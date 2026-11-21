@@ -1,0 +1,50 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Node / TypeScript / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE & OS
+.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Security scan reports (local artifacts)
+reports/*.json
+reports/*.sarif
+
+# Claude Code (personal settings and app-managed worktrees; .claude/settings.json IS committed)
+.claude/settings.local.json
+.claude/worktrees/

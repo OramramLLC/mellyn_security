@@ -1,0 +1,81 @@
+name: OWASP AI-Assisted Coding Security Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: nothing in this workflow writes to the repository or uploads results.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to full commit SHAs (tags can be moved; see the
+# tj-actions/changed-files compromise). Python tools are pinned to exact versions.
+# Bump both deliberately, e.g. with Dependabot or `pre-commit autoupdate --freeze`.
+
+jobs:
+  secrets:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Repositories owned by a GitHub organization also need GITLEAKS_LICENSE.
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  sast-and-supply-chain:
+    name: SAST, lint, agent rules & dependency verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned security tooling
+        run: python -m pip install --disable-pip-version-check "semgrep==1.182.0" "ruff==0.17.1"
+
+      - name: Verify dependencies (existence, age, pinning, non-registry sources)
+        run: python scripts/verify_dependencies.py --online
+
+      - name: Check agent rules files are in sync and free of hidden characters
+        run: python scripts/sync_agent_rules.py --check
+
+      - name: Ruff (lint, including bandit security rules)
+        run: ruff check .
+
+      - name: Test the custom Semgrep rules
+        working-directory: .semgrep # semgrep --test skips dot-directories when run from the root
+        run: semgrep --test --metrics=off .
+
+      - name: Semgrep scan with OWASP AI rules
+        run: semgrep scan --config .semgrep/owasp-ai-code-rules.yaml --exclude .semgrep --error --metrics=off
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v

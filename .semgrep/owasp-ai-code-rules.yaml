@@ -1,0 +1,149 @@
+# Custom Semgrep rules for flaws AI coding assistants commonly introduce.
+# Rule tests live next to this file (owasp-ai-code-rules.py / .tsx) and run with:
+#   cd .semgrep && semgrep --test .   (run from inside this directory: Semgrep skips dot-dirs)
+# These complement, not replace, Ruff's bandit ("S") rules and the Semgrep registry
+# packs (p/python, p/typescript, p/owasp-top-ten).
+# OWASP Top 10 references use the 2021 numbering (A0x:2021).
+rules:
+  - id: owasp-ai-python-no-eval-or-exec
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+    message: >
+      [OWASP LLM05 / A03:2021] Dynamic code execution via eval()/exec() is forbidden.
+      Agent tool handlers must never evaluate model- or user-supplied strings.
+      Use ast.literal_eval() for literals or a strict Pydantic model for structured data.
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-shell-command-execution
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+      - pattern: asyncio.create_subprocess_shell(...)
+    message: >
+      [OWASP Agentic / A03:2021] Shell execution enables command injection, especially from
+      prompt-injected tool arguments. Pass an argument list with shell=False.
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-unsafe-deserialization
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: pickle.Unpickler(...)
+      - pattern: dill.load(...)
+      - pattern: dill.loads(...)
+      - pattern: marshal.load(...)
+      - pattern: marshal.loads(...)
+      - pattern: joblib.load(...)
+      - pattern: shelve.open(...)
+    message: >
+      [OWASP A08:2021 / LLM03] Unsafe deserialization can execute arbitrary code. Never load
+      pickled data, models, or caches from untrusted sources. Use JSON + Pydantic, or safetensors for weights.
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-unsafe-yaml-load
+    patterns:
+      - pattern-either:
+          - pattern: yaml.load(...)
+          - pattern: yaml.load_all(...)
+          - pattern: yaml.unsafe_load(...)
+          - pattern: yaml.unsafe_load_all(...)
+          - pattern: yaml.full_load(...)
+          - pattern: yaml.full_load_all(...)
+      - pattern-not: yaml.$F(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.$F(..., Loader=yaml.CSafeLoader, ...)
+      - pattern-not: yaml.$F($DATA, yaml.SafeLoader)
+      - pattern-not: yaml.$F($DATA, yaml.CSafeLoader)
+    message: >
+      [OWASP A08:2021] YAML loaders other than SafeLoader can construct arbitrary Python objects.
+      Use yaml.safe_load().
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-torch-load-without-weights-only
+    patterns:
+      - pattern: torch.load(...)
+      - pattern-not: torch.load(..., weights_only=True, ...)
+    message: >
+      [OWASP LLM03 / A08:2021] torch.load() unpickles the file; a malicious checkpoint executes code.
+      Pass weights_only=True explicitly (or use safetensors) for any model you did not produce yourself.
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-sql-string-building
+    pattern-either:
+      - pattern: $CUR.execute(f"...", ...)
+      - pattern: $CUR.execute("..." % $X, ...)
+      - pattern: $CUR.execute("...".format(...), ...)
+      - pattern: $CUR.execute("..." + $X, ...)
+      - pattern: $CUR.executemany(f"...", ...)
+      - pattern: $CUR.executescript(f"...", ...)
+      - pattern: sqlalchemy.text(f"...")
+      - pattern: text(f"...")
+    message: >
+      [OWASP A03:2021 / LLM05] SQL built with string formatting is injectable. Use bound
+      parameters (cursor.execute("... WHERE id = %s", (value,))) or ORM expressions.
+    languages: [python]
+    severity: ERROR
+
+  - id: owasp-ai-python-weak-crypto-hash
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5(...)
+          - pattern: hashlib.sha1(...)
+          - pattern: hashlib.new("md5", ...)
+          - pattern: hashlib.new("sha1", ...)
+      - pattern-not: hashlib.$F(..., usedforsecurity=False, ...)
+    message: >
+      [OWASP A02:2021] AI assistants frequently default to MD5/SHA-1. Use SHA-256+ for integrity,
+      HMAC-SHA256 for high-entropy API keys, and Argon2id/bcrypt for passwords. Mark genuine
+      non-security uses with usedforsecurity=False.
+    languages: [python]
+    severity: WARNING
+
+  - id: owasp-ai-python-insecure-random-for-security
+    patterns:
+      - pattern: random.$FUNC(...)
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: ^(random|randint|randrange|randbytes|choice|choices|sample|getrandbits|uniform)$
+    message: >
+      [OWASP A02:2021] The 'random' module is not cryptographically secure. Use the 'secrets'
+      module for tokens, keys, nonces, IDs, and passwords.
+    languages: [python]
+    severity: WARNING
+
+  - id: owasp-ai-ts-no-dynamic-code-eval
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)
+    message: >
+      [OWASP LLM05 / A03:2021] Evaluating dynamic JavaScript enables code injection from LLM output.
+    languages: [typescript, javascript]
+    severity: ERROR
+
+  - id: owasp-ai-ts-dangerously-set-inner-html
+    patterns:
+      - pattern: |
+          <$EL dangerouslySetInnerHTML={$X} />
+      - pattern-not: |
+          <$EL dangerouslySetInnerHTML={{__html: DOMPurify.sanitize(...)}} />
+    message: >
+      [OWASP LLM05 / A03:2021] Rendering LLM or user content as raw HTML enables XSS. Render it as
+      text, or sanitize with DOMPurify.sanitize() inside the __html value.
+    languages: [typescript, javascript]
+    severity: ERROR
+
+  - id: owasp-ai-ts-insecure-random-for-security
+    pattern: Math.random()
+    message: >
+      [OWASP A02:2021] Math.random() is not cryptographically secure. Use crypto.randomUUID()
+      or crypto.getRandomValues() for tokens, IDs, and nonces.
+    languages: [typescript, javascript]
+    severity: WARNING
