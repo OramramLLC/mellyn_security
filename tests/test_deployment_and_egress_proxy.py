@@ -106,7 +106,13 @@ class TestWorkspaceRootCheck(unittest.TestCase):
 class TestDownstreamEnvironment(unittest.TestCase):
     def test_aegis_secrets_are_not_passed_to_mcp_servers(self) -> None:
         env = downstream_environment(
-            {"AEGIS_API_KEY_PEPPER": "p", "aegis_approver_key_digest": "d", "PATH": "/bin", "HTTPS_PROXY": "x"}
+            {
+                "AEGIS_API_KEY_PEPPER": "p",
+                "aegis_approver_key_digest": "d",
+                "MELLYN_API_KEY_PEPPER": "p2",
+                "PATH": "/bin",
+                "HTTPS_PROXY": "x",
+            }
         )
         self.assertEqual(env, {"PATH": "/bin", "HTTPS_PROXY": "x"})
 

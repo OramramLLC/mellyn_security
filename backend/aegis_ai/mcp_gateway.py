@@ -99,13 +99,18 @@ class Downstream(Protocol):
 _EOF = object()
 
 
+SECRET_ENV_PREFIXES = ("AEGIS_", "MELLYN_")
+
+
 def downstream_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """
-    The environment for downstream MCP servers: the gateway's own, minus every AEGIS_* variable. The pepper
-    and key digests are the gateway's secrets; the servers it launches are untrusted and must not see them.
+    The environment for downstream MCP servers: the gateway's own, minus every AEGIS_* and MELLYN_* variable.
+    The pepper and key digests are the gateway's secrets; the servers it launches are untrusted and must not see
+    them. MELLYN_* is stripped too because the product was renamed: a deployment may set its secrets under the
+    new prefix even though the code reads AEGIS_*.
     """
     source = os.environ if environ is None else environ
-    return {key: value for key, value in source.items() if not key.upper().startswith("AEGIS_")}
+    return {key: value for key, value in source.items() if not key.upper().startswith(SECRET_ENV_PREFIXES)}
 
 
 class StdioDownstream:
