@@ -113,6 +113,32 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.run_main({"package.json": json.dumps({"dependencies": {"x": "latest"}})}), 1)
         self.assertEqual(self.run_main({"frontend/package.json": json.dumps({"devDependencies": {"x": "a/b"}})}), 1)
 
+    def test_nested_manifests_and_build_system_requires_are_verified(self):
+        nested_pyproject = '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["requests>=0"]\n'
+        self.assertEqual(self.run_main({"services/demo/pyproject.toml": nested_pyproject}), 1)
+
+        weak_build_sys = (
+            '[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n'
+            '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["httpx>=0.28.0"]\n'
+        )
+        self.assertEqual(self.run_main({"pyproject.toml": weak_build_sys}), 1)
+
+        valid_nested = (
+            '[build-system]\nrequires = ["setuptools>=75.0.0"]\nbuild-backend = "setuptools.build_meta"\n'
+            '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["httpx>=0.28.0"]\n'
+        )
+        ignored_venv = '[project]\nname = "ignored"\ndependencies = ["requests"]\n'
+        self.assertEqual(
+            self.run_main(
+                {
+                    "services/demo/pyproject.toml": valid_nested,
+                    ".venv/Lib/site-packages/pkg/pyproject.toml": ignored_venv,
+                    "node_modules/bad/package.json": json.dumps({"dependencies": {"x": "*"}}),
+                }
+            ),
+            0,
+        )
+
     def test_requirements_options_and_hashes_are_handled(self):
         reqs = "-r base.txt\n--index-url https://pypi.org/simple\nhttpx==0.28.1 --hash=sha256:abc \\\n# comment\n"
         self.assertEqual(self.run_main({"requirements.txt": reqs, "base.txt": "anyio>=4.0\n"}), 0)

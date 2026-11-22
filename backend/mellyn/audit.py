@@ -53,9 +53,32 @@ def hash_arguments(arguments: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+MAX_AUDIT_REASON_CHARS = 512
+MAX_TAINT_ENTRY_CHARS = 256
+EMPTY_ARGS_SHA256 = hashlib.sha256(b"{}").hexdigest()
+
+
+def hash_untrusted_identifier(prefix: str, raw_value: str) -> str:
+    """
+    Deterministic bounded digest label for unrecognized caller-supplied identifiers (`session_id`,
+    `tool_name`, `mcp_server`), preventing arbitrary caller text or secrets from entering JSONL while
+    keeping repeated attempts correlatable.
+    """
+    digest = hashlib.sha256(f"{prefix}:{raw_value}".encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"{prefix}:{digest}"
+
+
+def format_taint_entry(source: TaintSource, *, max_chars: int = MAX_TAINT_ENTRY_CHARS) -> str:
+    """Redact and bound a single taint entry once so repeated decisions do not re-scan full text."""
+    s_type = redact_text(source.source_type)[:64]
+    s_origin = redact_text(source.origin)
+    combined = f"{s_type}:{s_origin}"
+    return combined[:max_chars]
+
+
 @dataclass(frozen=True)
 class AuditEvent:
-    """Structured, redacted audit record (never stores raw prompts or secrets)."""
+    """Structured, redacted audit record (never stores raw prompts, secrets, or unrecognized caller IDs)."""
 
     audit_id: str
     timestamp: str
@@ -70,6 +93,8 @@ class AuditEvent:
     reasons: list[str]
     policy_id: str | None
     grant_id: str | None
+    event_type: str = "authorization"
+    taint_count: int = 0
 
 
 class AuditLogger:
@@ -88,6 +113,14 @@ class AuditLogger:
     def events(self) -> tuple[AuditEvent, ...]:
         return tuple(self._events)
 
+    def _emit(self, event: AuditEvent) -> AuditEvent:
+        with self._lock:
+            self._events.append(event)
+            if self._sink is not None:
+                self._sink.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+                self._sink.flush()
+        return event
+
     def record(
         self,
         *,
@@ -98,32 +131,77 @@ class AuditLogger:
         decision: Decision,
         risk_tier: RiskTier,
         tainted: bool,
-        taint_sources: tuple[TaintSource, ...],
+        taint_sources: tuple[TaintSource | str, ...],
         reasons: tuple[str, ...],
         policy_id: str | None = None,
         grant_id: str | None = None,
+        taint_count: int | None = None,
+        session_known: bool = True,
+        tool_known: bool = True,
+        server_known: bool = True,
     ) -> AuditEvent:
+        safe_session = (
+            redact_text(session_id)[:128] if session_known else hash_untrusted_identifier("unknown_ses", session_id)
+        )
+        safe_tool = (
+            redact_text(tool_name)[:128] if tool_known else hash_untrusted_identifier("untrusted_tool", tool_name)
+        )
+        if mcp_server is None:
+            safe_server: str | None = None
+        elif server_known:
+            safe_server = redact_text(mcp_server)[:128]
+        else:
+            safe_server = hash_untrusted_identifier("untrusted_srv", mcp_server)
+
+        rendered_taints = [item if isinstance(item, str) else format_taint_entry(item) for item in taint_sources]
+        effective_count = len(rendered_taints) if taint_count is None else taint_count
+
         event = AuditEvent(
             audit_id=f"aud_{secrets.token_hex(12)}",
             timestamp=utc_now().isoformat(),
-            session_id=session_id,
-            tool_name=tool_name,
-            mcp_server=mcp_server,
+            session_id=safe_session,
+            tool_name=safe_tool,
+            mcp_server=safe_server,
             decision=decision.value,
             risk_tier=risk_tier.value,
             tainted=tainted,
-            taint_sources=[redact_text(f"{src.source_type}:{src.origin}") for src in taint_sources],
+            taint_sources=rendered_taints,
             args_sha256=hash_arguments(arguments),
-            reasons=[redact_text(reason) for reason in reasons],
+            reasons=[redact_text(reason)[:MAX_AUDIT_REASON_CHARS] for reason in reasons],
             policy_id=policy_id,
             grant_id=grant_id,
+            event_type="authorization",
+            taint_count=effective_count,
         )
-        with self._lock:
-            self._events.append(event)
-            if self._sink is not None:
-                self._sink.write(json.dumps(asdict(event), sort_keys=True) + "\n")
-                self._sink.flush()
-        return event
+        return self._emit(event)
+
+    def record_taint(
+        self,
+        *,
+        session_id: str,
+        taint_count: int,
+        taint_sources: tuple[str, ...],
+        reason: str = "Session tainted by untrusted external content.",
+    ) -> AuditEvent:
+        """Emit a standalone durable structured record when untrusted content taints a session."""
+        event = AuditEvent(
+            audit_id=f"aud_{secrets.token_hex(12)}",
+            timestamp=utc_now().isoformat(),
+            session_id=redact_text(session_id)[:128],
+            tool_name="session/taint",
+            mcp_server=None,
+            decision="tainted",
+            risk_tier=RiskTier.LOW.value,
+            tainted=True,
+            taint_sources=list(taint_sources),
+            args_sha256=EMPTY_ARGS_SHA256,
+            reasons=[redact_text(reason)[:MAX_AUDIT_REASON_CHARS]],
+            policy_id=None,
+            grant_id=None,
+            event_type="taint",
+            taint_count=taint_count,
+        )
+        return self._emit(event)
 
     def to_jsonl(self) -> str:
         """Export all recorded audit events as newline-delimited JSON."""

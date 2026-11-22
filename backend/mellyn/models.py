@@ -16,46 +16,52 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def validate_json_value(value: Any) -> None:
+def _normalize_json_tree(value: Any) -> Any:
     """
-    Ensure a value consists exclusively of strict RFC 8259 JSON types.
+    Validate that `value` consists exclusively of strict RFC 8259 JSON types and return canonical
+    plain-JSON containers (`tuple` -> `list`, mapping -> `dict`, `-0.0` -> `0.0`).
 
     Rejects NaN/Infinity floats, non-string mapping keys, and arbitrary Python objects so
     serialization never falls back to lossy stringification (`default=str`).
     """
     if value is None or isinstance(value, bool | int | str):
-        return
+        return value
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError("Non-finite float (NaN or Infinity) is not permitted in tool arguments.")
-        return
+            raise ValueError("Non-finite float (NaN or Infinity) is not permitted in JSON values.")
+        return 0.0 if value == 0.0 else value
     if isinstance(value, list | tuple):
-        for item in value:
-            validate_json_value(item)
-        return
+        return [_normalize_json_tree(item) for item in value]
     if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("Tool argument mapping keys must be strings.")
-            validate_json_value(item)
-        return
+            out[key] = _normalize_json_tree(item)
+        return out
     raise TypeError(f"Unsupported non-JSON value of type '{type(value).__name__}'.")
 
 
-def _to_plain_json(value: Any) -> Any:
-    if isinstance(value, list | tuple):
-        return [_to_plain_json(v) for v in value]
-    if isinstance(value, Mapping):
-        return {k: _to_plain_json(v) for k, v in value.items()}
-    return value
+def canonical_json_value(value: Any) -> str:
+    """
+    Deterministic RFC 8259 JSON string for any strict JSON scalar, array, or object.
+
+    Preserves exact JSON scalar types (`"true"` != `"1"` != `"1.0"`), treats tuples and lists
+    identically, sorts object keys, and canonicalizes `-0.0` to `0.0`.
+    """
+    return json.dumps(_normalize_json_tree(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def validate_json_value(value: Any) -> None:
+    """Ensure a value consists exclusively of strict RFC 8259 JSON types."""
+    _normalize_json_tree(value)
 
 
 def canonical_json(arguments: Mapping[str, Any]) -> str:
     """Deterministic RFC 8259 JSON form of tool arguments, used for exact matching and hashing."""
     if not isinstance(arguments, Mapping):
         raise TypeError("Tool arguments must be a mapping.")
-    validate_json_value(arguments)
-    return json.dumps(_to_plain_json(arguments), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return canonical_json_value(arguments)
 
 
 class RiskTier(StrEnum):

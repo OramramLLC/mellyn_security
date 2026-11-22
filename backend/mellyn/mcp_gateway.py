@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -36,9 +37,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import IO, Any, Protocol, TextIO
+from typing import IO, Any, BinaryIO, Protocol, TextIO
 
 from mellyn.approvals import ApprovalHTTPServer, PendingApprovals
 from mellyn.audit import AuditLogger
@@ -52,6 +54,8 @@ from mellyn.policy_loader import PolicyLoadError, load_policy_file
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 MAX_LINE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_INBOX_MESSAGES = 256
+DEFAULT_MAX_INBOX_BYTES = 8 * 1024 * 1024
 MAX_LIST_PAGES = 20
 DOWNSTREAM_TIMEOUT_SECONDS = 60.0
 INIT_TIMEOUT_SECONDS = 30.0
@@ -243,14 +247,141 @@ def _drop_gateway_privileges(gateway_user: str) -> None:
     os.environ["LOGNAME"] = uname
 
 
+def iter_bounded_frames(
+    stream: BinaryIO | TextIO, *, max_line_bytes: int = MAX_LINE_BYTES
+) -> Iterator[tuple[bytes | None, bool]]:
+    """
+    Yield `(frame_bytes, oversized)` from a newline-delimited stream without unbounded buffering.
+
+    Reads bounded chunks (`min(65536, max_line_bytes + 2)`), measures limits strictly in UTF-8 bytes
+    (never Unicode codepoints), and drains any oversized frame through its `\\n` delimiter while
+    discarding excess bytes immediately. Empty/whitespace-only frames within the limit are skipped.
+    """
+    if max_line_bytes <= 0:
+        raise ValueError("max_line_bytes must be positive.")
+    chunk_limit = min(65536, max_line_bytes + 2)
+    bstream = getattr(stream, "buffer", None)
+    if bstream is not None:
+        raw_source: Any = bstream
+        is_bytes = True
+    else:
+        raw_source = stream
+        is_bytes = isinstance(stream, io.RawIOBase | io.BufferedIOBase)
+
+    while True:
+        buf = bytearray()
+        oversized = False
+        got_any = False
+        while True:
+            piece = raw_source.readline(chunk_limit)
+            if not piece:
+                break
+            got_any = True
+            chunk_bytes = piece if is_bytes else str(piece).encode("utf-8", errors="surrogatepass")
+            ended = chunk_bytes.endswith(b"\n")
+            if not oversized:
+                if len(buf) + len(chunk_bytes) > max_line_bytes + 2:
+                    oversized = True
+                    buf.clear()
+                else:
+                    buf.extend(chunk_bytes)
+            if ended:
+                break
+        if not got_any:
+            return
+        if oversized:
+            yield None, True
+            continue
+        payload = bytes(buf).rstrip(b"\r\n")
+        if len(payload) > max_line_bytes:
+            yield None, True
+            continue
+        stripped = payload.strip()
+        if not stripped:
+            continue
+        yield stripped, False
+
+
+class _BoundedInbox:
+    """Thread-safe inbox bounding both queued message count and total queued UTF-8 bytes."""
+
+    def __init__(
+        self,
+        *,
+        max_messages: int = DEFAULT_MAX_INBOX_MESSAGES,
+        max_bytes: int = DEFAULT_MAX_INBOX_BYTES,
+    ) -> None:
+        if max_messages <= 0 or max_bytes <= 0:
+            raise ValueError("Inbox capacity limits must be positive.")
+        self.max_messages = max_messages
+        self.max_bytes = max_bytes
+        self._cond = threading.Condition()
+        self._items: deque[tuple[Any, int]] = deque()
+        self._queued_bytes = 0
+        self._eof = False
+        self._closed = False
+
+    @property
+    def qsize(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+    @property
+    def queued_bytes(self) -> int:
+        with self._cond:
+            return self._queued_bytes
+
+    def put(self, item: Any, byte_size: int) -> bool:
+        size = max(1, byte_size)
+        if size > self.max_bytes:
+            return False
+        with self._cond:
+            while not self._closed and (
+                len(self._items) >= self.max_messages or self._queued_bytes + size > self.max_bytes
+            ):
+                self._cond.wait()
+            if self._closed:
+                return False
+            self._items.append((item, size))
+            self._queued_bytes += size
+            self._cond.notify_all()
+            return True
+
+    def mark_eof(self) -> None:
+        with self._cond:
+            self._eof = True
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._eof = True
+            self._items.clear()
+            self._queued_bytes = 0
+            self._cond.notify_all()
+
+    def get(self, *, deadline: float) -> Any:
+        with self._cond:
+            while not self._items and not self._eof and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._cond.wait(timeout=remaining)
+            if self._items:
+                item, size = self._items.popleft()
+                self._queued_bytes -= size
+                self._cond.notify_all()
+                return item
+            return _EOF
+
+
 class StdioDownstream:
     """
     A downstream MCP server launched as a subprocess (argv list, no shell) and spoken to over stdio.
 
-    A reader thread parses each stdout line into a queue. `request` uses its own IDs and returns only the
-    response carrying that ID; anything else that arrives meanwhile is handled, not returned:
-    notifications go to `on_notification`, server-to-client requests are refused, malformed or oversized
-    lines are dropped. The server's stderr goes to `stderr`, never to the audit log.
+    A reader thread parses bounded byte frames into a bounded `_BoundedInbox`. `request` enforces a single
+    overall deadline covering both pipe write/flush and reply wait, closing an unresponsive child if either
+    stalls so healthy peer servers continue operating.
     """
 
     def __init__(
@@ -266,14 +397,22 @@ class StdioDownstream:
         child_username: str | None = None,
         on_notification: Callable[[str, dict[str, Any]], None] | None = None,
         stderr: TextIO | None = None,
+        max_line_bytes: int = MAX_LINE_BYTES,
+        max_inbox_messages: int = DEFAULT_MAX_INBOX_MESSAGES,
+        max_inbox_bytes: int = DEFAULT_MAX_INBOX_BYTES,
+        writer: Callable[[bytes], None] | None = None,
     ) -> None:
         if not argv:
             raise ValueError(f"Server '{name}' requires a non-empty command argv.")
         self.name = name
         self.on_notification = on_notification or (lambda _server, _msg: None)
+        self._max_line_bytes = max_line_bytes
         self._ids = itertools.count(1)
-        self._inbox: queue.Queue[Any] = queue.Queue()
+        self._inbox = _BoundedInbox(max_messages=max_inbox_messages, max_bytes=max_inbox_bytes)
         self._write_lock = threading.Lock()
+        self._custom_writer = writer
+        self._writer_thread: threading.Thread | None = None
+        self._closed = False
 
         child_env = downstream_environment()
         if child_home is not None:
@@ -307,64 +446,128 @@ class StdioDownstream:
     def _read_loop(self) -> None:
         stdout = self.proc.stdout
         if stdout is None:
-            self._inbox.put(_EOF)
+            self._inbox.mark_eof()
             return
-        while True:
-            line = stdout.readline(MAX_LINE_BYTES + 1)
-            if not line:
-                break
-            if len(line) > MAX_LINE_BYTES and not line.endswith(b"\n"):
-                while line and not line.endswith(b"\n"):  # discard the rest of an oversized line
-                    line = stdout.readline(MAX_LINE_BYTES + 1)
-                continue
-            try:
-                self._inbox.put(json.loads(line.decode("utf-8")))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-        self._inbox.put(_EOF)
+        try:
+            for frame, oversized in iter_bounded_frames(stdout, max_line_bytes=self._max_line_bytes):
+                if oversized or frame is None:
+                    continue
+                try:
+                    parsed = json.loads(frame.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                self._inbox.put(parsed, len(frame))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._inbox.mark_eof()
 
-    def _write(self, message: dict[str, Any]) -> bool:
+    def _raw_write(self, payload: bytes) -> None:
+        if self._custom_writer is not None:
+            self._custom_writer(payload)
+            return
         stdin = self.proc.stdin
         if stdin is None:
-            return False
+            raise BrokenPipeError("stdin closed")
+        stdin.write(payload)
+        stdin.flush()
+
+    def _abort_unresponsive(self) -> None:
+        """Mark this server dead and terminate it without hanging when a request deadline expires."""
+        self._closed = True
+        self._inbox.close()
+        for stop in (self.proc.terminate, self.proc.kill):
+            try:
+                stop()
+                break
+            except OSError:
+                continue
+        writer_stuck = self._writer_thread is not None and self._writer_thread.is_alive()
+        if self.proc.stdin is not None and not writer_stuck:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+
+    def _write_with_deadline(self, message: dict[str, Any], deadline: float) -> tuple[bool, bool]:
+        """Return `(wrote_ok, timed_out)`. Counts writing and flushing against `deadline`."""
+        if self._closed:
+            return False, False
+        payload = (json.dumps(message) + "\n").encode("utf-8")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._abort_unresponsive()
+            return False, True
+        if not self._write_lock.acquire(timeout=remaining):
+            self._abort_unresponsive()
+            return False, True
         try:
-            with self._write_lock:
-                stdin.write((json.dumps(message) + "\n").encode("utf-8"))
-                stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            return False
-        return True
+            if self._closed:
+                return False, False
+            done = threading.Event()
+            errors: list[BaseException] = []
+
+            def _do_write() -> None:
+                try:
+                    self._raw_write(payload)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=_do_write, name=f"mcp-{self.name}-writer", daemon=True)
+            self._writer_thread = worker
+            worker.start()
+            if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
+                self._abort_unresponsive()
+                return False, True
+            if errors:
+                return False, False
+            return True, False
+        finally:
+            self._write_lock.release()
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
-        self._write(message)
+        self._write_with_deadline(message, time.monotonic() + min(5.0, DOWNSTREAM_TIMEOUT_SECONDS))
 
     def request(
         self, method: str, params: dict[str, Any], timeout: float = DOWNSTREAM_TIMEOUT_SECONDS
     ) -> dict[str, Any]:
         req_id = f"mellyn-{next(self._ids)}"
-        if not self._write({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}):
-            return _local_downstream_error(req_id, f"Downstream server '{self.name}' is not accepting input.")
         deadline = time.monotonic() + timeout
+        wrote, write_timed_out = self._write_with_deadline(
+            {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
+            deadline,
+        )
+        if not wrote:
+            if write_timed_out:
+                return _local_downstream_error(req_id, f"Downstream server '{self.name}' timed out.")
+            return _local_downstream_error(req_id, f"Downstream server '{self.name}' is not accepting input.")
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            # Checked on every message, not only when the inbox is empty: a server that keeps the inbox full
+            # (a notification flood faster than the gateway forwards it) must not hold the request open forever.
+            if time.monotonic() >= deadline:
+                self._abort_unresponsive()
                 return _local_downstream_error(req_id, f"Downstream server '{self.name}' timed out.")
             try:
-                message = self._inbox.get(timeout=remaining)
+                message = self._inbox.get(deadline=deadline)
             except queue.Empty:
-                continue
+                self._abort_unresponsive()
+                return _local_downstream_error(req_id, f"Downstream server '{self.name}' timed out.")
             if message is _EOF:
-                self._inbox.put(_EOF)  # keep reporting closed to later requests
                 return _local_downstream_error(req_id, f"Downstream server '{self.name}' closed.")
             if not isinstance(message, dict):
                 continue
             if isinstance(message.get("method"), str):
                 if "id" in message:  # server-to-client request (sampling, elicitation, roots): refuse
                     srv_id = message["id"] if _valid_request_id(message["id"]) else None
-                    self._write(_jsonrpc_error(srv_id, JSONRPC_METHOD_NOT_FOUND, "Not permitted by gateway."))
+                    self._write_with_deadline(
+                        _jsonrpc_error(srv_id, JSONRPC_METHOD_NOT_FOUND, "Not permitted by gateway."),
+                        deadline,
+                    )
                 else:
                     self.on_notification(self.name, message)
                 continue
@@ -384,8 +587,14 @@ class StdioDownstream:
         (EPERM). That is expected, not an error: such a gateway runs as PID 1 (see check_privilege_separation), so
         the kernel kills the server when the gateway exits. close() must therefore return, not hang.
         """
+        self._closed = True
+        inbox = getattr(self, "_inbox", None)
+        if inbox is not None:
+            inbox.close()
+        writer_thread = getattr(self, "_writer_thread", None)
+        writer_stuck = writer_thread is not None and writer_thread.is_alive()
         try:
-            if self.proc.stdin is not None:
+            if self.proc.stdin is not None and not writer_stuck:
                 self.proc.stdin.close()
         except OSError:
             pass
@@ -397,6 +606,8 @@ class StdioDownstream:
                     stop()
                 except PermissionError:
                     break  # separate user: the kernel kills it when the gateway (PID 1) exits
+                except OSError:
+                    break
                 try:
                     self.proc.wait(timeout=5)
                     break
@@ -742,18 +953,21 @@ def _relay(req_id: Any, response: dict[str, Any]) -> dict[str, Any]:
     return _jsonrpc_error(req_id, code, message[:1000])
 
 
-def run_stdio_proxy(*, gateway: MCPGateway, client_in: TextIO, client_out: TextIO) -> int:
-    """Read newline-delimited JSON-RPC messages from client_in and write replies to client_out."""
-    for raw_line in client_in:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if len(line) > MAX_LINE_BYTES:
+def run_stdio_proxy(
+    *,
+    gateway: MCPGateway,
+    client_in: BinaryIO | TextIO,
+    client_out: TextIO,
+    max_line_bytes: int = MAX_LINE_BYTES,
+) -> int:
+    """Read bounded UTF-8 newline-delimited JSON-RPC frames from client_in and write replies to client_out."""
+    for frame, oversized in iter_bounded_frames(client_in, max_line_bytes=max_line_bytes):
+        if oversized or frame is None:
             reply: dict[str, Any] | None = _jsonrpc_error(None, JSONRPC_INVALID_REQUEST, "Message too large.")
         else:
             try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
+                message = json.loads(frame.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 reply = _jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Malformed JSON-RPC message.")
             else:
                 try:

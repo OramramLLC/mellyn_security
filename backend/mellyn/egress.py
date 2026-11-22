@@ -87,7 +87,7 @@ class EgressValidator:
             return False, "Malformed URL authority or port."
 
         if parsed.scheme.lower() != "https":
-            return False, f"Disallowed URL scheme '{parsed.scheme}'; only https is permitted."
+            return False, "Disallowed URL scheme; only https is permitted."
 
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             return False, "URLs with embedded credentials/userinfo are forbidden."
@@ -106,15 +106,15 @@ class EgressValidator:
             return False, "URL is missing a valid hostname."
 
         if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
-            return False, f"Loopback/local hostname '{hostname}' is forbidden."
+            return False, "Loopback or local hostname is forbidden."
 
         if self._is_ip_literal(hostname):
-            return False, f"Direct IP literals ('{hostname}') are forbidden; use an allowlisted domain."
+            return False, "Direct IP literals are forbidden; use an allowlisted domain."
 
         if not self.is_domain_allowlisted(hostname):
-            return False, f"Destination host '{hostname}' is not in the egress domain allowlist."
+            return False, "Destination host is not in the egress domain allowlist."
 
-        return True, f"Destination host '{hostname}' matched egress allowlist."
+        return True, "Destination host matched egress allowlist."
 
     def is_domain_allowlisted(self, hostname: str) -> bool:
         """Check exact or subdomain match against the allowlist."""
@@ -205,34 +205,34 @@ class WorkspacePathGuard:
         try:
             resolved = (candidate if candidate.is_absolute() else self.workspace_root / candidate).resolve()
         except (OSError, ValueError, RuntimeError) as exc:  # e.g. invalid names, symlink loops
-            return False, f"Path '{raw_path}' could not be resolved ({type(exc).__name__})."
+            return False, f"Workspace path could not be resolved ({type(exc).__name__})."
 
         try:
             rel_path = resolved.relative_to(self.workspace_root)
         except ValueError:
-            return False, f"Path '{raw_path}' escapes workspace root."
+            return False, "Path escapes workspace root."
 
         rel_posix = rel_path.as_posix()
 
         # Check sensitive directory components (e.g., .ssh, .aws, secrets)
         for part in rel_path.parts:
             if part.lower() in SENSITIVE_PATH_PARTS:
-                return False, f"Access to sensitive directory '{part}' is denied."
+                return False, f"Access to sensitive directory '{part.lower()}' is denied."
 
         # Check sensitive filenames (.env, *.pem, *.key, credentials.json, .npmrc, ...)
         filename = rel_path.name
         if filename.lower() != ".env.example":
             for pattern in SENSITIVE_FILENAME_PATTERNS:
                 if pattern.search(filename):
-                    return False, f"Access to sensitive file '{filename}' is denied."
+                    return False, "Access to sensitive file is denied."
         if rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS:
-            return False, f"Access to sensitive file '{rel_posix}' is denied."
+            return False, "Access to sensitive file is denied."
 
         # Block agent self-modification of security guardrails (and ancestor directories containing them)
         if is_write and self.is_protected(rel_posix):
-            return False, f"Modifying guardrail path '{rel_posix}' is denied."
+            return False, "Modifying protected guardrail path is denied."
 
-        return True, f"Workspace path '{rel_posix}' permitted."
+        return True, "Workspace path permitted."
 
     def search_content(
         self,
