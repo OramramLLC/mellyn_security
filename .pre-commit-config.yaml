@@ -42,7 +42,7 @@ repos:
         entry: python scripts/verify_dependencies.py
         language: python
         pass_filenames: false
-        files: ^(pyproject\.toml|requirements.*\.txt|backend/requirements.*\.txt|package\.json|frontend/package\.json|scripts/verify_dependencies\.py)$
+        files: ^(pyproject\.toml|requirements.*\.(txt|lock)|(backend|deploy)/requirements.*\.(txt|lock)|uv\.lock|package(-lock)?\.json|frontend/package(-lock)?\.json|\.mellyn-allowlist\.toml|scripts/verify_dependencies\.py)$
 
       - id: agent-rules-sync
         name: Agent rules files in sync, no hidden characters
