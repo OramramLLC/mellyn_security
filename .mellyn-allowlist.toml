@@ -1,0 +1,22 @@
+# Mellyn Security — Audited Package & Release Age Exemptions
+# Protected by CODEOWNERS and WorkspacePathGuard so AI coding agents cannot self-exempt packages.
+#
+# Every exemption requires an owner, rationale, and YYYY-MM-DD expiration date no more than 180 days ahead;
+# expired entries fail closed. An entry exempts the package from the new-package (90-day) check. The 14-day
+# release cooldown is exempted only for the exact versions listed under `versions`, so approving a package
+# never pre-approves its future releases.
+#
+# In CI, a pull request is checked against this file as it is on the PR's BASE commit: a PR cannot exempt
+# its own dependencies. Add an exemption in its own reviewed PR first.
+#
+# Example:
+# [[exemptions]]
+# package = "some-vetted-package"
+# ecosystem = "pypi"
+# reason = "Reviewed upstream repository, maintainers, and release diff manually"
+# approved_by = "@OramramLLC"
+# expires = "2027-03-01"
+# versions = ["1.4.2"]   # optional: also skip the release cooldown for exactly these versions
+
+schema_version = 1
+exemptions = []

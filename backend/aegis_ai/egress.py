@@ -43,6 +43,7 @@ GUARDRAIL_PATHS: tuple[str, ...] = (
     ".gitattributes",
     ".pre-commit-config.yaml",
     ".pre-commit-hooks.yaml",
+    ".mellyn-allowlist.toml",
     ".cursorrules",
     ".windsurfrules",
     ".clinerules",

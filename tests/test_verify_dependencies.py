@@ -115,7 +115,20 @@ class EndToEndTests(unittest.TestCase):
 
     def test_requirements_options_and_hashes_are_handled(self):
         reqs = "-r base.txt\n--index-url https://pypi.org/simple\nhttpx==0.28.1 --hash=sha256:abc \\\n# comment\n"
-        self.assertEqual(self.run_main({"requirements.txt": reqs}), 0)
+        self.assertEqual(self.run_main({"requirements.txt": reqs, "base.txt": "anyio>=4.0\n"}), 0)
+
+    def test_requirements_cannot_switch_the_index_or_include_unchecked_files(self):
+        for reqs, files in (
+            ("--index-url https://evil.example/simple\nhttpx==0.28.1\n", {}),
+            ("-ihttps://evil.example/simple\nhttpx==0.28.1\n", {}),
+            ("--extra-index-url https://evil.example/simple\nhttpx==0.28.1\n", {}),
+            ("--find-links https://evil.example/wheels\nhttpx==0.28.1\n", {}),
+            ("-r https://evil.example/reqs.txt\n", {}),
+            ("-r missing.txt\n", {}),
+            ("-r base.txt\n", {"base.txt": "requests\n"}),  # the included file is verified too
+        ):
+            with self.subTest(reqs=reqs):
+                self.assertEqual(self.run_main({"requirements.txt": reqs, **files}), 1)
 
 
 if __name__ == "__main__":

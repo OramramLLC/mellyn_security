@@ -21,7 +21,7 @@
   entry: scripts/verify_dependencies.py
   language: script
   pass_filenames: false
-  files: (^|/)(pyproject\.toml|requirements.*\.txt|package\.json)$
+  files: (^|/)(pyproject\.toml|requirements.*\.(txt|lock)|uv\.lock|package(-lock)?\.json|\.mellyn-allowlist\.toml)$
 
 - id: mellyn-check-agent-rules
   name: Mellyn Security — AI Instruction File Hidden-Unicode & Sync Check
