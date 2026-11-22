@@ -4,9 +4,9 @@
 This repository houses **Mellyn Security**, an AI Security Engineering Reference Architecture and B2B SMB Security Platform.
 
 - **Implemented today**: the secure AI-assisted coding layer — agent rules files, the dependency / anti-slopsquatting
-  verifier, custom Semgrep rules, Gitleaks config, pre-commit hooks, and the CI security gate.
-- **Planned (not yet in the repo)**: `backend/` (Python 3.12+, FastAPI, Pydantic v2) and `frontend/` (TypeScript,
-  Next.js App Router, Tailwind CSS, Zod).
+  verifier, custom Semgrep rules, Gitleaks config, pre-commit hooks, and the CI security gate — and `backend/aegis_ai/`
+  (Python 3.12+, FastAPI, Pydantic v2): the tool-call authorizer, HTTP API, stdio MCP gateway, and `deploy/` stack.
+- **Planned (not yet in the repo)**: `frontend/` (TypeScript, Next.js App Router, Tailwind CSS, Zod).
 
 ## Essential Commands
 On Windows, use `py` instead of `python` if `python` opens the Microsoft Store.

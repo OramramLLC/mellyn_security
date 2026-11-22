@@ -56,4 +56,4 @@ repos:
         entry: python -m unittest discover -s tests
         language: python
         pass_filenames: false
-        files: ^(scripts|tests)/.*\.py$
+        files: ^(scripts|tests|backend)/.*\.py$

@@ -1,0 +1,7 @@
+# The build context is the repository root (see deploy/docker-compose.yml). Send only what the Dockerfile copies,
+# so .env, .git, .venv and local caches never reach the Docker daemon.
+*
+!backend/
+!deploy/requirements.lock
+**/__pycache__
+**/*.pyc

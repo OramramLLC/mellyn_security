@@ -1,0 +1,36 @@
+# Mellyn Security — Versioned Pre-Commit Hook Pack
+#
+# Client repositories consume these hooks pinned by commit SHA, without copying scripts:
+#
+#   - repo: https://github.com/<owner>/<mellyn-repo>
+#     rev: <40-char-commit-sha>
+#     hooks:
+#       - id: mellyn-verify-dependencies
+#         args: [--online]
+#       - id: mellyn-check-agent-rules
+#
+# `language: script` runs the scripts with the client's `python3` (standard library only, Python 3.12+). The
+# scripts are committed with the executable bit set; pre-commit refuses non-executable scripts on Linux and macOS.
+
+- id: mellyn-verify-dependencies
+  name: Mellyn Security — OWASP AI Dependency & Anti-Slopsquatting Verifier
+  description: >
+    Verifies Python (pyproject.toml, requirements*.txt) and npm (package.json) manifests for meaningful version
+    floors and registry-only sources. Pass `args: [--online]` to also check that every package exists on
+    PyPI/npm and is at least 90 days old.
+  entry: scripts/verify_dependencies.py
+  language: script
+  pass_filenames: false
+  files: (^|/)(pyproject\.toml|requirements.*\.txt|package\.json)$
+
+- id: mellyn-check-agent-rules
+  name: Mellyn Security — AI Instruction File Hidden-Unicode & Sync Check
+  description: >
+    Rejects invisible Unicode format/bidi/tag characters ("Rules File Backdoor" prompt injection) in AI coding
+    assistant instruction files. In repositories that use the canonical .agent/rules/owasp-secure-ai-coding.md,
+    also checks that the generated copies and the CLAUDE.md import are in sync.
+  entry: scripts/sync_agent_rules.py
+  args: ["--check"]
+  language: script
+  pass_filenames: false
+  files: ^(\.agent/rules/.+\.md|\.cursor/rules/.+\.mdc|\.github/instructions/.+\.md|\.cursorrules|\.windsurfrules|\.clinerules|\.github/copilot-instructions\.md|CLAUDE\.md|AGENTS\.md|GEMINI\.md)$

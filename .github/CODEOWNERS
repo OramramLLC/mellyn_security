@@ -1,0 +1,27 @@
+# CODEOWNERS — Protect security guardrails, CI gates, and runtime policy logic.
+# Pair this file with GitHub branch protection on `main` requiring code owner review
+# so an AI coding agent or unreviewed PR cannot weaken its own security controls.
+
+# Canonical AI steering rules & generated assistant configs
+/.agent/                    @OramramLLC
+/CLAUDE.md                  @OramramLLC
+/.cursorrules               @OramramLLC
+/.github/copilot-instructions.md @OramramLLC
+/.claude/settings.json      @OramramLLC
+
+# Security gates, SAST rules, secret scanning & supply-chain scripts
+/.github/CODEOWNERS         @OramramLLC
+/.github/workflows/         @OramramLLC
+/.pre-commit-config.yaml    @OramramLLC
+/.pre-commit-hooks.yaml     @OramramLLC
+/.gitleaks.toml             @OramramLLC
+/.semgrep/                  @OramramLLC
+/scripts/                   @OramramLLC
+/pyproject.toml             @OramramLLC
+
+# Threat model, policy configs, deployment & runtime authorization core
+/docs/THREAT_MODEL.md       @OramramLLC
+/config/                    @OramramLLC
+/deploy/                    @OramramLLC
+/Dockerfile                 @OramramLLC
+/backend/aegis_ai/          @OramramLLC

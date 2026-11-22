@@ -1,0 +1,24 @@
+# Mellyn Security — Example MCP Gateway deployment file
+# Loaded strictly by `aegis_ai.gateway_config.load_gateway_config()`. One gateway process fronts every server
+# below for one client, so they share one session (and its taint) and one approval queue.
+#
+# Run:  python -m aegis_ai.mcp_gateway --config config/mellyn-gateway.example.toml \
+#           --workspace . --audit-log mellyn-audit.jsonl
+# Then point your MCP client at that command instead of at the servers directly. Tools appear to the client
+# as "<server>__<tool>".
+
+schema_version = 1
+
+# Path to the policy, relative to this file.
+policy = "mellyn-policy.example.toml"
+
+# Each server's name must also be in the policy's allowed_mcp_servers. Names are lowercase letters, digits
+# and single hyphens. Commands are argv lists, launched without a shell; command interpreters are rejected.
+# The commands below are placeholders: replace them with the MCP servers you actually run.
+[[servers]]
+name = "local-workspace"
+command = ["replace-with-your-workspace-mcp-server", "--root", "."]
+
+[[servers]]
+name = "github-readonly"
+command = ["replace-with-your-github-mcp-server", "--read-only"]
