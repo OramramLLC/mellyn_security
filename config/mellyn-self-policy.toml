@@ -1,7 +1,7 @@
 # Mellyn Security — Policy for agents working on THIS repository (Mellyn Security itself)
 # Identical to mellyn-policy.example.toml except for protected_paths, which also covers this
 # repository's security core (a test keeps the two files in step).
-# Loaded strictly and fail-closed by `aegis_ai.policy_loader.load_policy_file()`.
+# Loaded strictly and fail-closed by `mellyn.policy_loader.load_policy_file()`.
 
 schema_version = 1
 
@@ -29,7 +29,7 @@ allowed_egress_domains = [
 #   protected_paths = ["infra/", "migrations/", "src/auth/"]
 # The gateway also protects its own config, this policy and its audit log when they sit in the workspace.
 protected_paths = [
-    "backend/aegis_ai/",
+    "backend/mellyn/",
     "scripts/",
     "tests/",
     "config/",

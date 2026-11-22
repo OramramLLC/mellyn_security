@@ -1,4 +1,4 @@
-"""Fail-closed TOML/JSON policy loader for Mellyn Security (AegisAI)."""
+"""Fail-closed TOML/JSON policy loader for Mellyn Security."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from aegis_ai.models import Decision, RiskTier
-from aegis_ai.policy import (
+from mellyn.models import Decision, RiskTier
+from mellyn.policy import (
     DEFAULT_TOOL_RISK_TIERS,
     DEFAULT_UNTRUSTED_CONTENT_TOOLS,
     PolicyConfig,

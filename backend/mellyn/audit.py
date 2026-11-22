@@ -1,4 +1,4 @@
-"""Redacted structured audit logger for AegisAI authorization decisions."""
+"""Redacted structured audit logger for Mellyn Security authorization decisions."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, TextIO
 
-from aegis_ai.models import Decision, RiskTier, TaintSource, canonical_json, utc_now
+from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, utc_now
 
 SECRET_REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-(?:proj|svcacct|None)-[A-Za-z0-9_-]{10,}"),

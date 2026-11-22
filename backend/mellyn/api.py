@@ -1,4 +1,4 @@
-"""FastAPI HTTP adapter for the AegisAI Self-Hosted MCP Tool-Call Authorizer."""
+"""FastAPI HTTP adapter for the Mellyn Security Self-Hosted MCP Tool-Call Authorizer."""
 
 from __future__ import annotations
 
@@ -11,13 +11,14 @@ from typing import IO, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from aegis_ai.audit import AuditLogger
-from aegis_ai.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer, SessionLimitError
-from aegis_ai.credentials import CredentialConfig, CredentialConfigError, Role
-from aegis_ai.egress import check_workspace_root
-from aegis_ai.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
-from aegis_ai.policy import PolicyConfig
-from aegis_ai.policy_loader import load_policy_file
+from mellyn.audit import AuditLogger
+from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer, SessionLimitError
+from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
+from mellyn.egress import check_workspace_root
+from mellyn.legacy_env import check_no_legacy_env
+from mellyn.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
+from mellyn.policy import PolicyConfig
+from mellyn.policy_loader import load_policy_file
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 _STRICT = ConfigDict(extra="forbid", strict=True)
@@ -103,15 +104,15 @@ def create_app(
             loaded = None
 
     def require(role: Role) -> Callable[..., None]:
-        def dependency(x_aegis_api_key: str | None = Header(default=None)) -> None:
+        def dependency(x_mellyn_api_key: str | None = Header(default=None)) -> None:
             if loaded is None:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Gateway credentials are not configured (fail-closed).",
                 )
-            if not x_aegis_api_key:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Aegis-API-Key header.")
-            if not loaded.verify(x_aegis_api_key, role):
+            if not x_mellyn_api_key:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Mellyn-API-Key header.")
+            if not loaded.verify(x_mellyn_api_key, role):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Key is not valid for this route.")
 
         return dependency
@@ -196,21 +197,22 @@ def create_app_from_env() -> FastAPI:
     Uvicorn ASGI factory for self-hosted container deployments.
 
     Reads:
-      AEGIS_POLICY_PATH     optional path to a .toml/.json policy file (fails closed on error)
-      AEGIS_WORKSPACE_ROOT  optional workspace root directory (defaults to cwd); must be an existing directory
-      AEGIS_REQUIRE_WORKSPACE_MOUNT  "1" = refuse to start unless the workspace root is a mount point. Set in
+      MELLYN_POLICY_PATH     optional path to a .toml/.json policy file (fails closed on error)
+      MELLYN_WORKSPACE_ROOT  optional workspace root directory (defaults to cwd); must be an existing directory
+      MELLYN_REQUIRE_WORKSPACE_MOUNT  "1" = refuse to start unless the workspace root is a mount point. Set in
                             the container image: without the agent's real workspace mounted, the path guard
                             resolves links against an empty directory and cannot see where they lead.
-      AEGIS_AUDIT_LOG_PATH  optional append-only JSONL file path for redacted audit events
+      MELLYN_AUDIT_LOG_PATH  optional append-only JSONL file path for redacted audit events
     """
-    policy_path_raw = os.environ.get("AEGIS_POLICY_PATH", "").strip()
+    check_no_legacy_env()  # a half-migrated deployment must not start with its old settings silently ignored
+    policy_path_raw = os.environ.get("MELLYN_POLICY_PATH", "").strip()
     policy_config = load_policy_file(Path(policy_path_raw)) if policy_path_raw else None
 
-    workspace_raw = os.environ.get("AEGIS_WORKSPACE_ROOT", "").strip()
+    workspace_raw = os.environ.get("MELLYN_WORKSPACE_ROOT", "").strip()
     workspace_root = Path(workspace_raw) if workspace_raw else Path.cwd()
-    check_workspace_root(workspace_root, require_mount=os.environ.get("AEGIS_REQUIRE_WORKSPACE_MOUNT") == "1")
+    check_workspace_root(workspace_root, require_mount=os.environ.get("MELLYN_REQUIRE_WORKSPACE_MOUNT") == "1")
 
-    audit_path_raw = os.environ.get("AEGIS_AUDIT_LOG_PATH", "").strip()
+    audit_path_raw = os.environ.get("MELLYN_AUDIT_LOG_PATH", "").strip()
     audit_logger: AuditLogger | None = None
     sink: IO[str] | None = None
     if audit_path_raw:

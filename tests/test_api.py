@@ -1,6 +1,6 @@
 """
 HTTP-layer tests for the authorizer API. Skipped when FastAPI (and httpx, for TestClient) is not installed,
-unless AEGIS_REQUIRE_API_TESTS=1 is set (as in CI), in which case missing dependencies fail the run.
+unless MELLYN_REQUIRE_API_TESTS=1 is set (as in CI), in which case missing dependencies fail the run.
 """
 
 from __future__ import annotations
@@ -19,35 +19,35 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 HAS_FASTAPI = all(importlib.util.find_spec(name) is not None for name in ("fastapi", "httpx"))
-REQUIRE_API_TESTS = os.environ.get("AEGIS_REQUIRE_API_TESTS") == "1"
+REQUIRE_API_TESTS = os.environ.get("MELLYN_REQUIRE_API_TESTS") == "1"
 
 
 class TestApiDependenciesPresent(unittest.TestCase):
-    @unittest.skipUnless(REQUIRE_API_TESTS, "AEGIS_REQUIRE_API_TESTS is not set")
+    @unittest.skipUnless(REQUIRE_API_TESTS, "MELLYN_REQUIRE_API_TESTS is not set")
     def test_api_dependencies_are_installed(self) -> None:
-        self.assertTrue(HAS_FASTAPI, "AEGIS_REQUIRE_API_TESTS=1 but fastapi/httpx are missing; API tests would skip.")
+        self.assertTrue(HAS_FASTAPI, "MELLYN_REQUIRE_API_TESTS=1 but fastapi/httpx are missing; API tests would skip.")
 
 
 @unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
 class TestAuthorizerApi(unittest.TestCase):
     def setUp(self) -> None:
-        from aegis_ai.api import create_app
-        from aegis_ai.credentials import CredentialConfig, key_digest
         from fastapi.testclient import TestClient
+        from mellyn.api import create_app
+        from mellyn.credentials import CredentialConfig, key_digest
 
         self._tmpdir = tempfile.TemporaryDirectory()
         pepper = secrets.token_urlsafe(32)
         self.agent_key, self.approver_key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         credentials = CredentialConfig.from_env(
             {
-                "AEGIS_API_KEY_PEPPER": pepper,
-                "AEGIS_AGENT_KEY_DIGEST": key_digest(self.agent_key, pepper),
-                "AEGIS_APPROVER_KEY_DIGEST": key_digest(self.approver_key, pepper),
+                "MELLYN_API_KEY_PEPPER": pepper,
+                "MELLYN_AGENT_KEY_DIGEST": key_digest(self.agent_key, pepper),
+                "MELLYN_APPROVER_KEY_DIGEST": key_digest(self.approver_key, pepper),
             }
         )
         self.client = TestClient(create_app(Path(self._tmpdir.name), credentials=credentials))
-        self.agent = {"X-Aegis-API-Key": self.agent_key}
-        self.approver = {"X-Aegis-API-Key": self.approver_key}
+        self.agent = {"X-Mellyn-API-Key": self.agent_key}
+        self.approver = {"X-Mellyn-API-Key": self.approver_key}
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
@@ -67,7 +67,7 @@ class TestAuthorizerApi(unittest.TestCase):
 
     def test_routes_require_a_key(self) -> None:
         self.assertEqual(self.client.post("/v1/sessions").status_code, 401)
-        self.assertEqual(self.client.post("/v1/sessions", headers={"X-Aegis-API-Key": "wrong"}).status_code, 403)
+        self.assertEqual(self.client.post("/v1/sessions", headers={"X-Mellyn-API-Key": "wrong"}).status_code, 403)
 
     def test_agent_key_cannot_approve_its_own_calls(self) -> None:
         session = self.new_session()
@@ -116,34 +116,34 @@ class TestAuthorizerApi(unittest.TestCase):
 @unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
 class TestApiFailsClosedWithoutCredentials(unittest.TestCase):
     def test_every_protected_route_answers_503(self) -> None:
-        from aegis_ai.api import create_app
         from fastapi.testclient import TestClient
+        from mellyn.api import create_app
 
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict("os.environ", {}, clear=True):
             client = TestClient(create_app(Path(tmp)))
-            self.assertEqual(client.post("/v1/sessions", headers={"X-Aegis-API-Key": "anything"}).status_code, 503)
+            self.assertEqual(client.post("/v1/sessions", headers={"X-Mellyn-API-Key": "anything"}).status_code, 503)
             self.assertEqual(client.get("/healthz").status_code, 200)
 
 
 @unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
 class TestCreateAppFromEnv(unittest.TestCase):
     def test_fails_closed_on_invalid_policy_path(self) -> None:
-        from aegis_ai.api import create_app_from_env
-        from aegis_ai.policy_loader import PolicyLoadError
+        from mellyn.api import create_app_from_env
+        from mellyn.policy_loader import PolicyLoadError
 
         with tempfile.TemporaryDirectory() as tmp:
             env = {
-                "AEGIS_POLICY_PATH": str(Path(tmp) / "missing.toml"),
-                "AEGIS_WORKSPACE_ROOT": tmp,
-                "AEGIS_REQUIRE_WORKSPACE_MOUNT": "0",
+                "MELLYN_POLICY_PATH": str(Path(tmp) / "missing.toml"),
+                "MELLYN_WORKSPACE_ROOT": tmp,
+                "MELLYN_REQUIRE_WORKSPACE_MOUNT": "0",
             }
             with unittest.mock.patch.dict("os.environ", env, clear=True), self.assertRaises(PolicyLoadError):
                 create_app_from_env()
 
     def test_writes_audit_log_and_closes_sink_on_lifespan_shutdown(self) -> None:
-        from aegis_ai.api import create_app_from_env
-        from aegis_ai.credentials import key_digest
         from fastapi.testclient import TestClient
+        from mellyn.api import create_app_from_env
+        from mellyn.credentials import key_digest
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "ws"
@@ -153,20 +153,20 @@ class TestCreateAppFromEnv(unittest.TestCase):
             agent_key = secrets.token_urlsafe(32)
             approver_key = secrets.token_urlsafe(32)
             env = {
-                "AEGIS_WORKSPACE_ROOT": str(workspace),
-                "AEGIS_REQUIRE_WORKSPACE_MOUNT": "0",
-                "AEGIS_AUDIT_LOG_PATH": str(audit_file),
-                "AEGIS_API_KEY_PEPPER": pepper,
-                "AEGIS_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
-                "AEGIS_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
+                "MELLYN_WORKSPACE_ROOT": str(workspace),
+                "MELLYN_REQUIRE_WORKSPACE_MOUNT": "0",
+                "MELLYN_AUDIT_LOG_PATH": str(audit_file),
+                "MELLYN_API_KEY_PEPPER": pepper,
+                "MELLYN_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
+                "MELLYN_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
             }
             with unittest.mock.patch.dict("os.environ", env, clear=True):
                 app = create_app_from_env()
                 with TestClient(app) as client:
-                    sid = client.post("/v1/sessions", headers={"X-Aegis-API-Key": agent_key}).json()["session_id"]
+                    sid = client.post("/v1/sessions", headers={"X-Mellyn-API-Key": agent_key}).json()["session_id"]
                     res = client.post(
                         "/v1/agent/authorize",
-                        headers={"X-Aegis-API-Key": agent_key},
+                        headers={"X-Mellyn-API-Key": agent_key},
                         json={"session_id": sid, "tool_name": "git_status", "arguments": {}},
                     )
                     self.assertEqual(res.status_code, 200)
@@ -174,6 +174,17 @@ class TestCreateAppFromEnv(unittest.TestCase):
             lines = audit_file.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertIn("git_status", lines[0])
+
+
+@unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
+class TestApiRefusesHalfMigratedEnvironment(unittest.TestCase):
+    def test_create_app_from_env_refuses_old_prefixed_variables(self) -> None:
+        from mellyn.api import create_app_from_env
+        from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError
+
+        with unittest.mock.patch.dict("os.environ", {LEGACY_ENV_PREFIX + "API_KEY_PEPPER": "x" * 40}, clear=True):
+            with self.assertRaises(LegacyConfigError):
+                create_app_from_env()
 
 
 if __name__ == "__main__":

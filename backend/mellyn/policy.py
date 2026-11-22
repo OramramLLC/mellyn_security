@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegis_ai.models import Decision, RiskTier, ToolCallRequest
+from mellyn.models import Decision, RiskTier, ToolCallRequest
 
 DEFAULT_TOOL_RISK_TIERS: dict[str, RiskTier] = {
     # Low-risk: read-only inside workspace

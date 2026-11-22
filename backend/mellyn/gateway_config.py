@@ -7,8 +7,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from aegis_ai.policy import validate_argv
-from aegis_ai.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
+from mellyn.policy import validate_argv
+from mellyn.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
 
 # Lowercase letters, digits and single hyphens. No underscores, so "<server>__<tool>" always splits cleanly.
 SERVER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$")

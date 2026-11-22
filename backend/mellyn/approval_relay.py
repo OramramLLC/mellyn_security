@@ -9,10 +9,10 @@ Docker does not publish host ports for containers that are only on internal netw
 `POST /v1/pending/apr_.../(approve|reject)`) from host loopback (`127.0.0.1:8765` on
 `mellyn-frontend`) to `mellyn-gateway:8765` on `mellyn-internal`:
   - `mellyn-gateway` keeps zero direct internet access.
-  - The human runs `python -m aegis_ai.approve --url http://127.0.0.1:8765 ...` on the host,
+  - The human runs `python -m mellyn.approve --url http://127.0.0.1:8765 ...` on the host,
     so the raw approver key never enters `mellyn-gateway`'s container process tree.
   - The relay itself holds zero credentials (`.env` is not mounted); `mellyn-gateway` verifies
-    `X-Aegis-API-Key` against `AEGIS_APPROVER_KEY_DIGEST`.
+    `X-Mellyn-API-Key` against `MELLYN_APPROVER_KEY_DIGEST`.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from aegis_ai.approvals import API_KEY_HEADER, MAX_BODY_BYTES, MAX_PENDING
+from mellyn.approvals import API_KEY_HEADER, MAX_BODY_BYTES, MAX_PENDING
 
 # Largest reply the relay will pass back. GET /v1/pending can hold MAX_PENDING calls, each with up to 64 KiB of
 # arguments plus their reasons, so this must comfortably exceed MAX_PENDING * 64 KiB. A larger reply is

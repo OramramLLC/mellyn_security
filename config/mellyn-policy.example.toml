@@ -1,5 +1,5 @@
 # Mellyn Security — Example Self-Hosted MCP Gateway Policy
-# Loaded strictly and fail-closed by `aegis_ai.policy_loader.load_policy_file()`.
+# Loaded strictly and fail-closed by `mellyn.policy_loader.load_policy_file()`.
 
 schema_version = 1
 

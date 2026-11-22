@@ -14,7 +14,7 @@ BACKEND_DIR = REPO_ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai import (  # noqa: E402
+from mellyn import (  # noqa: E402
     Authorizer,
     Decision,
     PolicyConfig,
@@ -26,15 +26,15 @@ from aegis_ai import (  # noqa: E402
     ToolCapability,
     parse_policy_dict,
 )
-from aegis_ai.mcp_gateway import (  # noqa: E402
+from mellyn.mcp_gateway import (  # noqa: E402
     MELLYN_POLICY_DENIED,
     GatewayLocalError,
     MCPGateway,
     _local_downstream_error,
     compute_tools_hash,
 )
-from aegis_ai.models import canonical_json  # noqa: E402
-from aegis_ai.policy import normalize_arg_value  # noqa: E402
+from mellyn.models import canonical_json  # noqa: E402
+from mellyn.policy import normalize_arg_value  # noqa: E402
 
 
 class TestCapabilityBindings(unittest.TestCase):

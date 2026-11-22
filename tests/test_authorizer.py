@@ -1,4 +1,4 @@
-"""Security regression tests for the AegisAI MCP Tool-Call Authorizer."""
+"""Security regression tests for the Mellyn Security MCP Tool-Call Authorizer."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ BACKEND_DIR = REPO_ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai import (  # noqa: E402
+from mellyn import (  # noqa: E402
     Authorizer,
     Decision,
     PolicyConfig,
@@ -24,7 +24,7 @@ from aegis_ai import (  # noqa: E402
     TaintSource,
     ToolCallRequest,
 )
-from aegis_ai.policy import DEFAULT_TOOL_RISK_TIERS  # noqa: E402
+from mellyn.policy import DEFAULT_TOOL_RISK_TIERS  # noqa: E402
 
 NOW = datetime(2026, 11, 21, 19, 0, 0, tzinfo=UTC)
 
@@ -169,7 +169,7 @@ class TestWorkspaceBoundaries(AuthorizerTestCase):
             ".git/config",
             "AGENTS.md",
             ".gitattributes",
-            # This repository's own security core (backend/aegis_ai/, scripts/, tests/, ...) is protected by
+            # This repository's own security core (backend/mellyn/, scripts/, tests/, ...) is protected by
             # config/mellyn-self-policy.toml, not by the built-in list; see test_pr2_runtime_and_scanners.py.
             # Case variants, which reach the same file on Windows and macOS
             "claude.md",

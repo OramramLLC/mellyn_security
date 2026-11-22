@@ -1,4 +1,4 @@
-"""Core domain models for the Mellyn Security (AegisAI) Tool-Call Authorizer."""
+"""Core domain models for the Mellyn Security Tool-Call Authorizer."""
 
 from __future__ import annotations
 

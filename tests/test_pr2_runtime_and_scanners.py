@@ -17,16 +17,16 @@ for p in (BACKEND_DIR, SCRIPTS_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from aegis_ai import Authorizer, Decision, ToolCallRequest, load_policy_file  # noqa: E402
-from aegis_ai.approval_relay import (  # noqa: E402
+from mellyn import Authorizer, Decision, ToolCallRequest, load_policy_file  # noqa: E402
+from mellyn.approval_relay import (  # noqa: E402
     MAX_RELAY_RESPONSE_BYTES,
     ApprovalRelayServer,
     is_allowed_approval_route,
     validate_upstream,
 )
-from aegis_ai.approvals import MAX_PENDING  # noqa: E402
-from aegis_ai.audit import redact_text  # noqa: E402
-from aegis_ai.policy import validate_argv  # noqa: E402
+from mellyn.approvals import MAX_PENDING  # noqa: E402
+from mellyn.audit import redact_text  # noqa: E402
+from mellyn.policy import validate_argv  # noqa: E402
 from sync_agent_rules import hidden_characters  # noqa: E402
 
 

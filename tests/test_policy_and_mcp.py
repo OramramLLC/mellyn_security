@@ -21,7 +21,7 @@ FAKE_SERVER = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai import (  # noqa: E402
+from mellyn import (  # noqa: E402
     Authorizer,
     CredentialConfig,
     Decision,
@@ -32,12 +32,12 @@ from aegis_ai import (  # noqa: E402
     load_policy_file,
     parse_policy_dict,
 )
-from aegis_ai.approvals import ApprovalHTTPServer, PendingApprovals  # noqa: E402
-from aegis_ai.approve import validate_approval_url  # noqa: E402
-from aegis_ai.audit import AuditLogger  # noqa: E402
-from aegis_ai.credentials import key_digest  # noqa: E402
-from aegis_ai.gateway_config import load_gateway_config  # noqa: E402
-from aegis_ai.mcp_gateway import (  # noqa: E402
+from mellyn.approvals import ApprovalHTTPServer, PendingApprovals  # noqa: E402
+from mellyn.approve import validate_approval_url  # noqa: E402
+from mellyn.audit import AuditLogger  # noqa: E402
+from mellyn.credentials import key_digest  # noqa: E402
+from mellyn.gateway_config import load_gateway_config  # noqa: E402
+from mellyn.mcp_gateway import (  # noqa: E402
     JSONRPC_INVALID_PARAMS,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
@@ -399,7 +399,7 @@ class TestStdioDownstream(unittest.TestCase):
 
 
 class TestGatewayEndToEnd(unittest.TestCase):
-    """Runs `python -m aegis_ai.mcp_gateway` as a real process in front of the fake server."""
+    """Runs `python -m mellyn.mcp_gateway` as a real process in front of the fake server."""
 
     def test_full_gateway_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,13 +429,13 @@ class TestGatewayEndToEnd(unittest.TestCase):
                 },
                 {"jsonrpc": "2.0", "id": 5, "method": "ping"},
             ]
-            env = {k: v for k, v in os.environ.items() if not k.startswith("AEGIS_")}
+            env = {k: v for k, v in os.environ.items() if not k.startswith("MELLYN_")}
             env["PYTHONPATH"] = str(BACKEND_DIR)
             proc = subprocess.run(  # noqa: S603 - fixed argv, test only
                 [
                     sys.executable,
                     "-m",
-                    "aegis_ai.mcp_gateway",
+                    "mellyn.mcp_gateway",
                     "--config",
                     str(workspace / "gateway.toml"),
                     "--workspace",
@@ -470,7 +470,7 @@ class TestApprovalServer(unittest.TestCase):
         pepper = secrets.token_urlsafe(32)
         self.approver_key = secrets.token_urlsafe(32)
         credentials = CredentialConfig.from_env(
-            {"AEGIS_API_KEY_PEPPER": pepper, "AEGIS_APPROVER_KEY_DIGEST": key_digest(self.approver_key, pepper)},
+            {"MELLYN_API_KEY_PEPPER": pepper, "MELLYN_APPROVER_KEY_DIGEST": key_digest(self.approver_key, pepper)},
             roles=frozenset({Role.APPROVER}),
         )
         self.authorizer = Authorizer(
@@ -489,7 +489,7 @@ class TestApprovalServer(unittest.TestCase):
     def http(self, method: str, path: str, key: str | None, body: dict[str, Any] | None = None) -> tuple[int, Any]:
         headers = {"Content-Type": "application/json"}
         if key is not None:
-            headers["X-Aegis-API-Key"] = key
+            headers["X-Mellyn-API-Key"] = key
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(self.server.url + path, data=data, method=method, headers=headers)  # noqa: S310
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback test server; no proxies

@@ -87,51 +87,73 @@ Every tool call the harness submits passes through `Authorizer.authorize(...)`:
 
 ```text
 V1/
-├── .agent/rules/                  # Canonical OWASP AI security ruleset
-├── .claude/settings.json          # Claude Code permission rules (secret denials, approval gates)
+├── .agent/rules/                    # Canonical OWASP AI steering guidelines
+├── .claude/settings.json            # Claude Code permission rules (secret denials, approval gates)
 ├── .github/
-│   ├── CODEOWNERS                 # Mandatory owner review on guardrails, CI, and auth core
-│   ├── copilot-instructions.md    # Generated from .agent/rules (verified by sync check)
+│   ├── CODEOWNERS                   # Mandatory owner review on guardrails, CI, configs, and runtime core
+│   ├── copilot-instructions.md      # Generated from .agent/rules (verified by sync check)
 │   └── workflows/
-│       └── ai-security-gate.yml   # SHA-pinned CI security gate (Gitleaks, Semgrep, tests)
+│       ├── ai-security-gate.yml     # Repo CI gate (Gitleaks, Semgrep, tests, container & Squid harness)
+│       └── mellyn-reusable-ai-security-gate.yml # Reusable SHA-pinned workflow_call gate for B2B clients
 ├── .semgrep/
-│   ├── owasp-ai-code-rules.yaml   # Custom SAST rules targeting AI-generated code flaws
-│   ├── owasp-ai-code-rules.py     # Semgrep rule test cases (Python)
-│   └── owasp-ai-code-rules.tsx    # Semgrep rule test cases (TypeScript/React)
+│   ├── owasp-ai-code-rules.yaml     # Custom SAST rules targeting AI-generated code flaws
+│   ├── owasp-ai-code-rules.py       # Semgrep rule test cases (Python)
+│   └── owasp-ai-code-rules.tsx      # Semgrep rule test cases (TypeScript/React)
 ├── backend/
-│   └── aegis_ai/                  # Self-hosted MCP Tool-Call Authorizer (Python 3.12+)
-│       ├── models.py              # Typed requests, decisions, risk tiers, grants, signals
-│       ├── egress.py              # SSRF & outbound destination allowlist validator
-│       ├── policy.py              # Scoped tool policy engine & taint-aware evaluator
-│       ├── authorizer.py          # Core Authorizer: sessions, taint, policy, grants & audit
-│       ├── audit.py               # Redacted structured audit logger (no raw secrets/prompts)
-│       ├── credentials.py         # Agent / approver API keys as HMAC-SHA256 digests with a pepper
-│       ├── policy_loader.py       # Strict, fail-closed TOML/JSON policy loader
-│       ├── gateway_config.py      # Strict loader for the gateway's server list
-│       ├── mcp_gateway.py         # stdio MCP gateway fronting all downstream servers
-│       ├── approvals.py           # Pending approvals + loopback-only approval server
-│       ├── approve.py             # Approver CLI (python -m aegis_ai.approve)
-│       └── api.py                 # FastAPI HTTP adapter (/v1/sessions, /v1/agent/authorize, grants)
-├── config/                        # Example policy and gateway configs (protected from agent writes)
+│   └── mellyn/                      # Self-hosted MCP Tool-Call Authorizer & Gateway (Python 3.12+)
+│       ├── models.py                # Strict RFC 8259 JSON models, decisions, risk tiers, grants, signals
+│       ├── egress.py                # SSRF validator & workspace path/secret/guardrail confinement
+│       ├── egress_proxy.py          # Policy-synced Squid forward-proxy config generator (TM-02)
+│       ├── policy.py                # Capability bindings, presets, type-strict rules & argv evaluator guard
+│       ├── policy_loader.py         # Fail-closed TOML/JSON policy loader
+│       ├── authorizer.py            # Core Authorizer: sessions, taint, capabilities, policy, grants & audit
+│       ├── audit.py                 # Redacted structured JSONL audit logger
+│       ├── credentials.py           # Role-separated agent/approver keys as HMAC-SHA256(pepper, key) digests
+│       ├── legacy_env.py            # Refuses to start while pre-rename variables are still set
+│       ├── gateway_config.py        # Strict loader for the MCP gateway's downstream server list
+│       ├── mcp_gateway.py           # Single-session multi-server stdio MCP gateway + pinned tool hashes
+│       ├── approvals.py             # Pending approvals store + HTTP approval server
+│       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
+│       ├── approve.py               # Approver CLI (python -m mellyn.approve)
+│       └── api.py                   # FastAPI HTTP adapter (/healthz, /v1/sessions, /v1/agent/authorize, grants)
+├── config/
+│   ├── mellyn-policy.example.toml   # Starter policy for client workspaces
+│   ├── mellyn-self-policy.toml      # Dogfooding policy protecting this repository's own core
+│   └── mellyn-gateway.example.toml  # Example multi-server MCP gateway config
+├── deploy/
+│   ├── README.md                    # Self-hosted container & egress proxy deployment guide
+│   ├── docker-compose.yml           # Isolated internal network, Squid egress, authorizer & approval relay
+│   ├── requirements.lock            # Hash-pinned Python runtime & transitive wheel lockfile
+│   └── egress/
+│       ├── Dockerfile               # Digest-pinned Ubuntu Squid egress image
+│       └── squid.conf               # Policy-generated Squid config
 ├── docs/
-│   ├── ARCHITECTURE.md            # This document
-│   ├── THREAT_MODEL.md            # Gateway threat model (STRIDE + OWASP Agentic/LLM)
-│   └── OWASP_AI_CODING_SECURITY.md# OWASP Secure Coding with AI synthesis
+│   ├── ARCHITECTURE.md              # This document
+│   ├── CLIENT_ONBOARDING.md         # 10-minute B2B client onboarding guide (CI gate & pre-commit pack)
+│   ├── OWASP_AI_CODING_SECURITY.md  # OWASP AI-assisted & agentic security synthesis
+│   └── THREAT_MODEL.md              # Gateway threat model & automated test traceability matrix
 ├── scripts/
-│   ├── verify_dependencies.py     # Anti-slopsquatting & 90-day registry age verifier
-│   └── sync_agent_rules.py        # Canonical rules generator & hidden-Unicode detector
-├── tests/                         # Unit tests (stdlib unittest; API tests skip unless FastAPI is installed)
-├── .cursorrules                   # Generated from .agent/rules (verified by sync check)
-├── .gitleaks.toml                 # AI + Cloud secret detection rules (value-based allowlist)
-├── .pre-commit-config.yaml        # Local deterministic pre-commit hooks
-├── CLAUDE.md                      # Claude Code context (imports .agent/rules)
-└── pyproject.toml                 # Python project manifest
+│   ├── verify_dependencies.py       # Manifest, lockfile, hash, 90d package & 14d release-cooldown verifier
+│   ├── sync_agent_rules.py          # Canonical rules generator & hidden-Unicode smuggling detector
+│   └── verify_container_stack.py    # End-to-end Docker build, mount, role & DNS-rebinding CI harness
+├── tests/                           # Security & regression test suites
+├── .cursorrules                     # Generated from .agent/rules (verified by sync check)
+├── .dockerignore                    # Excludes secrets, .git, and .venv from container build context
+├── .env.example                     # Placeholder environment configuration
+├── .gitattributes                   # Line-ending normalization
+├── .gitleaks.toml                   # AI + Cloud secret detection rules (value-based allowlist)
+├── .mellyn-allowlist.toml           # Audited, expiring package/version age exemptions
+├── .pre-commit-config.yaml          # Local deterministic pre-commit hooks
+├── .pre-commit-hooks.yaml           # Exported SHA-pinnable pre-commit hook manifest for client repos
+├── CLAUDE.md                        # Claude Code context (imports .agent/rules)
+├── Dockerfile                       # Digest- and hash-pinned non-root Mellyn runtime container
+└── pyproject.toml                   # Python project manifest
 ```
 
 ---
 
 ## 5. B2B SMB Delivery Roadmap
 
-1. **Product 1 (Built & packaged) — Versioned Repo-Hardening Pack**: The guardrails are packaged as a SHA-pinned pre-commit hook pack (`.pre-commit-hooks.yaml`) and a reusable GitHub Actions workflow (`.github/workflows/mellyn-reusable-ai-security-gate.yml`), so SMB clients receive versioned guardrail updates without copy-paste drift. See [`CLIENT_ONBOARDING.md`](CLIENT_ONBOARDING.md). The reusable workflow has not yet run in a client repository on GitHub.
-2. **Product 2 (Active MVP) — Self-Hosted MCP Tool-Call Authorizer**: The authorization core, the HTTP API, and the stdio MCP gateway exist. Still to build before it is a product: persistent session state, pinning of approved tool descriptions, and an approval UI. A digest-pinned container image and a compose stack with a Squid egress proxy exist (`deploy/`) and have been built and run end to end on Docker Desktop.
+1. **Product 1 (Built & packaged) — Versioned Repo-Hardening Pack**: Packaged as a SHA-pinned pre-commit hook pack (`.pre-commit-hooks.yaml`) and a reusable GitHub Actions workflow (`.github/workflows/mellyn-reusable-ai-security-gate.yml`), so SMB clients receive versioned guardrail updates without copy-paste drift. See [`CLIENT_ONBOARDING.md`](CLIENT_ONBOARDING.md).
+2. **Product 2 (Active MVP) — Self-Hosted MCP Tool-Call Authorizer & Gateway**: The capability-bound authorization core, pinned tool-description hashes, HTTP API, stdio MCP gateway, host approval relay, and digest/hash-pinned Docker + Squid egress stack (`deploy/`, continuously verified in CI via `scripts/verify_container_stack.py`) are implemented and tested. Still to build before v1.0 GA: persistent session state and a browser approval UI.
 3. **Product 3 (Later) — Redacted Posture & Evidence Viewer**: Lightweight Next.js UI over real redacted audit logs, providing structured control evidence mapped to OWASP LLM Top 10, OWASP Agentic Top 10, and NIST AI RMF.
