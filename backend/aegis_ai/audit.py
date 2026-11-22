@@ -32,14 +32,18 @@ def redact_text(value: str) -> str:
     return sanitized
 
 
-def hash_arguments(arguments: dict[str, Any]) -> str:
+def hash_arguments(arguments: Any) -> str:
     """
     Deterministic SHA-256 digest of tool arguments, for correlating events without storing payloads.
 
     It is unsalted, so low-entropy arguments (a branch name, a short path) can be recovered by guessing.
     Treat the audit log as confidential, not as anonymized.
     """
-    return hashlib.sha256(canonical_json(arguments).encode("utf-8")).hexdigest()
+    try:
+        payload = canonical_json(arguments).encode("utf-8")
+    except (TypeError, ValueError):
+        payload = f"invalid:{type(arguments).__name__}:{arguments!r}".encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)

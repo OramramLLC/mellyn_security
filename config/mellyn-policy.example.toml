@@ -43,6 +43,12 @@ deny_on_dlp_secret = true
 "local-workspace/shell_exec" = "high"
 "github-readonly/get_issue" = "low"
 
+# Capability bindings. Every LOW or MEDIUM tool must map to a built-in capability, a server preset
+# (e.g. `server_presets = { "local-workspace" = "mcp-filesystem" }`), or an explicit capability entry
+# below so workspace/URL/shell hard boundaries apply regardless of what a server names its tools.
+[tool_capabilities."github-readonly/get_issue"]
+pure = true
+
 # Narrow, exact-match scoped rules. ALLOW rules must name their server and list exact arguments.
 [[scoped_rules]]
 rule_id = "allow-unit-tests-when-tainted"

@@ -1,4 +1,4 @@
-"""Core AegisAI Authorizer orchestrating sessions, taint, policy, grants, egress, and audit."""
+"""Core Mellyn Security Authorizer orchestrating sessions, taint, capabilities, policy, grants, egress, and audit."""
 
 from __future__ import annotations
 
@@ -22,12 +22,17 @@ from aegis_ai.models import (
     ToolCallRequest,
     canonical_json,
     utc_now,
+    validate_json_value,
 )
-from aegis_ai.policy import SHELL_TOOL_NAMES, PolicyConfig, PolicyEngine, ScopedRule, validate_argv
+from aegis_ai.policy import (
+    UNBOUND_PATH_ARG_NAMES,
+    PolicyConfig,
+    PolicyEngine,
+    ScopedRule,
+    ToolCapability,
+    validate_argv,
+)
 
-NETWORK_TOOL_NAMES: frozenset[str] = frozenset({"http_get", "http_post", "http_fetch", "webhook_call"})
-WORKSPACE_READ_TOOLS: frozenset[str] = frozenset({"workspace_read", "workspace_search"})
-WORKSPACE_WRITE_TOOLS: frozenset[str] = frozenset({"workspace_write", "workspace_delete"})
 # MCP resources/read is authorized as a pseudo-tool of this name, with arguments {"uri": ...}.
 RESOURCE_READ_TOOL = "resources/read"
 
@@ -53,9 +58,10 @@ class Authorizer:
     Deterministic, authorization-first tool-call gatekeeper.
 
     Decision invariant:
-    1. Hard security boundaries (known session, MCP allowlist, workspace secret/guardrail jail,
-       argv-only shell execution, SSRF/egress allowlist, explicit DENY rules) ALWAYS deny regardless
-       of taint state, approval grants, or risk scores.
+    1. Hard security boundaries (known session, strict RFC 8259 JSON arguments, MCP allowlist,
+       capability-bound workspace secret/guardrail jail, argv-only shell execution, SSRF/egress
+       allowlist, explicit DENY rules) ALWAYS deny regardless of taint state, approval grants, or
+       risk scores.
     2. High-risk tools in a tainted session are NEVER auto-allowed without an explicit taint-safe
        scoped policy rule or a valid human grant for that exact call.
     3. Supporting signals (prompt-injection score, DLP secret hit) can only escalate a decision
@@ -64,8 +70,9 @@ class Authorizer:
     Session model: session IDs are issued by the authorizer (`create_session`) and unknown IDs are
     denied, so a caller cannot shed taint by inventing a fresh ID, and a restart (which clears this
     in-memory state) fails closed rather than resetting every session to clean. Taint is recorded
-    automatically whenever the authorizer allows a call whose result brings outside content into the
-    session; `mark_tainted` is for other sources the harness knows about (an issue body, a PR comment).
+    automatically whenever an allowed call's result brings outside content into the session (by
+    `authorize`, or by `record_tool_result_taint` once the gateway has the server's reply);
+    `mark_tainted` is for other sources the harness knows about (an issue body, a PR comment).
     """
 
     def __init__(
@@ -138,6 +145,26 @@ class Authorizer:
             state = self._session(session_id)
             state.last_seen_at = check_time
             state.taints.append(source)
+
+    def record_tool_result_taint(self, request: ToolCallRequest, *, now: datetime | None = None) -> bool:
+        """
+        Record taint from an allowed tool call's result AFTER downstream execution succeeds.
+
+        Used by `MCPGateway` (which calls `authorize(..., record_taint_on_allow=False)`) so failed
+        or timed-out downstream requests do not taint the session with content that never arrived.
+        """
+        if not self.policy.brings_untrusted_content(request):
+            return False
+        check_time = now or utc_now()
+        origin = f"{request.mcp_server or 'local'}:{request.tool_name}"
+        with self._lock:
+            self._prune_sessions_locked(check_time)
+            state = self._sessions.get(request.session_id)
+            if state is None:
+                return False
+            state.last_seen_at = check_time
+            state.taints.append(TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time))
+        return True
 
     def is_tainted(self, session_id: str) -> bool:
         with self._lock:
@@ -212,12 +239,24 @@ class Authorizer:
 
     # ---- Authorization ---------------------------------------------------------------------------
 
-    def authorize(self, request: ToolCallRequest, *, now: datetime | None = None) -> AuthorizationResult:
+    def authorize(
+        self,
+        request: ToolCallRequest,
+        *,
+        now: datetime | None = None,
+        record_taint_on_allow: bool = True,
+    ) -> AuthorizationResult:
         """Evaluate a tool call and record a redacted audit event."""
         with self._lock:
-            return self._authorize_locked(request, now or utc_now())
+            return self._authorize_locked(request, now or utc_now(), record_taint_on_allow=record_taint_on_allow)
 
-    def _authorize_locked(self, request: ToolCallRequest, check_time: datetime) -> AuthorizationResult:
+    def _authorize_locked(
+        self,
+        request: ToolCallRequest,
+        check_time: datetime,
+        *,
+        record_taint_on_allow: bool,
+    ) -> AuthorizationResult:
         self._prune_sessions_locked(check_time)
         risk_tier = self.policy.classify_risk(request.tool_name, request.mcp_server)
         state = self._sessions.get(request.session_id)
@@ -228,7 +267,6 @@ class Authorizer:
             return self._finalize(request, Decision.DENY, risk_tier, False, (), [reason])
 
         state.last_seen_at = check_time
-
         tainted = bool(state.taints)
         taint_sources = tuple(state.taints)
         reasons: list[str] = []
@@ -238,41 +276,49 @@ class Authorizer:
         def deny(reason: str) -> AuthorizationResult:
             return self._finalize(request, Decision.DENY, risk_tier, tainted, taint_sources, [*reasons, reason])
 
+        # 0b. Hard boundary: arguments must be a valid RFC 8259 JSON mapping
+        if not isinstance(request.arguments, dict):
+            return deny("Tool arguments must be a dictionary.")
+        try:
+            validate_json_value(request.arguments)
+        except (TypeError, ValueError) as exc:
+            return deny(f"Invalid tool arguments: {exc}")
+
         # 1. Hard boundary: MCP server allowlist
         mcp_ok, mcp_reason = self.policy.check_mcp_server(request.mcp_server)
         if not mcp_ok:
             return deny(mcp_reason)
 
-        # 2. Hard boundary: Workspace path confinement & secret/guardrail protection
-        if request.tool_name in WORKSPACE_READ_TOOLS or request.tool_name in WORKSPACE_WRITE_TOOLS:
-            is_write = request.tool_name in WORKSPACE_WRITE_TOOLS
-            path_ok, path_reason = self.path_guard.validate_path(request.arguments.get("path", ""), is_write=is_write)
-            if not path_ok:
-                return deny(path_reason)
-            reasons.append(path_reason)
-
-        # 2b. Hard boundary: MCP resource reads of file:// URIs get the same path guard as workspace_read
+        # 2. Hard boundary: MCP resource reads of file:// URIs
         if request.tool_name == RESOURCE_READ_TOOL:
             uri_ok, uri_reason = self._check_resource_uri(request.arguments.get("uri"))
             if not uri_ok:
                 return deny(uri_reason)
             reasons.append(uri_reason)
 
-        # 3. Hard boundary: shell tools take an argv list, never a string a shell would parse
-        if request.tool_name in SHELL_TOOL_NAMES:
-            argv_ok, argv_reason = validate_argv(request.arguments)
-            if not argv_ok:
-                return deny(argv_reason)
-            reasons.append(argv_reason)
-
-        # 4. Hard boundary: Network egress / SSRF allowlist
-        if request.tool_name in NETWORK_TOOL_NAMES or "url" in request.arguments:
+        # 3. Hard boundary: Capability-bound path, shell, and URL guards
+        capability = self.policy.capability_for(request.tool_name, request.mcp_server)
+        if capability is not None:
+            cap_ok, cap_reasons = self._enforce_capability(capability, request.arguments)
+            if not cap_ok:
+                return deny(cap_reasons[0])
+            reasons.extend(cap_reasons)
+        else:
+            # No binding: guess path arguments by name and hold them to the write rules (see UNBOUND_PATH_ARG_NAMES).
+            path_ok, path_reasons = self._guard_unbound_paths(request.arguments)
+            if not path_ok:
+                return deny(path_reasons[0])
+            reasons.extend(path_reasons)
+        # Defense in depth: a "url" argument is checked against the egress allowlist on EVERY tool, whatever its
+        # capability says, unless that capability already checked it. A pure or path-only tool must not become
+        # a way to hand a server an internal or metadata URL.
+        if "url" in request.arguments and (capability is None or "url" not in capability.url_args):
             url_ok, url_reason = self.egress.validate_url(request.arguments.get("url", ""))
             if not url_ok:
                 return deny(url_reason)
             reasons.append(url_reason)
 
-        # 5. Evaluate scoped policy rules (explicit DENY always wins)
+        # 4. Evaluate scoped policy rules (explicit DENY always wins)
         matched_rule = self.policy.match_scoped_rule(request)
         if matched_rule and matched_rule.effect == Decision.DENY:
             reasons.append(f"Denied by scoped policy '{matched_rule.rule_id}': {matched_rule.description}")
@@ -280,12 +326,12 @@ class Authorizer:
                 request, Decision.DENY, risk_tier, tainted, taint_sources, reasons, policy_id=matched_rule.rule_id
             )
 
-        # 6. Base decision from risk tier + taint state + scoped allow
+        # 5. Base decision from risk tier + taint state + scoped allow
         decision = self._evaluate_base_decision(risk_tier, tainted, matched_rule, reasons)
         if matched_rule and decision == Decision.ALLOW:
             policy_id = matched_rule.rule_id
 
-        # 7. A human grant for this exact call can turn REQUIRE_APPROVAL into ALLOW
+        # 6. A human grant for this exact call can turn REQUIRE_APPROVAL into ALLOW
         matching_grant = None
         if decision == Decision.REQUIRE_APPROVAL:
             matching_grant = self._find_matching_grant(request, check_time)
@@ -296,15 +342,16 @@ class Authorizer:
                     f"Approved by human grant '{matching_grant.grant_id}' (approved_by={matching_grant.approved_by})."
                 )
 
-        # 8. Apply supporting risk signals (escalate ONLY; never downgrade)
+        # 7. Apply supporting risk signals (escalate ONLY; never downgrade)
         decision = self._apply_risk_signals(request, decision, reasons)
 
         if decision == Decision.ALLOW:
             # A grant is spent only by a call it actually let through.
             if matching_grant is not None:
                 self._grant_uses[matching_grant.grant_id] += 1
-            # 9. The result of this call will enter the agent's context: taint the session.
-            if self.policy.brings_untrusted_content(request):
+            # The result of this call will enter the agent's context: taint the session (the gateway defers
+            # this to record_tool_result_taint, once it knows whether the server actually replied).
+            if record_taint_on_allow and self.policy.brings_untrusted_content(request):
                 origin = f"{request.mcp_server or 'local'}:{request.tool_name}"
                 state.taints.append(TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time))
                 reasons.append(f"Session tainted by the result of '{origin}'.")
@@ -321,6 +368,70 @@ class Authorizer:
             policy_id=policy_id,
             grant_id=grant_id,
         )
+
+    def _enforce_capability(self, capability: ToolCapability, arguments: dict[str, Any]) -> tuple[bool, list[str]]:
+        """Run every hard-boundary guard declared by `capability`. Fails closed on missing or invalid args."""
+        notes: list[str] = []
+
+        for arg_name in capability.path_read_args:
+            ok, reason = self.path_guard.validate_path(arguments.get(arg_name, ""), is_write=False)
+            if not ok:
+                return False, [reason]
+            notes.append(reason)
+
+        for arg_name in capability.optional_path_read_args:
+            raw_val = arguments.get(arg_name)
+            target = "." if raw_val is None else raw_val
+            ok, reason = self.path_guard.validate_path(target, is_write=False)
+            if not ok:
+                return False, [reason]
+            notes.append(reason)
+
+        for arg_name in capability.path_read_list_args:
+            paths = arguments.get(arg_name)
+            if not isinstance(paths, list | tuple) or not paths:
+                return False, [f"Argument '{arg_name}' must be a non-empty list of paths."]
+            for item in paths:
+                ok, reason = self.path_guard.validate_path(item, is_write=False)
+                if not ok:
+                    return False, [reason]
+                notes.append(reason)
+
+        for arg_name in capability.path_write_args:
+            ok, reason = self.path_guard.validate_path(arguments.get(arg_name, ""), is_write=True)
+            if not ok:
+                return False, [reason]
+            notes.append(reason)
+
+        if capability.shell_argv_arg is not None:
+            ok, reason = validate_argv(arguments, argv_key=capability.shell_argv_arg)
+            if not ok:
+                return False, [reason]
+            notes.append(reason)
+
+        for arg_name in capability.url_args:
+            ok, reason = self.egress.validate_url(arguments.get(arg_name, ""))
+            if not ok:
+                return False, [reason]
+            notes.append(reason)
+
+        return True, notes
+
+    def _guard_unbound_paths(self, arguments: dict[str, Any]) -> tuple[bool, list[str]]:
+        """Path-like arguments of a tool with no capability binding, checked as writes (strictest)."""
+        notes: list[str] = []
+        for name, value in arguments.items():
+            if name.lower() not in UNBOUND_PATH_ARG_NAMES:
+                continue
+            values = value if isinstance(value, list | tuple) else [value]
+            for item in values:
+                if not isinstance(item, str):
+                    continue  # not a path string; a bound capability would reject it, a guess should not
+                ok, reason = self.path_guard.validate_path(item, is_write=True)
+                if not ok:
+                    return False, [f"Unbound tool argument '{name}': {reason}"]
+                notes.append(f"Unbound tool argument '{name}': {reason}")
+        return True, notes
 
     def _check_resource_uri(self, uri: object) -> tuple[bool, str]:
         if not isinstance(uri, str) or not uri.strip():
