@@ -1,4 +1,4 @@
-# AegisAI — AI Security Engineering Architecture & B2B Guardrail Platform
+# Mellyn Security — AI Security Engineering Architecture & B2B Guardrail Platform
 
 An **OWASP-aligned AI Security Engineering Reference Architecture** and **B2B Security Platform** designed to secure AI-assisted coding workflows and runtime LLM/Agentic applications for small and medium businesses (SMBs).
 

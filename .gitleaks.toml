@@ -1,4 +1,4 @@
-title = "AegisAI Gitleaks Configuration (OWASP AI & Cloud Secrets)"
+title = "Mellyn Security Gitleaks Configuration (OWASP AI & Cloud Secrets)"
 
 # The default ruleset already covers OpenAI, Anthropic, GCP, HuggingFace, AWS, GitHub, and more.
 # The rules below add LLM-ecosystem coverage and act as an explicit, reviewable inventory.

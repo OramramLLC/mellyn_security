@@ -1,7 +1,7 @@
 # CLAUDE.md — Project Context & OWASP AI Security Guardrails
 
 ## Project Overview
-This repository houses **AegisAI**, an AI Security Engineering Reference Architecture and B2B SMB Security Platform.
+This repository houses **Mellyn Security**, an AI Security Engineering Reference Architecture and B2B SMB Security Platform.
 
 - **Implemented today**: the secure AI-assisted coding layer — agent rules files, the dependency / anti-slopsquatting
   verifier, custom Semgrep rules, Gitleaks config, pre-commit hooks, and the CI security gate.

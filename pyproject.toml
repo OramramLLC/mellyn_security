@@ -3,7 +3,7 @@ requires = ["setuptools>=75.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aegis-ai-security"
+name = "mellyn-security"
 version = "0.1.0"
 description = "OWASP-aligned AI Security Engineering Reference Architecture & B2B Guardrail Platform"
 readme = "README.md"
