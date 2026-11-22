@@ -23,8 +23,8 @@ for p in (BACKEND_DIR, SCRIPTS_DIR):
 
 import verify_container_stack as vcs  # noqa: E402
 import verify_dependencies as vd  # noqa: E402
-from aegis_ai.egress_proxy import generate_squid_config  # noqa: E402
-from aegis_ai.policy_loader import load_policy_file  # noqa: E402
+from mellyn.egress_proxy import generate_squid_config  # noqa: E402
+from mellyn.policy_loader import load_policy_file  # noqa: E402
 
 NOW = dt.datetime(2026, 11, 22, tzinfo=dt.UTC)
 

@@ -20,7 +20,7 @@ mellyn-authorizer (HTTP API, 127.0.0.1:8000) — for custom harnesses; makes no 
 - **Covered:** tools that run *inside* the gateway container. The internal network has no route out, so they
   can only reach the internet through Squid, whether or not they honour `HTTPS_PROXY`.
 - **Not covered:** anything that runs on the developer machine itself: MCP servers the IDE launches directly,
-  or a gateway started with `python -m aegis_ai.mcp_gateway` on the host. Those keep full network access.
+  or a gateway started with `python -m mellyn.mcp_gateway` on the host. Those keep full network access.
 - **DNS rebinding, as tested (2026-11-22, Squid 6.14):** Squid checks the resolved address against the blocked ranges
   and then connects using the same cached answer. Names that resolve to private addresses (`10.0.0.1.nip.io`,
   `169.254.169.254.nip.io`, ...) were refused. A name whose DNS answer flips between `127.0.0.1` and `1.1.1.1` on every
@@ -35,12 +35,17 @@ mellyn-authorizer (HTTP API, 127.0.0.1:8000) — for custom harnesses; makes no 
 
 ```bash
 cp .env.example .env
-python -c "import secrets; print(secrets.token_urlsafe(32))"   # put this in AEGIS_API_KEY_PEPPER
-PYTHONPATH=backend python -m aegis_ai.credentials              # run twice: agent key, approver key
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # put this in MELLYN_API_KEY_PEPPER
+PYTHONPATH=backend python -m mellyn.credentials              # run twice: agent key, approver key
 ```
 
-Store only the **digests** in `.env`. The gateway never passes `AEGIS_*` variables to the MCP servers it launches.
+Store only the **digests** in `.env`. The gateway never passes `MELLYN_*` variables to the MCP servers it launches.
 Never give the approver key to the agent runtime.
+
+> **Upgrading from a pre-rename deployment:** every variable now uses the `MELLYN_` prefix. The authorizer
+> and the gateway refuse to start while any variable with the old `AEGIS` prefix is still set, and name each
+> one to rename, so old settings are never silently ignored. The gateway also strips both prefixes from the
+> environment of every MCP server it launches.
 
 ### 2. Point the stack at the agent's workspace
 
@@ -49,13 +54,13 @@ export MELLYN_WORKSPACE=/absolute/path/to/the/workspace
 ```
 
 Compose refuses to start without it. The authorizer mounts it read-only and refuses to start if `/workspace` is not
-a mount point (`AEGIS_REQUIRE_WORKSPACE_MOUNT=1`): otherwise its path guard would resolve symlinks against an empty
+a mount point (`MELLYN_REQUIRE_WORKSPACE_MOUNT=1`): otherwise its path guard would resolve symlinks against an empty
 directory and could not see a link that points at a secret.
 
 ### 3. Sync the egress proxy config from your policy
 
 ```bash
-PYTHONPATH=backend python -m aegis_ai.egress_proxy \
+PYTHONPATH=backend python -m mellyn.egress_proxy \
   --policy config/mellyn-policy.example.toml \
   --output deploy/egress/squid.conf
 ```
@@ -98,11 +103,11 @@ servers from the client's own MCP config** so it cannot reach them directly:
 `mellyn-approval-relay` publishes `127.0.0.1:8765` on the host and forwards **only** the three exact approval routes (`GET /v1/pending` and `POST /v1/pending/apr_.../(approve|reject)`) to `mellyn-gateway:8765` across `mellyn-internal`—keeping `mellyn-gateway` completely cut off from direct internet routes while letting you run the approver CLI directly on the host:
 
 ```bash
-PYTHONPATH=backend python -m aegis_ai.approve --url http://127.0.0.1:8765 list
-PYTHONPATH=backend python -m aegis_ai.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
+PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 list
+PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
 ```
 
-Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). If you prefer not to run Python on the host, you can also run `docker exec -it mellyn-gateway python -m aegis_ai.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i ... --key-stdin`); never pass the key via `docker exec -e`.
+Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). If you prefer not to run Python on the host, you can also run `docker exec -it mellyn-gateway python -m mellyn.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i ... --key-stdin`); never pass the key via `docker exec -e`.
 
 ---
 
@@ -113,7 +118,7 @@ install, Squid 6.14 from the Ubuntu archive), Squid ran as `proxy` with every ca
 on `127.0.0.1:8000`, the authorizer refused to start without a policy or without a mounted workspace, and a symlink in
 the mounted workspace pointing at `/etc/passwd` was denied. From the internal network: no direct route out, only
 CONNECT to allowlisted domains on 443, IP literals and private/metadata destinations refused, plain HTTP refused, and
-clients outside the internal subnet refused. Through the gateway container: an MCP server saw no `AEGIS_*` variables,
+clients outside the internal subnet refused. Through the gateway container: an MCP server saw no `MELLYN_*` variables,
 fetched an allowlisted URL, was blocked by Squid for a domain the application layer allowed, could not connect
 directly, and a held call was approved with `docker exec` and then ran once.
 

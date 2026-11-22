@@ -11,7 +11,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai.credentials import (  # noqa: E402
+from mellyn.credentials import (  # noqa: E402
     CredentialConfig,
     CredentialConfigError,
     Role,
@@ -25,9 +25,9 @@ def make_config() -> tuple[CredentialConfig, str, str]:
     agent_key, approver_key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     config = CredentialConfig.from_env(
         {
-            "AEGIS_API_KEY_PEPPER": pepper,
-            "AEGIS_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
-            "AEGIS_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
+            "MELLYN_API_KEY_PEPPER": pepper,
+            "MELLYN_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
+            "MELLYN_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
         }
     )
     return config, agent_key, approver_key
@@ -58,20 +58,20 @@ class TestCredentials(unittest.TestCase):
         bad_envs = {
             "nothing set": {},
             "short pepper": {
-                "AEGIS_API_KEY_PEPPER": "short",
-                "AEGIS_AGENT_KEY_DIGEST": digest_a,
-                "AEGIS_APPROVER_KEY_DIGEST": digest_b,
+                "MELLYN_API_KEY_PEPPER": "short",
+                "MELLYN_AGENT_KEY_DIGEST": digest_a,
+                "MELLYN_APPROVER_KEY_DIGEST": digest_b,
             },
-            "approver digest missing": {"AEGIS_API_KEY_PEPPER": pepper, "AEGIS_AGENT_KEY_DIGEST": digest_a},
+            "approver digest missing": {"MELLYN_API_KEY_PEPPER": pepper, "MELLYN_AGENT_KEY_DIGEST": digest_a},
             "malformed digest": {
-                "AEGIS_API_KEY_PEPPER": pepper,
-                "AEGIS_AGENT_KEY_DIGEST": "abc123",
-                "AEGIS_APPROVER_KEY_DIGEST": digest_b,
+                "MELLYN_API_KEY_PEPPER": pepper,
+                "MELLYN_AGENT_KEY_DIGEST": "abc123",
+                "MELLYN_APPROVER_KEY_DIGEST": digest_b,
             },
             "same key for both roles": {
-                "AEGIS_API_KEY_PEPPER": pepper,
-                "AEGIS_AGENT_KEY_DIGEST": digest_a,
-                "AEGIS_APPROVER_KEY_DIGEST": digest_a,
+                "MELLYN_API_KEY_PEPPER": pepper,
+                "MELLYN_AGENT_KEY_DIGEST": digest_a,
+                "MELLYN_APPROVER_KEY_DIGEST": digest_a,
             },
         }
         for name, env in bad_envs.items():

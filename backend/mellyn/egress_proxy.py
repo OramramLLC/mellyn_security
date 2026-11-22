@@ -7,7 +7,7 @@ cannot bypass it: in deploy/docker-compose.yml the MCP gateway and its servers s
 whose only way out is this proxy. Tools running directly on a developer machine are not covered.
 
 Usage:
-    python -m aegis_ai.egress_proxy \
+    python -m mellyn.egress_proxy \
         --policy config/mellyn-policy.example.toml \
         --output deploy/egress/squid.conf
 """
@@ -20,8 +20,8 @@ import re
 import sys
 from pathlib import Path
 
-from aegis_ai.policy import PolicyConfig
-from aegis_ai.policy_loader import PolicyLoadError, load_policy_file
+from mellyn.policy import PolicyConfig
+from mellyn.policy_loader import PolicyLoadError, load_policy_file
 
 # Strict RFC 1035 / 1123 hostname (at least one dot, lowercase labels, no wildcards/spaces/newlines)
 _VALID_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -61,7 +61,7 @@ def validate_egress_domain(domain: str) -> str:
 
 # The mellyn-internal subnet in deploy/docker-compose.yml. Only these clients may use the proxy.
 DEFAULT_CLIENT_CIDRS: tuple[str, ...] = ("172.30.250.0/24",)
-REGENERATE_HINT = "python -m aegis_ai.egress_proxy --policy <policy.toml> --output deploy/egress/squid.conf"
+REGENERATE_HINT = "python -m mellyn.egress_proxy --policy <policy.toml> --output deploy/egress/squid.conf"
 
 
 def generate_squid_config(

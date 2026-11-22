@@ -5,7 +5,7 @@
 # archive's security updates; the base image is pinned by digest.
 #
 # Squid runs directly as the unprivileged `proxy` user (no root start-up step), so the container can drop
-# every capability. squid.conf is generated from the policy by `python -m aegis_ai.egress_proxy`.
+# every capability. squid.conf is generated from the policy by `python -m mellyn.egress_proxy`.
 
 # ubuntu:noble-20260930.1, published 2026-10-17. Bump the tag and digest together.
 FROM ubuntu:noble-20260930.1@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac

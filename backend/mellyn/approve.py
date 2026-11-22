@@ -1,11 +1,11 @@
 """
 Approver CLI for the MCP gateway's local approval server.
 
-    python -m aegis_ai.approve --url http://127.0.0.1:PORT list
-    python -m aegis_ai.approve --url http://127.0.0.1:PORT approve apr_... --by you@example.com [--max-uses N]
-    python -m aegis_ai.approve --url http://127.0.0.1:PORT reject apr_...
+    python -m mellyn.approve --url http://127.0.0.1:PORT list
+    python -m mellyn.approve --url http://127.0.0.1:PORT approve apr_... --by you@example.com [--max-uses N]
+    python -m mellyn.approve --url http://127.0.0.1:PORT reject apr_...
 
-The URL can also come from AEGIS_APPROVAL_URL. The approver key is read from AEGIS_APPROVER_KEY, or prompted
+The URL can also come from MELLYN_APPROVAL_URL. The approver key is read from MELLYN_APPROVER_KEY, or prompted
 for without echo. The key is only ever sent to a loopback http:// URL (the gateway's approval server binds to
 127.0.0.1), so a mistyped or planted URL cannot carry it off the machine.
 """
@@ -22,7 +22,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
-from aegis_ai.approvals import API_KEY_HEADER
+from mellyn.approvals import API_KEY_HEADER
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -75,11 +75,11 @@ def _make_undumpable() -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Approve or reject tool calls held by the Mellyn MCP gateway.")
-    parser.add_argument("--url", default=os.environ.get("AEGIS_APPROVAL_URL", ""), help="Approval server URL")
+    parser.add_argument("--url", default=os.environ.get("MELLYN_APPROVAL_URL", ""), help="Approval server URL")
     parser.add_argument(
         "--key-stdin",
         action="store_true",
-        help="Read the approver key as one line from stdin instead of AEGIS_APPROVER_KEY or a TTY prompt",
+        help="Read the approver key as one line from stdin instead of MELLYN_APPROVER_KEY or a TTY prompt",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="Show calls waiting for approval")
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.key_stdin:
         key = sys.stdin.readline().rstrip("\r\n")
     else:
-        key = os.environ.get("AEGIS_APPROVER_KEY") or getpass.getpass("Approver key: ")
+        key = os.environ.get("MELLYN_APPROVER_KEY") or getpass.getpass("Approver key: ")
 
     if args.command == "list":
         pending = _call(base_url, key, "GET", "/v1/pending")["pending"]

@@ -121,7 +121,7 @@ jobs:
 
       - name: Run tests
         env:
-          AEGIS_REQUIRE_API_TESTS: "1" # fail instead of skipping if the API test dependencies are missing
+          MELLYN_REQUIRE_API_TESTS: "1" # fail instead of skipping if the API test dependencies are missing
         run: python -m unittest discover -s tests -v
 
   container-and-egress:

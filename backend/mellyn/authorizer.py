@@ -11,9 +11,9 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from aegis_ai.audit import AuditLogger
-from aegis_ai.egress import EgressValidator, WorkspacePathGuard
-from aegis_ai.models import (
+from mellyn.audit import AuditLogger
+from mellyn.egress import EgressValidator, WorkspacePathGuard
+from mellyn.models import (
     ApprovalGrant,
     AuthorizationResult,
     Decision,
@@ -24,7 +24,7 @@ from aegis_ai.models import (
     utc_now,
     validate_json_value,
 )
-from aegis_ai.policy import (
+from mellyn.policy import (
     UNBOUND_PATH_ARG_NAMES,
     PolicyConfig,
     PolicyEngine,

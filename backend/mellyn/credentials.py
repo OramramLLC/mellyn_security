@@ -9,13 +9,13 @@ API credentials for the authorizer: two roles, stored as HMAC-SHA256 digests wit
 API keys are high-entropy random values, so they are stored as HMAC-SHA256(pepper, key) rather than
 with a password hash, and compared with hmac.compare_digest. Configuration comes from:
 
-    AEGIS_API_KEY_PEPPER        server-side secret, at least 32 characters
-    AEGIS_AGENT_KEY_DIGEST      hex HMAC-SHA256 digest of the agent key
-    AEGIS_APPROVER_KEY_DIGEST   hex HMAC-SHA256 digest of the approver key
+    MELLYN_API_KEY_PEPPER        server-side secret, at least 32 characters
+    MELLYN_AGENT_KEY_DIGEST      hex HMAC-SHA256 digest of the agent key
+    MELLYN_APPROVER_KEY_DIGEST   hex HMAC-SHA256 digest of the approver key
 
-Generate a key and its digest (with AEGIS_API_KEY_PEPPER set in the environment) by running, from backend/:
+Generate a key and its digest (with MELLYN_API_KEY_PEPPER set in the environment) by running, from backend/:
 
-    python -m aegis_ai.credentials
+    python -m mellyn.credentials
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
-PEPPER_ENV = "AEGIS_API_KEY_PEPPER"
-DIGEST_ENV: dict[str, str] = {"agent": "AEGIS_AGENT_KEY_DIGEST", "approver": "AEGIS_APPROVER_KEY_DIGEST"}
+PEPPER_ENV = "MELLYN_API_KEY_PEPPER"
+DIGEST_ENV: dict[str, str] = {"agent": "MELLYN_AGENT_KEY_DIGEST", "approver": "MELLYN_APPROVER_KEY_DIGEST"}
 MIN_PEPPER_LENGTH = 32
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
@@ -93,7 +93,7 @@ class CredentialConfig:
 
 
 def main() -> int:
-    """Print a new random API key and the digest to put in AEGIS_AGENT_KEY_DIGEST or AEGIS_APPROVER_KEY_DIGEST."""
+    """Print a new random API key and the digest to put in MELLYN_AGENT_KEY_DIGEST or MELLYN_APPROVER_KEY_DIGEST."""
     pepper = os.environ.get(PEPPER_ENV, "").strip()
     if len(pepper) < MIN_PEPPER_LENGTH:
         print(f"Set {PEPPER_ENV} (at least {MIN_PEPPER_LENGTH} characters) first.", file=sys.stderr)

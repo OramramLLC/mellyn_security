@@ -5,7 +5,7 @@ End-to-end empirical container & network-egress verification harness for Mellyn 
 Proves in CI (on real Docker Engine + Linux namespaces) that:
   1. Both container images (`Dockerfile` and `deploy/egress/Dockerfile`) build cleanly from their
      SHA-256 digest-pinned base images and `--require-hashes` Python lockfile.
-  2. `mellyn-authorizer` refuses to start when `AEGIS_REQUIRE_WORKSPACE_MOUNT=1` and `/workspace`
+  2. `mellyn-authorizer` refuses to start when `MELLYN_REQUIRE_WORKSPACE_MOUNT=1` and `/workspace`
      is unmounted, and serves `/healthz` + role-separated `/v1/sessions` when mounted.
   3. On a Docker `internal: true` network (`172.30.252.0/24`):
      - Direct outbound internet access bypassing Squid fails (no route to host/network).
@@ -38,9 +38,9 @@ BACKEND_DIR = REPO_ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai.credentials import key_digest  # noqa: E402
-from aegis_ai.egress_proxy import generate_squid_config  # noqa: E402
-from aegis_ai.policy_loader import load_policy_file  # noqa: E402
+from mellyn.credentials import key_digest  # noqa: E402
+from mellyn.egress_proxy import generate_squid_config  # noqa: E402
+from mellyn.policy_loader import load_policy_file  # noqa: E402
 
 AUTH_IMAGE = "mellyn-security:ci-verify"
 EGRESS_IMAGE = "mellyn-egress:ci-verify"
@@ -210,11 +210,11 @@ def main() -> int:
                     "-v",
                     f"{REPO_ROOT / 'config' / 'mellyn-policy.example.toml'}:/etc/mellyn/policy.toml:ro",
                     "-e",
-                    f"AEGIS_API_KEY_PEPPER={pepper}",
+                    f"MELLYN_API_KEY_PEPPER={pepper}",
                     "-e",
-                    f"AEGIS_AGENT_KEY_DIGEST={key_digest(agent_key, pepper)}",
+                    f"MELLYN_AGENT_KEY_DIGEST={key_digest(agent_key, pepper)}",
                     "-e",
-                    f"AEGIS_APPROVER_KEY_DIGEST={key_digest(approver_key, pepper)}",
+                    f"MELLYN_APPROVER_KEY_DIGEST={key_digest(approver_key, pepper)}",
                     AUTH_IMAGE,
                 ]
             )
@@ -224,7 +224,7 @@ def main() -> int:
             req_ok = urllib.request.Request(
                 "http://127.0.0.1:18000/v1/sessions",
                 method="POST",
-                headers={"X-Aegis-API-Key": agent_key},
+                headers={"X-Mellyn-API-Key": agent_key},
             )
             with opener.open(req_ok, timeout=5) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
@@ -234,7 +234,7 @@ def main() -> int:
             req_forbidden = urllib.request.Request(
                 "http://127.0.0.1:18000/v1/sessions",
                 method="POST",
-                headers={"X-Aegis-API-Key": approver_key},
+                headers={"X-Mellyn-API-Key": approver_key},
             )
             try:
                 opener.open(req_forbidden, timeout=5)

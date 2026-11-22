@@ -10,10 +10,10 @@
 #     calls itself; no agent tool runs in its container.
 #
 # Quickstart (see deploy/README.md):
-#   1. cp .env.example .env and fill in the pepper and key digests (python -m aegis_ai.credentials).
+#   1. cp .env.example .env and fill in the pepper and key digests (python -m mellyn.credentials).
 #   2. Export MELLYN_WORKSPACE=/absolute/path/to/the/agent/workspace (required; compose refuses to start without it).
 #   3. Regenerate squid.conf whenever the policy changes:
-#        PYTHONPATH=backend python -m aegis_ai.egress_proxy \
+#        PYTHONPATH=backend python -m mellyn.egress_proxy \
 #          --policy config/mellyn-policy.example.toml --output deploy/egress/squid.conf
 #   4. docker compose -f deploy/docker-compose.yml up -d --build          # authorizer API + egress proxy
 #      The MCP gateway is started per client session by the MCP client itself (profile "gateway").
@@ -37,10 +37,10 @@ services:
     env_file:
       - ../.env
     environment:
-      AEGIS_POLICY_PATH: /etc/mellyn/mellyn-policy.example.toml
-      AEGIS_WORKSPACE_ROOT: /workspace
-      AEGIS_REQUIRE_WORKSPACE_MOUNT: "1"
-      AEGIS_AUDIT_LOG_PATH: /var/log/mellyn/audit.jsonl
+      MELLYN_POLICY_PATH: /etc/mellyn/mellyn-policy.example.toml
+      MELLYN_WORKSPACE_ROOT: /workspace
+      MELLYN_REQUIRE_WORKSPACE_MOUNT: "1"
+      MELLYN_AUDIT_LOG_PATH: /var/log/mellyn/audit.jsonl
     ports:
       # Loopback only; put an internal TLS reverse proxy in front if other hosts must reach it.
       - "127.0.0.1:8000:8000"
@@ -64,7 +64,7 @@ services:
     command:
       - python
       - -m
-      - aegis_ai.mcp_gateway
+      - mellyn.mcp_gateway
       - --config
       - /etc/mellyn/mellyn-gateway.example.toml
       - --workspace
@@ -106,7 +106,7 @@ services:
     command:
       - python
       - -m
-      - aegis_ai.approval_relay
+      - mellyn.approval_relay
       - --listen-host
       - "0.0.0.0"
       - --listen-port
@@ -151,7 +151,7 @@ networks:
     internal: true
     ipam:
       config:
-        # Must match --client-cidr in squid.conf (python -m aegis_ai.egress_proxy --client-cidr ...).
+        # Must match --client-cidr in squid.conf (python -m mellyn.egress_proxy --client-cidr ...).
         - subnet: 172.30.250.0/24
   mellyn-egress-net:
     driver: bridge

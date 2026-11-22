@@ -13,18 +13,18 @@ BACKEND_DIR = REPO_ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from aegis_ai.authorizer import Authorizer, SessionLimitError  # noqa: E402
-from aegis_ai.egress import WorkspaceConfigError, check_workspace_root  # noqa: E402
-from aegis_ai.egress_proxy import (  # noqa: E402
+from mellyn.authorizer import Authorizer, SessionLimitError  # noqa: E402
+from mellyn.egress import WorkspaceConfigError, check_workspace_root  # noqa: E402
+from mellyn.egress_proxy import (  # noqa: E402
     BLOCKED_DESTINATION_CIDRS,
     DEFAULT_CLIENT_CIDRS,
     generate_squid_config,
     validate_egress_domain,
 )
-from aegis_ai.mcp_gateway import downstream_environment  # noqa: E402
-from aegis_ai.models import Decision, ToolCallRequest  # noqa: E402
-from aegis_ai.policy import PolicyConfig  # noqa: E402
-from aegis_ai.policy_loader import load_policy_file  # noqa: E402
+from mellyn.mcp_gateway import downstream_environment  # noqa: E402
+from mellyn.models import Decision, ToolCallRequest  # noqa: E402
+from mellyn.policy import PolicyConfig  # noqa: E402
+from mellyn.policy_loader import load_policy_file  # noqa: E402
 
 
 class TestSessionBounds(unittest.TestCase):
@@ -104,12 +104,12 @@ class TestWorkspaceRootCheck(unittest.TestCase):
 
 
 class TestDownstreamEnvironment(unittest.TestCase):
-    def test_aegis_secrets_are_not_passed_to_mcp_servers(self) -> None:
+    def test_mellyn_secrets_are_not_passed_to_mcp_servers(self) -> None:
         env = downstream_environment(
             {
-                "AEGIS_API_KEY_PEPPER": "p",
-                "aegis_approver_key_digest": "d",
-                "MELLYN_API_KEY_PEPPER": "p2",
+                "MELLYN_API_KEY_PEPPER": "p",
+                "mellyn_approver_key_digest": "d",
+                "MELLYN_AGENT_KEY_DIGEST": "p2",
                 "PATH": "/bin",
                 "HTTPS_PROXY": "x",
             }

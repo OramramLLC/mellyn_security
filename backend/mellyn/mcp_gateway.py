@@ -1,5 +1,5 @@
 """
-MCP JSON-RPC 2.0 Security Gateway for Mellyn Security (AegisAI).
+MCP JSON-RPC 2.0 Security Gateway for Mellyn Security.
 
 One gateway process fronts every downstream MCP server for one client connection (one agent session):
 
@@ -18,7 +18,7 @@ One gateway process fronts every downstream MCP server for one client connection
   server (approvals.py) with the approver key. The agent then retries the exact call.
 
 Usage:
-    python -m aegis_ai.mcp_gateway --config config/mellyn-gateway.example.toml \
+    python -m mellyn.mcp_gateway --config config/mellyn-gateway.example.toml \
         --workspace . --audit-log mellyn-audit.jsonl [--approval-port 8765]
 """
 
@@ -39,14 +39,15 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
-from aegis_ai.approvals import ApprovalHTTPServer, PendingApprovals
-from aegis_ai.audit import AuditLogger
-from aegis_ai.authorizer import RESOURCE_READ_TOOL, Authorizer
-from aegis_ai.credentials import CredentialConfig, CredentialConfigError, Role
-from aegis_ai.egress import WorkspaceConfigError, check_workspace_root
-from aegis_ai.gateway_config import load_gateway_config
-from aegis_ai.models import Decision, TaintSource, ToolCallRequest, canonical_json
-from aegis_ai.policy_loader import PolicyLoadError, load_policy_file
+from mellyn.approvals import ApprovalHTTPServer, PendingApprovals
+from mellyn.audit import AuditLogger
+from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
+from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
+from mellyn.egress import WorkspaceConfigError, check_workspace_root
+from mellyn.gateway_config import load_gateway_config
+from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
+from mellyn.models import Decision, TaintSource, ToolCallRequest, canonical_json
+from mellyn.policy_loader import PolicyLoadError, load_policy_file
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 MAX_LINE_BYTES = 4 * 1024 * 1024
@@ -131,15 +132,16 @@ class Downstream(Protocol):
 _EOF = object()
 
 
-SECRET_ENV_PREFIXES = ("AEGIS_", "MELLYN_")
+# Both the current prefix and the retired one: main() refuses to start when old-prefixed variables are set,
+# but library callers of downstream_environment() get the same protection.
+SECRET_ENV_PREFIXES = ("MELLYN_", LEGACY_ENV_PREFIX)
 
 
 def downstream_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """
-    The environment for downstream MCP servers: the gateway's own, minus every AEGIS_* and MELLYN_* variable.
-    The pepper and key digests are the gateway's secrets; the servers it launches are untrusted and must not see
-    them. MELLYN_* is stripped too because the product was renamed: a deployment may set its secrets under the
-    new prefix even though the code reads AEGIS_*.
+    The environment for downstream MCP servers: the gateway's own, minus every MELLYN_* variable and every
+    variable with the pre-rename prefix. The pepper and key digests are the gateway's secrets; the servers it
+    launches are untrusted and must not see them, whichever name a deployment set them under.
     """
     source = os.environ if environ is None else environ
     return {key: value for key, value in source.items() if not key.upper().startswith(SECRET_ENV_PREFIXES)}
@@ -538,10 +540,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        check_no_legacy_env()
         config = load_gateway_config(args.config)
         policy = load_policy_file(config.policy_path)
-        check_workspace_root(args.workspace, require_mount=os.environ.get("AEGIS_REQUIRE_WORKSPACE_MOUNT") == "1")
-    except (PolicyLoadError, WorkspaceConfigError) as exc:
+        check_workspace_root(args.workspace, require_mount=os.environ.get("MELLYN_REQUIRE_WORKSPACE_MOUNT") == "1")
+    except (PolicyLoadError, WorkspaceConfigError, LegacyConfigError) as exc:
         print(f"Gateway config, policy or workspace rejected (fail-closed): {exc}", file=sys.stderr)
         return 2
     if policy.allowed_mcp_servers is None:
@@ -579,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                 approvals, credentials, port=args.approval_port, host=args.approval_host
             )
             approval_server.start_in_background()
-            print(f"Approvals: python -m aegis_ai.approve --url {approval_server.url} list", file=sys.stderr)
+            print(f"Approvals: python -m mellyn.approve --url {approval_server.url} list", file=sys.stderr)
 
         def notify_client(message: dict[str, Any]) -> None:
             sys.stdout.write(json.dumps(message) + "\n")

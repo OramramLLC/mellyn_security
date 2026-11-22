@@ -3,7 +3,7 @@ Human approval channel for the MCP gateway.
 
 When the authorizer answers REQUIRE_APPROVAL, the gateway records the exact call as a pending approval and
 tells the agent its ID. A human lists and approves it through a small HTTP server bound to 127.0.0.1, using
-the APPROVER key (see credentials.py), for example with `python -m aegis_ai.approve`. Approving issues a grant
+the APPROVER key (see credentials.py), for example with `python -m mellyn.approve`. Approving issues a grant
 for that exact call; the agent then retries and the call goes through once (or `max_uses` times).
 
 The agent side of the gateway never holds the approver key, so a prompt-injected agent that can reach the
@@ -22,14 +22,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from aegis_ai.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer
-from aegis_ai.credentials import CredentialConfig, Role
-from aegis_ai.models import ApprovalGrant, AuthorizationResult, ToolCallRequest, canonical_json, utc_now
+from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer
+from mellyn.credentials import CredentialConfig, Role
+from mellyn.models import ApprovalGrant, AuthorizationResult, ToolCallRequest, canonical_json, utc_now
 
 MAX_PENDING = 100
 PENDING_TTL_SECONDS = 3600
 MAX_BODY_BYTES = 16 * 1024
-API_KEY_HEADER = "X-Aegis-API-Key"
+API_KEY_HEADER = "X-Mellyn-API-Key"
 _APPROVE_PATH = re.compile(r"^/v1/pending/(apr_[A-Za-z0-9_-]{8,64})/(approve|reject)$")
 
 
