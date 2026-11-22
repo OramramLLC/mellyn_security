@@ -1,6 +1,6 @@
-# AegisAI — B2B AI Security Engineering Reference Architecture
+# Mellyn Security — B2B AI Security Engineering Reference Architecture
 
-AegisAI is a dual-purpose **AI Security Engineering Portfolio Reference Architecture** and **B2B SMB Product** designed for small-to-medium engineering firms adopting AI coding assistants (Cursor, Claude Code, GitHub Copilot) and deploying LLM/Agentic workflows.
+Mellyn Security is a dual-purpose **AI Security Engineering Portfolio Reference Architecture** and **B2B SMB Product** designed for small-to-medium engineering firms adopting AI coding assistants (Cursor, Claude Code, GitHub Copilot) and deploying LLM/Agentic workflows.
 
 ---
 
@@ -24,7 +24,7 @@ flowchart TB
     end
 
     subgraph RuntimePlane["3. Runtime AI & Agent Security Gateway (FastAPI Backend)"]
-        Proxy["AegisAI FastAPI Guardrail API<br/>(/v1/guard/scan, /v1/agent/authorize)"]
+        Proxy["Mellyn Security FastAPI Guardrail API<br/>(/v1/guard/scan, /v1/agent/authorize)"]
         PI["Prompt Injection & Jailbreak Detector<br/>(Direct & Indirect Heuristics + Classifier)"]
         DLP["Secret & PII Egress Redactor<br/>(API Keys, JWTs, SSN, Email, Source IP)"]
         ToolGuard["MCP & Agent Tool Policy Engine<br/>(SSRF Protection, Command Allowlist, Schema Gate)"]
@@ -58,7 +58,7 @@ V1/
 ├── .semgrep/
 │   └── owasp-ai-code-rules.yaml   # Custom SAST rules targeting AI-generated code flaws
 ├── backend/                       # (planned) Python / FastAPI AI Security Engine
-│   ├── aegis_ai/
+│   ├── mellyn/
 │   │   ├── api/                   # FastAPI routes (/v1/guard, /v1/supply-chain, /v1/audit)
 │   │   ├── core/                  # Typed config (Pydantic Settings), crypto, auth
 │   │   ├── engines/
@@ -87,7 +87,7 @@ V1/
 
 ## 3. B2B SMB Product Value Proposition
 
-Small firms (10–250 employees) adopt AI coding tools and LLM APIs faster than large enterprises but lack a dedicated AI Security team. AegisAI solves three acute SMB pain points:
+Small firms (10–250 employees) adopt AI coding tools and LLM APIs faster than large enterprises but lack a dedicated AI Security team. Mellyn Security solves three acute SMB pain points:
 
 1. **Zero-Config Secure AI Coding Pack ("Drop-In Repo Hardening")**:
    A 1-command onboarding CLI/template that equips any client repository with OWASP-aligned AI steering rules (`.cursorrules`, `CLAUDE.md`, Copilot instructions), AI-specific Semgrep SAST rules, Gitleaks secret patterns, and slopsquatting protection.
