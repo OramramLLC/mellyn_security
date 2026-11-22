@@ -1,97 +1,134 @@
 # Mellyn Security — B2B AI Security Engineering Reference Architecture
 
-Mellyn Security is a dual-purpose **AI Security Engineering Portfolio Reference Architecture** and **B2B SMB Product** designed for small-to-medium engineering firms adopting AI coding assistants (Cursor, Claude Code, GitHub Copilot) and deploying LLM/Agentic workflows.
+Mellyn Security is a dual-purpose **AI Security Engineering Portfolio Reference Architecture** and **B2B SMB Security Product** for small-to-medium engineering teams adopting AI coding assistants (Cursor, Claude Code, GitHub Copilot, Antigravity) and deploying MCP-connected AI agents.
 
 ---
 
-## 1. System Architecture Overview
+## 1. Architectural Principles
+
+1. **Authorization-First, Not Detection-First**: Per OWASP LLM01, prompt-injection detection cannot be relied on as a primary security boundary. The runtime core enforces **deterministic tool-call authorization** driven by session provenance (taint), tool risk tiers, scoped argument policies, and human-in-the-loop approvals. Injection/DLP scores act only as risk-escalating signals and audit metadata—never as an allow gate.
+2. **MCP Gateway as the Integration Choke Point**: Rather than building a fragile multi-provider LLM proxy, Mellyn Security belongs at the **MCP / tool-execution boundary** where agent actions actually happen. It runs in two modes: an **HTTP authorization API** that a custom agent harness calls before each tool call (it only protects harnesses that call it), and a **stdio MCP gateway** that an MCP client launches in place of its servers, which puts the authorizer in the data path. One gateway process fronts all of a client's servers so that taint and approvals are shared across them. The client must be configured to reach its servers only through the gateway.
+3. **Self-Hosted First (Zero Prompt Custody)**: v1 deploys as a single self-hosted container or local sidecar inside the customer's own environment. Mellyn Security never holds customer prompts, secrets, or proprietary code on multi-tenant servers.
+4. **Independent Defense-in-Depth Controls**: Prompt steering rules, agent permission sandboxes, pre-commit hooks, CI supply-chain gates, and runtime authorization operate as independent layers—compromise or bypass of one layer does not disable the others.
+
+---
+
+## 2. System Architecture Overview
 
 ```mermaid
 flowchart TB
-    subgraph DevPlane["1. Developer & Agent Endpoint Plane (IDE / CLI)"]
-        IDE["AI Coding Assistants<br/>(Cursor, Claude Code, Copilot, Antigravity)"]
-        Rules["Policy-as-Prompt Steering<br/>(.cursorrules, CLAUDE.md, .agent/rules)"]
-        PreCommit["Local Pre-Commit Security Hook<br/>(Secrets + Semgrep + Slopsquat Verifier)"]
-        IDE --> Rules --> PreCommit
+    subgraph DevPlane["Plane 1: Developer & Agent Endpoint (Independent Controls)"]
+        Rules["Canonical Ruleset & Sync<br/>(.agent/rules -> CLAUDE.md, .cursorrules, Copilot)"]
+        Sandbox["Agent Permissions & Sandboxing<br/>(.claude/settings.json, secret denials, MCP allowlist)"]
+        PreCommit["Local Pre-Commit Hooks<br/>(Gitleaks, Semgrep, Ruff, Dep Verifier)"]
     end
 
-    subgraph CICDPlane["2. CI/CD & Supply Chain Verification Plane"]
-        GH["GitHub / GitLab PR Pipeline"]
-        DepCheck["Live Registry & Slopsquatting Engine<br/>(PyPI / npm Verification)"]
-        SAST["AI-Targeted SAST & Secret Gate<br/>(Semgrep + Gitleaks)"]
-        Provenance["Audit & Human Sign-Off Attestation"]
-        GH --> DepCheck & SAST --> Provenance
+    subgraph CICDPlane["Plane 2: CI/CD & Supply Chain Gate (Versioned / SHA-Pinned)"]
+        CI["GitHub Actions Security Gate<br/>(Gitleaks, Semgrep, Hidden-Unicode Check)"]
+        DepCheck["Anti-Slopsquatting Verifier<br/>(PyPI/npm Existence + 90-Day Age + Fail-Closed)"]
+        Attest["Human Sign-Off & Governance<br/>(CODEOWNERS; branch protection & signed commits: to configure)"]
     end
 
-    subgraph RuntimePlane["3. Runtime AI & Agent Security Gateway (FastAPI Backend)"]
-        Proxy["Mellyn Security FastAPI Guardrail API<br/>(/v1/guard/scan, /v1/agent/authorize)"]
-        PI["Prompt Injection & Jailbreak Detector<br/>(Direct & Indirect Heuristics + Classifier)"]
-        DLP["Secret & PII Egress Redactor<br/>(API Keys, JWTs, SSN, Email, Source IP)"]
-        ToolGuard["MCP & Agent Tool Policy Engine<br/>(SSRF Protection, Command Allowlist, Schema Gate)"]
-        Proxy --> PI & DLP & ToolGuard
+    subgraph RuntimePlane["Plane 3: Self-Hosted MCP Tool-Call Authorizer (Core Runtime)"]
+        Gateway["stdio MCP Gateway<br/>(one process for all servers, tools as server__tool)"]
+        Auth["Authorizer Core<br/>(in-process for the gateway; /v1/agent/authorize for harnesses)"]
+        Taint["Server-Issued Sessions & Taint<br/>(auto-taint on web/untrusted MCP results & listings)"]
+        Policy["Scoped Policy & Grant Engine<br/>(Per-Server Risk Tiers + Exact-Arg Rules + Exact-Call Grants)"]
+        Approver["Human Approval Surface<br/>(loopback approval server / API grants, approver key only)"]
+        Gateway --> Auth
+        Signals["Supporting Risk Signals<br/>(Injection Score + Secret/PII DLP -> Escalate Only)"]
+        Egress["Squid Egress Proxy (container stack)<br/>(Domain Allowlist + Private IP / DNS Rebinding Block)"]
+        Taint --> Auth
+        Policy --> Auth
+        Approver --> Policy
+        Signals -.->|"risk signal only"| Auth
+        Gateway -->|"MCP servers on internal network"| Egress
     end
 
-    subgraph ControlPlane["4. B2B Governance & Posture Dashboard (Next.js / TypeScript)"]
-        UI["SMB Security Posture Dashboard"]
-        Compliance["Framework Mapper<br/>(OWASP LLM Top 10, Agentic Top 10, NIST AI RMF)"]
-        Telemetry["Audit Log & Incident Store"]
-        UI --> Compliance & Telemetry
+    subgraph ControlPlane["Plane 4: Posture & Audit Viewer (Built Last)"]
+        Audit["Redacted Structured Audit Log<br/>(Decisions, Taint Sources, Tool Hashes)"]
+        UI["SMB Evidence & Posture Dashboard<br/>(OWASP LLM/Agentic & NIST AI RMF Mapping)"]
+        Audit --> UI
     end
 
-    PreCommit --> GH
-    RuntimePlane --> Telemetry
-    CICDPlane --> Telemetry
+    DevPlane --> CICDPlane
+    Auth --> Audit
+    CICDPlane --> Audit
 ```
 
 ---
 
-## 2. Repository Directory Structure
+## 3. Runtime Tool-Call Authorization Flow
+
+Every tool call the harness submits passes through `Authorizer.authorize(...)`:
+
+0. **Server-Issued Sessions & Two Credentials**: Session IDs come from `POST /v1/sessions`; unknown IDs are denied, so a caller cannot shed taint by inventing a new ID, and a restart (state is in memory) fails closed. The **agent key** (held by the harness) can create sessions, report taint, and request decisions. Only the separate **approver key** (held by the human approval surface) can issue grants, so an agent cannot approve its own calls. Keys are stored as `HMAC-SHA256(pepper, key)` digests.
+1. **Provenance & Taint Tracking**: When the authorizer allows a call whose result brings outside content into the session (`http_get`, web fetch/search, or any MCP server not listed as trusted), it taints the session itself. In gateway mode, listing tools or resources from an untrusted server also taints the session, because their descriptions are model-visible text written by that server. Harnesses using the API report other sources they know about (an issue body, a PR comment) through `/v1/sessions/{id}/taint`.
+   - **Tool identity is per server.** MCP tools are tiered by `"<server>/<tool>"` (unlisted MCP tools are `HIGH`), and allow rules name their server, so a downstream server cannot borrow a low tier or an allow rule by naming its tool `workspace_read` or `shell_exec`.
+2. **Tool Risk Classification**:
+   - `LOW`: Read-only operations scoped inside the workspace (e.g., `workspace_read`, `git_status`).
+   - `MEDIUM`: Local state changes inside the workspace or read-only calls to allowlisted internal/public endpoints (e.g., `workspace_write`, `http_get_allowlisted`).
+   - `HIGH`: Shell execution, outbound HTTP to non-allowlisted hosts, file writes outside the workspace, sending external messages, or mutating cloud/payment APIs.
+3. **Scoped Policy & Taint-Explosion Mitigation**:
+   - Low-risk calls in clean or tainted sessions are allowed and logged (unless explicitly denied).
+   - High-risk calls in a **tainted** session are **never auto-allowed** unless matched by an explicit scoped policy rule marked taint-safe **or** a human grant for that exact call.
+   - Rules match exactly, never by string prefix: an allow rule lists the exact values (for shell tools, the exact `argv`) and does not match a call with extra arguments; a deny rule can name programs by basename (`rm` matches `/bin/rm -fr`).
+   - Shell tools accept only an `argv` list. Command strings and command interpreters (`sh`, `bash`, `cmd`, `powershell`, `env`, ...) are denied outright.
+   - Grants are bound to the session, tool, MCP server, and full argument set, expire (default 15 minutes), and are single-use unless the approver sets `max_uses`.
+   - Supporting risk signals (prompt-injection score or DLP secret hit) can escalate an `ALLOW` to `REQUIRE_APPROVAL` or `DENY`, but can **never** downgrade a `DENY` or `REQUIRE_APPROVAL` to `ALLOW`.
+4. **Network Egress Enforcement**: Application-level URL checks (https only, no IP literals, no userinfo, domain allowlist) run today. In the container stack (`deploy/`), the gateway and its MCP servers run on an internal Docker network whose only route out is a Squid proxy generated from the same allowlist, which blocks private and metadata addresses after DNS resolution. Tools running directly on a developer machine get only the application-level checks.
+
+---
+
+## 4. Repository Directory Structure
 
 ```text
 V1/
-├── .agent/rules/                  # Canonical agent ruleset (Antigravity reads it; CLAUDE.md imports it)
-├── .claude/settings.json          # Claude Code permission rules (secret files denied)
+├── .agent/rules/                  # Canonical OWASP AI security ruleset
+├── .claude/settings.json          # Claude Code permission rules (secret denials, approval gates)
 ├── .github/
-│   ├── copilot-instructions.md    # GitHub Copilot security constraints
+│   ├── CODEOWNERS                 # Mandatory owner review on guardrails, CI, and auth core
+│   ├── copilot-instructions.md    # Generated from .agent/rules (verified by sync check)
 │   └── workflows/
-│       └── ai-security-gate.yml   # Automated CI/CD security gate
+│       └── ai-security-gate.yml   # SHA-pinned CI security gate (Gitleaks, Semgrep, tests)
 ├── .semgrep/
-│   └── owasp-ai-code-rules.yaml   # Custom SAST rules targeting AI-generated code flaws
-├── backend/                       # (planned) Python / FastAPI AI Security Engine
-│   ├── mellyn/
-│   │   ├── api/                   # FastAPI routes (/v1/guard, /v1/supply-chain, /v1/audit)
-│   │   ├── core/                  # Typed config (Pydantic Settings), crypto, auth
-│   │   ├── engines/
-│   │   │   ├── prompt_guard.py    # Direct & indirect prompt injection scanner
-│   │   │   ├── secret_dlp.py      # Egress secret & PII detection/redaction
-│   │   │   ├── supply_chain.py    # Slopsquatting & dependency risk scorer
-│   │   │   └── tool_policy.py     # Agent/MCP tool call validator & SSRF guard
-│   │   └── models/                # Strict Pydantic v2 request/response schemas
-│   └── tests/                     # Pytest security regression suite
-├── frontend/                      # (planned) TypeScript / Next.js B2B SMB Dashboard
+│   ├── owasp-ai-code-rules.yaml   # Custom SAST rules targeting AI-generated code flaws
+│   ├── owasp-ai-code-rules.py     # Semgrep rule test cases (Python)
+│   └── owasp-ai-code-rules.tsx    # Semgrep rule test cases (TypeScript/React)
+├── backend/
+│   └── aegis_ai/                  # Self-hosted MCP Tool-Call Authorizer (Python 3.12+)
+│       ├── models.py              # Typed requests, decisions, risk tiers, grants, signals
+│       ├── egress.py              # SSRF & outbound destination allowlist validator
+│       ├── policy.py              # Scoped tool policy engine & taint-aware evaluator
+│       ├── authorizer.py          # Core Authorizer: sessions, taint, policy, grants & audit
+│       ├── audit.py               # Redacted structured audit logger (no raw secrets/prompts)
+│       ├── credentials.py         # Agent / approver API keys as HMAC-SHA256 digests with a pepper
+│       ├── policy_loader.py       # Strict, fail-closed TOML/JSON policy loader
+│       ├── gateway_config.py      # Strict loader for the gateway's server list
+│       ├── mcp_gateway.py         # stdio MCP gateway fronting all downstream servers
+│       ├── approvals.py           # Pending approvals + loopback-only approval server
+│       ├── approve.py             # Approver CLI (python -m aegis_ai.approve)
+│       └── api.py                 # FastAPI HTTP adapter (/v1/sessions, /v1/agent/authorize, grants)
+├── config/                        # Example policy and gateway configs (protected from agent writes)
 ├── docs/
-│   ├── ARCHITECTURE.md            # System architecture & B2B packaging
+│   ├── ARCHITECTURE.md            # This document
+│   ├── THREAT_MODEL.md            # Gateway threat model (STRIDE + OWASP Agentic/LLM)
 │   └── OWASP_AI_CODING_SECURITY.md# OWASP Secure Coding with AI synthesis
 ├── scripts/
-│   ├── verify_dependencies.py     # Anti-slopsquatting & dependency hygiene CLI
-│   └── sync_agent_rules.py        # Generates agent rules files from one source; hidden-Unicode check
-├── tests/                         # Tests for the scripts above
-├── .cursorrules                   # Cursor AI security rules
-├── .gitleaks.toml                 # AI + Cloud secret detection rules
+│   ├── verify_dependencies.py     # Anti-slopsquatting & 90-day registry age verifier
+│   └── sync_agent_rules.py        # Canonical rules generator & hidden-Unicode detector
+├── tests/                         # Unit tests (stdlib unittest; API tests skip unless FastAPI is installed)
+├── .cursorrules                   # Generated from .agent/rules (verified by sync check)
+├── .gitleaks.toml                 # AI + Cloud secret detection rules (value-based allowlist)
 ├── .pre-commit-config.yaml        # Local deterministic pre-commit hooks
-├── CLAUDE.md                      # Claude Code context & security guardrails
-└── pyproject.toml                 # Python project & dependency manifest
+├── CLAUDE.md                      # Claude Code context (imports .agent/rules)
+└── pyproject.toml                 # Python project manifest
 ```
 
 ---
 
-## 3. B2B SMB Product Value Proposition
+## 5. B2B SMB Delivery Roadmap
 
-Small firms (10–250 employees) adopt AI coding tools and LLM APIs faster than large enterprises but lack a dedicated AI Security team. Mellyn Security solves three acute SMB pain points:
-
-1. **Zero-Config Secure AI Coding Pack ("Drop-In Repo Hardening")**:
-   A 1-command onboarding CLI/template that equips any client repository with OWASP-aligned AI steering rules (`.cursorrules`, `CLAUDE.md`, Copilot instructions), AI-specific Semgrep SAST rules, Gitleaks secret patterns, and slopsquatting protection.
-2. **Lightweight Runtime AI & Agent Guardrail API**:
-   A self-hosted or managed FastAPI microservice that sits in front of OpenAI/Anthropic/Gemini and MCP tools to block indirect prompt injection, redact leaked credentials/PII before egress, and prevent SSRF/command injection in agent tool calls.
-3. **Compliance & Posture Evidence for Enterprise Sales**:
-   Maps every scan and runtime policy decision directly to **OWASP LLM Top 10**, **OWASP Agentic Top 10**, and **SOC 2 / ISO 42001 / NIST AI RMF** controls so SMBs can pass enterprise security questionnaires.
+1. **Product 1 (Built & packaged) — Versioned Repo-Hardening Pack**: The guardrails are packaged as a SHA-pinned pre-commit hook pack (`.pre-commit-hooks.yaml`) and a reusable GitHub Actions workflow (`.github/workflows/mellyn-reusable-ai-security-gate.yml`), so SMB clients receive versioned guardrail updates without copy-paste drift. See [`CLIENT_ONBOARDING.md`](CLIENT_ONBOARDING.md). The reusable workflow has not yet run in a client repository on GitHub.
+2. **Product 2 (Active MVP) — Self-Hosted MCP Tool-Call Authorizer**: The authorization core, the HTTP API, and the stdio MCP gateway exist. Still to build before it is a product: persistent session state, pinning of approved tool descriptions, and an approval UI. A digest-pinned container image and a compose stack with a Squid egress proxy exist (`deploy/`) and have been built and run end to end on Docker Desktop.
+3. **Product 3 (Later) — Redacted Posture & Evidence Viewer**: Lightweight Next.js UI over real redacted audit logs, providing structured control evidence mapped to OWASP LLM Top 10, OWASP Agentic Top 10, and NIST AI RMF.

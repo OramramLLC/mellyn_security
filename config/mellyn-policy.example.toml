@@ -1,0 +1,67 @@
+# Mellyn Security — Example Self-Hosted MCP Gateway Policy
+# Loaded strictly and fail-closed by `aegis_ai.policy_loader.load_policy_file()`.
+
+schema_version = 1
+
+# Only these MCP servers may be called through the gateway (required in gateway mode).
+allowed_mcp_servers = [
+    "local-workspace",
+    "github-readonly",
+]
+
+# MCP servers whose responses are trusted not to carry indirect prompt injections.
+# Listing tools from, or calling, any allowlisted server NOT listed here taints the session.
+trusted_mcp_servers = [
+    "local-workspace",
+]
+
+# Outbound HTTPS domains permitted for network-capable tools (checked at the application layer).
+allowed_egress_domains = [
+    "docs.python.org",
+    "api.github.com",
+]
+
+# Additional workspace paths the agent may never modify (on top of built-in guardrail protections).
+# The gateway also protects its own config, this policy, and its audit log when they sit in the workspace.
+protected_paths = [
+    "config/",
+]
+
+# Supporting risk-signal thresholds (escalate-only; never grant access).
+injection_escalate_threshold = 0.70
+injection_deny_threshold = 0.90
+deny_on_dlp_secret = true
+
+# Risk tiers. MCP tools are keyed "<server>/<tool>"; a bare name applies only to local (non-MCP) tools.
+# Any MCP tool not listed here is HIGH, whatever its name, so a server cannot claim a low tier by naming
+# its tool "workspace_read". "resources/read" is the tier for reading that server's resources.
+[tool_risk_tiers]
+"local-workspace/workspace_read" = "low"
+"local-workspace/workspace_search" = "low"
+"local-workspace/workspace_write" = "medium"
+"local-workspace/resources/read" = "low"
+"local-workspace/shell_exec" = "high"
+"github-readonly/get_issue" = "low"
+
+# Narrow, exact-match scoped rules. ALLOW rules must name their server and list exact arguments.
+[[scoped_rules]]
+rule_id = "allow-unit-tests-when-tainted"
+tool_name = "shell_exec"
+mcp_server = "local-workspace"
+effect = "allow"
+allow_when_tainted = true
+description = "Allow running the exact local unittest command even in a tainted session."
+
+[scoped_rules.arg_equals]
+argv = [
+    ["python", "-m", "unittest", "discover", "-s", "tests"],
+    ["pytest", "tests"],
+]
+
+# A DENY rule without mcp_server applies to a tool of this name on every server.
+[[scoped_rules]]
+rule_id = "deny-destructive-programs"
+tool_name = "shell_exec"
+effect = "deny"
+programs = ["rm", "curl", "wget", "nc", "ncat"]
+description = "Defense-in-depth denial of destructive deletion and raw network binaries."

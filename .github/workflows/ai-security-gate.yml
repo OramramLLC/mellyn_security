@@ -24,12 +24,25 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+      # The Gitleaks CLI rather than gitleaks-action, so `# gitleaks:allow` comments and a .gitleaksignore added by
+      # the change under review are not honored. Pinned by version and SHA-256 of the release archive.
+      - name: Install pinned Gitleaks (checksum verified)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
-          # Repositories owned by a GitHub organization also need GITLEAKS_LICENSE.
-          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Gitleaks (full history, suppressions ignored)
+        run: |
+          # Gitleaks reads .gitleaksignore from --gitleaks-ignore-path AND from the scanned directory's root.
+          rm -f .gitleaksignore
+          mkdir -p "$RUNNER_TEMP/no-gitleaksignore"
+          "$RUNNER_TEMP/gitleaks" git . --config .gitleaks.toml --ignore-gitleaks-allow \
+            --gitleaks-ignore-path "$RUNNER_TEMP/no-gitleaksignore" --redact --no-banner --exit-code 1
 
   sast-and-supply-chain:
     name: SAST, lint, agent rules & dependency verification
@@ -59,8 +72,15 @@ jobs:
         working-directory: .semgrep # semgrep --test skips dot-directories when run from the root
         run: semgrep --test --metrics=off .
 
+      - name: Replace Semgrep ignore files (the change under review must not be able to hide itself)
+        run: |
+          find . -name .semgrepignore -not -path './.git/*' -print -delete
+          printf '%s\n' 'node_modules/' '.venv/' 'venv/' 'vendor/' 'dist/' 'build/' '*.min.js' > .semgrepignore
+
       - name: Semgrep scan with OWASP AI rules
-        run: semgrep scan --config .semgrep/owasp-ai-code-rules.yaml --exclude .semgrep --error --metrics=off
+        run: >
+          semgrep scan --config .semgrep/owasp-ai-code-rules.yaml --exclude .semgrep
+          --disable-nosem --error --metrics=off
 
   tests:
     name: Tests (Python ${{ matrix.python-version }})
@@ -77,5 +97,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # API test dependencies live in this job only: current FastAPI needs a newer opentelemetry-api than
+      # the Semgrep pin in the job above allows. Versions are at least a month old as a supply-chain cooldown;
+      # starlette is pinned too so the transitive dependency cannot float to a brand-new release.
+      - name: Install pinned API test dependencies
+        run: python -m pip install --disable-pip-version-check "fastapi==0.159.1" "starlette==1.9.0" "httpx==0.28.1"
+
       - name: Run tests
+        env:
+          AEGIS_REQUIRE_API_TESTS: "1" # fail instead of skipping if the API test dependencies are missing
         run: python -m unittest discover -s tests -v
