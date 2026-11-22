@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from aegis_ai.models import Decision, RiskTier
-from aegis_ai.policy import DEFAULT_TOOL_RISK_TIERS, DEFAULT_UNTRUSTED_CONTENT_TOOLS, PolicyConfig, ScopedRule
+from aegis_ai.policy import (
+    DEFAULT_TOOL_RISK_TIERS,
+    DEFAULT_UNTRUSTED_CONTENT_TOOLS,
+    PolicyConfig,
+    ScopedRule,
+    ToolCapability,
+)
 
 MAX_POLICY_BYTES = 256 * 1024
 
@@ -22,6 +28,9 @@ _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "allowed_egress_domains",
         "protected_paths",
         "tool_risk_tiers",
+        "tool_capabilities",
+        "server_presets",
+        "pinned_tool_hashes",
         "scoped_rules",
         "injection_escalate_threshold",
         "injection_deny_threshold",
@@ -42,6 +51,18 @@ _ALLOWED_RULE_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_ALLOWED_CAPABILITY_KEYS: frozenset[str] = frozenset(
+    {
+        "path_read_args",
+        "optional_path_read_args",
+        "path_read_list_args",
+        "path_write_args",
+        "url_args",
+        "shell_argv_arg",
+        "pure",
+    }
+)
+
 
 class PolicyLoadError(ValueError):
     """Raised when a policy file is missing, unreadable, or fails strict schema validation."""
@@ -52,6 +73,18 @@ def _require_str_list(data: Mapping[str, Any], key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
         raise PolicyLoadError(f"Policy field '{key}' must be a list of non-empty strings.")
     return tuple(item.strip() for item in value)
+
+
+def _require_str_map(data: Mapping[str, Any], key: str) -> dict[str, str]:
+    raw = data[key]
+    if not isinstance(raw, Mapping):
+        raise PolicyLoadError(f"Policy field '{key}' must be a mapping of non-empty string -> string.")
+    result: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+            raise PolicyLoadError(f"Every entry in '{key}' must map a non-empty string to a non-empty string.")
+        result[k.strip()] = v.strip()
+    return result
 
 
 def _require_threshold(data: Mapping[str, Any], key: str, default: float) -> float:
@@ -84,6 +117,45 @@ def _parse_risk_tiers(raw: Any) -> dict[str, RiskTier]:
                 f"Invalid risk tier '{tier_raw}' for tool '{tool_name}'; expected low, medium, or high."
             ) from exc
     return tiers
+
+
+def _parse_tool_capabilities(raw: Any) -> dict[str, ToolCapability]:
+    if not isinstance(raw, Mapping):
+        raise PolicyLoadError("Policy field 'tool_capabilities' must be a mapping of tool key -> capability table.")
+    caps: dict[str, ToolCapability] = {}
+    for tool_id, entry in raw.items():
+        if not isinstance(tool_id, str) or not tool_id.strip():
+            raise PolicyLoadError("Every key in 'tool_capabilities' must be a non-empty string.")
+        if not isinstance(entry, Mapping):
+            raise PolicyLoadError(f"tool_capabilities['{tool_id}'] must be a table/object.")
+        unknown = set(entry) - _ALLOWED_CAPABILITY_KEYS
+        if unknown:
+            raise PolicyLoadError(f"tool_capabilities['{tool_id}'] contains unknown key(s): {sorted(unknown)}")
+
+        def opt_str_tuple(field_name: str, _entry: Mapping[str, Any] = entry) -> tuple[str, ...]:
+            return _require_str_list(_entry, field_name) if field_name in _entry else ()
+
+        shell_argv_arg = entry.get("shell_argv_arg")
+        if shell_argv_arg is not None and (not isinstance(shell_argv_arg, str) or not shell_argv_arg.strip()):
+            raise PolicyLoadError(f"tool_capabilities['{tool_id}'].shell_argv_arg must be a non-empty string.")
+
+        pure = entry.get("pure", False)
+        if not isinstance(pure, bool):
+            raise PolicyLoadError(f"tool_capabilities['{tool_id}'].pure must be a boolean.")
+
+        try:
+            caps[tool_id.strip()] = ToolCapability(
+                path_read_args=opt_str_tuple("path_read_args"),
+                optional_path_read_args=opt_str_tuple("optional_path_read_args"),
+                path_read_list_args=opt_str_tuple("path_read_list_args"),
+                path_write_args=opt_str_tuple("path_write_args"),
+                url_args=opt_str_tuple("url_args"),
+                shell_argv_arg=shell_argv_arg.strip() if isinstance(shell_argv_arg, str) else None,
+                pure=pure,
+            )
+        except ValueError as exc:
+            raise PolicyLoadError(f"tool_capabilities['{tool_id}']: {exc}") from exc
+    return caps
 
 
 def _parse_scoped_rules(raw: Any) -> tuple[ScopedRule, ...]:
@@ -167,7 +239,7 @@ def _parse_scoped_rules(raw: Any) -> tuple[ScopedRule, ...]:
                     mcp_server=mcp_server.strip() if mcp_server else None,
                 )
             )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise PolicyLoadError(str(exc)) from exc
 
     return tuple(rules)
@@ -209,6 +281,13 @@ def parse_policy_dict(data: Mapping[str, Any]) -> PolicyConfig:
     tool_risk_tiers = (
         _parse_risk_tiers(data["tool_risk_tiers"]) if "tool_risk_tiers" in data else dict(DEFAULT_TOOL_RISK_TIERS)
     )
+    tool_capabilities = _parse_tool_capabilities(data["tool_capabilities"]) if "tool_capabilities" in data else {}
+    server_presets = _require_str_map(data, "server_presets") if "server_presets" in data else {}
+    pinned_tool_hashes = (
+        {k: v.lower() for k, v in _require_str_map(data, "pinned_tool_hashes").items()}
+        if "pinned_tool_hashes" in data
+        else {}
+    )
     scoped_rules = _parse_scoped_rules(data["scoped_rules"]) if "scoped_rules" in data else ()
 
     escalate = _require_threshold(data, "injection_escalate_threshold", 0.70)
@@ -222,18 +301,24 @@ def parse_policy_dict(data: Mapping[str, Any]) -> PolicyConfig:
     if not isinstance(deny_on_dlp_secret, bool):
         raise PolicyLoadError("Policy field 'deny_on_dlp_secret' must be a boolean.")
 
-    return PolicyConfig(
-        tool_risk_tiers=tool_risk_tiers,
-        allowed_mcp_servers=allowed_mcp_servers,
-        trusted_mcp_servers=trusted_mcp_servers,
-        untrusted_content_tools=untrusted_content_tools,
-        allowed_egress_domains=allowed_egress_domains,
-        protected_paths=protected_paths,
-        scoped_rules=scoped_rules,
-        injection_escalate_threshold=escalate,
-        injection_deny_threshold=deny,
-        deny_on_dlp_secret=deny_on_dlp_secret,
-    )
+    try:
+        return PolicyConfig(
+            tool_risk_tiers=tool_risk_tiers,
+            tool_capabilities=tool_capabilities,
+            server_presets=server_presets,
+            pinned_tool_hashes=pinned_tool_hashes,
+            allowed_mcp_servers=allowed_mcp_servers,
+            trusted_mcp_servers=trusted_mcp_servers,
+            untrusted_content_tools=untrusted_content_tools,
+            allowed_egress_domains=allowed_egress_domains,
+            protected_paths=protected_paths,
+            scoped_rules=scoped_rules,
+            injection_escalate_threshold=escalate,
+            injection_deny_threshold=deny,
+            deny_on_dlp_secret=deny_on_dlp_secret,
+        )
+    except ValueError as exc:
+        raise PolicyLoadError(str(exc)) from exc
 
 
 def load_policy_file(path: Path) -> PolicyConfig:

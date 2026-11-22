@@ -16,7 +16,7 @@ from aegis_ai.models import (
     TaintSource,
     ToolCallRequest,
 )
-from aegis_ai.policy import PolicyConfig, PolicyEngine, ScopedRule
+from aegis_ai.policy import MCP_CAPABILITY_PRESETS, PolicyConfig, PolicyEngine, ScopedRule, ToolCapability
 from aegis_ai.policy_loader import PolicyLoadError, load_policy_file, parse_policy_dict
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "CredentialConfigError",
     "Decision",
     "EgressValidator",
+    "MCP_CAPABILITY_PRESETS",
     "PolicyConfig",
     "PolicyEngine",
     "PolicyLoadError",
@@ -38,6 +39,7 @@ __all__ = [
     "ScopedRule",
     "TaintSource",
     "ToolCallRequest",
+    "ToolCapability",
     "WorkspacePathGuard",
     "load_policy_file",
     "parse_policy_dict",

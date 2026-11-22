@@ -54,6 +54,12 @@ GUARDRAIL_PATHS: tuple[str, ...] = (
 )
 
 
+# NUL and other C0/DEL control characters. They have no business in a path or URL, and they are where
+# validators and the programs that later open the path or URL disagree (NUL truncates C strings; CR/LF
+# split HTTP headers and log lines).
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 class EgressValidator:
     """
     Application-layer SSRF and destination allowlist validator.
@@ -71,6 +77,8 @@ class EgressValidator:
         """Return (is_allowed, reason) for an outbound URL."""
         if not isinstance(raw_url, str) or not raw_url.strip():
             return False, "URL is empty or not a string."
+        if _CONTROL_CHARACTERS.search(raw_url):
+            return False, "URL contains control characters."
 
         parsed = urlparse(raw_url.strip())
         if parsed.scheme.lower() != "https":
@@ -157,9 +165,14 @@ class WorkspacePathGuard:
         """Return (is_allowed, reason) for a workspace file read or write."""
         if not isinstance(raw_path, str) or not raw_path.strip():
             return False, "Path is empty or not a string."
+        if _CONTROL_CHARACTERS.search(raw_path):
+            return False, "Path contains control characters (for example a NUL byte)."
 
         candidate = Path(raw_path)
-        resolved = (candidate if candidate.is_absolute() else self.workspace_root / candidate).resolve()
+        try:
+            resolved = (candidate if candidate.is_absolute() else self.workspace_root / candidate).resolve()
+        except (OSError, ValueError, RuntimeError) as exc:  # e.g. invalid names, symlink loops
+            return False, f"Path '{raw_path}' could not be resolved ({type(exc).__name__})."
 
         try:
             rel_path = resolved.relative_to(self.workspace_root)

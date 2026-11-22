@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
 import os
@@ -69,6 +70,25 @@ MELLYN_POLICY_DENIED = -32003
 FORWARDED_SERVER_NOTIFICATIONS = frozenset({"notifications/tools/list_changed", "notifications/resources/list_changed"})
 
 
+class GatewayLocalError(dict):
+    """
+    A JSON-RPC error the gateway generated itself because a downstream server never answered (timeout,
+    closed pipe, refused input). It carries no server-written text, so it does not taint the session.
+
+    Replies a server actually sent are parsed with json.loads into plain `dict`s, so a server cannot make
+    its own reply look like one of these, whatever fields it includes.
+    """
+
+
+def _local_downstream_error(req_id: Any, message: str) -> GatewayLocalError:
+    return GatewayLocalError(_jsonrpc_error(req_id, DOWNSTREAM_ERROR, message))
+
+
+def _came_from_server(response: Mapping[str, Any]) -> bool:
+    """True when a downstream server wrote this reply (a result OR an error), so its text reaches the agent."""
+    return not isinstance(response, GatewayLocalError)
+
+
 def _jsonrpc_error(req_id: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
     error_body: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -80,6 +100,18 @@ def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
+def compute_tools_hash(tools: Sequence[Mapping[str, Any]]) -> str:
+    """
+    Compute the deterministic SHA-256 hex digest of a server's `tools/list` definitions.
+
+    Pinning this digest under `[pinned_tool_hashes]` in the policy lets an operator attest that they
+    have reviewed a server's tool names, schemas, and descriptions: matching listings do not taint
+    the session at turn 0, while any unreviewed change ("rug pull") is rejected fail-closed.
+    """
+    normalized = sorted((dict(t) for t in tools), key=lambda item: str(item.get("name", "")))
+    return hashlib.sha256(canonical_json({"tools": normalized}).encode("utf-8")).hexdigest()
+
+
 class Downstream(Protocol):
     """One downstream MCP server, as the gateway sees it."""
 
@@ -88,7 +120,7 @@ class Downstream(Protocol):
     def request(
         self, method: str, params: dict[str, Any], timeout: float = DOWNSTREAM_TIMEOUT_SECONDS
     ) -> dict[str, Any]:
-        """Send a request and return the JSON-RPC response with the matching ID (or a gateway error)."""
+        """Return the server's JSON-RPC response with the matching ID, or a GatewayLocalError if it never answered."""
         ...
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None: ...
@@ -188,19 +220,19 @@ class StdioDownstream:
     ) -> dict[str, Any]:
         req_id = f"mellyn-{next(self._ids)}"
         if not self._write({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}):
-            return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, f"Downstream server '{self.name}' is not accepting input.")
+            return _local_downstream_error(req_id, f"Downstream server '{self.name}' is not accepting input.")
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, f"Downstream server '{self.name}' timed out.")
+                return _local_downstream_error(req_id, f"Downstream server '{self.name}' timed out.")
             try:
                 message = self._inbox.get(timeout=remaining)
             except queue.Empty:
                 continue
             if message is _EOF:
                 self._inbox.put(_EOF)  # keep reporting closed to later requests
-                return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, f"Downstream server '{self.name}' closed.")
+                return _local_downstream_error(req_id, f"Downstream server '{self.name}' closed.")
             if not isinstance(message, dict):
                 continue
             if isinstance(message.get("method"), str):
@@ -341,11 +373,24 @@ class MCPGateway:
 
     def _tools_list(self, req_id: Any, _params: dict[str, Any]) -> dict[str, Any]:
         tools: list[dict[str, Any]] = []
+        pinned = self.authorizer.policy.config.pinned_tool_hashes
         for name, server in self.servers.items():
             listed = [t for t in self._list_all(server, "tools/list", "tools") if _valid_name(t.get("name"))]
+            if name in pinned:
+                try:
+                    actual_hash = compute_tools_hash(listed)
+                except (TypeError, ValueError):
+                    actual_hash = ""
+                if actual_hash != pinned[name]:
+                    return _jsonrpc_error(
+                        req_id,
+                        MELLYN_POLICY_DENIED,
+                        f"Downstream MCP server '{name}' tool definitions do not match pinned SHA-256 hash.",
+                        {"decision": Decision.DENY.value, "mcp_server": name},
+                    )
             for tool in listed:
                 tools.append({**tool, "name": f"{name}{TOOL_SEPARATOR}{tool['name']}"})
-            if listed:
+            if listed and name not in pinned:
                 self._taint_from(name, "mcp_tool_descriptions")
         return _jsonrpc_result(req_id, {"tools": tools})
 
@@ -373,7 +418,11 @@ class MCPGateway:
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "tools/call 'arguments' must be a JSON object.")
-        if len(canonical_json(arguments).encode("utf-8")) > MAX_ARGUMENTS_BYTES:
+        try:
+            encoded_args = canonical_json(arguments).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, f"Invalid tool arguments: {exc}")
+        if len(encoded_args) > MAX_ARGUMENTS_BYTES:
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "tools/call 'arguments' exceed 64 KiB.")
 
         request = ToolCallRequest(self.session_id, tool_name, arguments, mcp_server=server_name)
@@ -382,6 +431,10 @@ class MCPGateway:
             return blocked
         # Forward exactly what was authorized, rebuilt from validated fields.
         response = self.servers[server_name].request("tools/call", {"name": tool_name, "arguments": arguments})
+        # Taint on anything the server wrote, errors included: a relayed error message reaches the agent too,
+        # so an injection delivered as an error must taint just like one delivered as a result.
+        if _came_from_server(response):
+            self.authorizer.record_tool_result_taint(request)
         return _relay(req_id, response)
 
     def _resources_read(self, req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -397,11 +450,16 @@ class MCPGateway:
         blocked = self._authorize(req_id, request)
         if blocked is not None:
             return blocked
-        return _relay(req_id, self.servers[server_name].request("resources/read", {"uri": uri}))
+        response = self.servers[server_name].request("resources/read", {"uri": uri})
+        # Taint on anything the server wrote, errors included: a relayed error message reaches the agent too,
+        # so an injection delivered as an error must taint just like one delivered as a result.
+        if _came_from_server(response):
+            self.authorizer.record_tool_result_taint(request)
+        return _relay(req_id, response)
 
     def _authorize(self, req_id: Any, request: ToolCallRequest) -> dict[str, Any] | None:
         """Return None when the call may proceed, otherwise the JSON-RPC error to send back."""
-        result = self.authorizer.authorize(request)
+        result = self.authorizer.authorize(request, record_taint_on_allow=False)
         if result.decision == Decision.ALLOW:
             return None
         # Full reasons go to the audit log and the approver, not to the agent: they would tell an injected

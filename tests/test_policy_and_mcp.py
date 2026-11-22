@@ -406,7 +406,8 @@ class TestGatewayEndToEnd(unittest.TestCase):
             workspace = Path(tmp)
             (workspace / "policy.toml").write_text(
                 'schema_version = 1\nallowed_mcp_servers = ["fake", "files"]\ntrusted_mcp_servers = ["files"]\n'
-                '[tool_risk_tiers]\n"fake/read_note" = "low"\n"files/workspace_write" = "medium"\n',
+                '[tool_risk_tiers]\n"fake/read_note" = "low"\n"files/workspace_write" = "medium"\n'
+                '[tool_capabilities."fake/read_note"]\npure = true\n',
                 encoding="utf-8",
             )
             server = json.dumps([sys.executable, str(FAKE_SERVER)])
