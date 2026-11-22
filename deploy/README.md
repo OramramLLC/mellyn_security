@@ -95,18 +95,14 @@ servers from the client's own MCP config** so it cannot reach them directly:
 
 ### 6. Approve held calls
 
-The gateway's approval server listens on `127.0.0.1:8765` inside its container:
+`mellyn-approval-relay` publishes `127.0.0.1:8765` on the host and forwards **only** the three exact approval routes (`GET /v1/pending` and `POST /v1/pending/apr_.../(approve|reject)`) to `mellyn-gateway:8765` across `mellyn-internal`—keeping `mellyn-gateway` completely cut off from direct internet routes while letting you run the approver CLI directly on the host:
 
 ```bash
-docker exec -it mellyn-gateway python -m aegis_ai.approve --url http://127.0.0.1:8765 list
-docker exec -it mellyn-gateway python -m aegis_ai.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
+PYTHONPATH=backend python -m aegis_ai.approve --url http://127.0.0.1:8765 list
+PYTHONPATH=backend python -m aegis_ai.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
 ```
 
-The CLI prompts for the approver key. Use `-it` so it is not echoed, and **never** pass it with `docker exec -e`: the
-CLI runs in the same container, as the same user, as the MCP servers. It marks itself non-dumpable before reading
-the key, so those servers cannot read it from its memory or `/proc`. A key passed with `-e` is already in the process
-environment when the process starts, before the CLI can protect itself, so a same-user process could read it in that
-window.
+Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). If you prefer not to run Python on the host, you can also run `docker exec -it mellyn-gateway python -m aegis_ai.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i ... --key-stdin`); never pass the key via `docker exec -e`.
 
 ---
 

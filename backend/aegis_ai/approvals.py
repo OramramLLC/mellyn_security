@@ -210,17 +210,34 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
         )
 
 
+# 0.0.0.0 is only for the internal-only gateway container (reached through mellyn-approval-relay).
+ALLOWED_BIND_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "0.0.0.0"})  # noqa: S104 - see above
+
+
 class ApprovalHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, approvals: PendingApprovals, credentials: CredentialConfig, port: int = 0) -> None:
-        # Loopback only. The approver key, not the network location, is what authorizes an approval.
-        super().__init__(("127.0.0.1", port), _ApprovalHandler)
+    def __init__(
+        self,
+        approvals: PendingApprovals,
+        credentials: CredentialConfig,
+        port: int = 0,
+        *,
+        host: str = "127.0.0.1",
+    ) -> None:
+        # Loopback by default on bare metal; 0.0.0.0 is used only inside an internal-only container behind
+        # mellyn-approval-relay. Either way, Role.APPROVER HMAC verification is what authorizes an approval.
+        if host not in ALLOWED_BIND_HOSTS:
+            raise ValueError(f"ApprovalHTTPServer host must be one of {sorted(ALLOWED_BIND_HOSTS)}, got '{host}'.")
+        super().__init__((host, port), _ApprovalHandler)
         self.approvals = approvals
         self.credentials = credentials
 
     @property
     def url(self) -> str:
+        # Always the loopback form: the approver CLI only talks to loopback, and when the server is bound to
+        # 0.0.0.0 inside the gateway container it is reached as 127.0.0.1 there, or through the relay's
+        # 127.0.0.1 port on the host.
         return f"http://127.0.0.1:{self.server_address[1]}"
 
     def start_in_background(self) -> threading.Thread:

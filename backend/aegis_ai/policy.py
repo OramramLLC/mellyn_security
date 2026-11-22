@@ -31,10 +31,43 @@ DEFAULT_TOOL_RISK_TIERS: dict[str, RiskTier] = {
 # Tools that execute a program when no explicit ToolCapability overrides them.
 SHELL_TOOL_NAMES: frozenset[str] = frozenset({"shell_exec"})
 
-# Programs that interpret a command string, which would reintroduce shell injection through argv.
+# Programs that interpret a command string or dispatch arbitrary child commands, which would
+# reintroduce shell/command injection through argv.
 SHELL_INTERPRETERS: frozenset[str] = frozenset(
-    {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "cmd", "powershell", "pwsh", "env", "xargs"}
+    {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "csh",
+        "tcsh",
+        "cmd",
+        "powershell",
+        "pwsh",
+        "env",
+        "xargs",
+        "busybox",
+        "toybox",
+        "nohup",
+        "sudo",
+        "su",
+        "doas",
+        "eval",
+        "exec",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+    }
 )
+
+_PYTHON_PROG_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|py)$")
+_NODE_RUNTIMES: frozenset[str] = frozenset({"node", "nodejs", "deno", "bun"})
+_PERL_RUBY_RUNTIMES: frozenset[str] = frozenset({"perl", "ruby"})
+_LUA_RUNTIMES: frozenset[str] = frozenset({"lua", "luajit"})
+_FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 
 # Tools whose results bring outside content into the agent's context. Allowing one taints the session.
 DEFAULT_UNTRUSTED_CONTENT_TOOLS: frozenset[str] = frozenset({"http_get", "http_fetch", "web_fetch", "web_search"})
@@ -149,16 +182,115 @@ def program_name(argv0: str) -> str:
     return re.sub(r"\.(exe|cmd|bat|com)$", "", name)
 
 
+def _short_option_clusters(rest: tuple[str, ...], value_letters: str, long_with_value: frozenset[str]):
+    """
+    Yield (letter, cluster) for each short option letter before the first operand, the way getopt reads
+    them: `-Ic` is `-I -c`; a letter in `value_letters` takes the rest of its cluster (`-Wignore`) or, when
+    nothing follows it, the next argument (`-W ignore`) as its value. Long options in `long_with_value`
+    consume the next argument. Stops at the first operand (the script or module) or `--`.
+    """
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--" or not arg.startswith("-") or arg == "-":
+            return
+        if arg.startswith("--"):
+            if arg in long_with_value:
+                i += 1  # skip its separate value
+            i += 1
+            continue
+        for pos, letter in enumerate(arg[1:], start=1):
+            yield letter, arg
+            if letter in value_letters:
+                if pos == len(arg) - 1:
+                    i += 1  # value is the next argument
+                break  # the rest of this cluster is the value
+        i += 1
+
+
+def _has_inline_eval_flag(prog: str, rest: tuple[str, ...]) -> str | None:
+    """
+    Return a denial reason if argv asks an interpreter to evaluate inline code or hook a command.
+
+    This is a best-effort blocklist, not a boundary: shell tools are HIGH risk and need an exact allow rule
+    or a human approval regardless. It parses each runtime's own option syntax (combined short flags such
+    as `-Ic` or `-le`, and flags that take a value such as `-W ignore`), so the obvious spellings of the
+    same command are caught too.
+    """
+    if _PYTHON_PROG_RE.fullmatch(prog):
+        for letter, cluster in _short_option_clusters(rest, "WXQm", frozenset({"--check-hash-based-pycs"})):
+            if letter == "c":
+                return f"Inline Python code evaluation ('-c' in '{cluster}') via '{prog}' is denied."
+            if letter == "m":
+                return None  # `-m module`: everything after belongs to the module
+    elif prog in _NODE_RUNTIMES:
+        operands = [arg for arg in rest if not arg.startswith("-")]
+        if prog == "deno" and operands[:1] == ["eval"]:
+            return "Inline JavaScript evaluation ('deno eval') is denied."
+        for arg in rest:
+            if arg in ("-e", "--eval", "-p", "--print") or arg.startswith(("--eval=", "--print=")):
+                return f"Inline JavaScript evaluation ('{arg}') via '{prog}' is denied."
+            if arg.startswith("-") and not arg.startswith("--") and any(c in "ep" for c in arg[1:]):
+                return f"Inline JavaScript evaluation ('{arg}') via '{prog}' is denied."
+            if "data:" in arg:
+                return f"Loading code from a data: URL ('{arg}') via '{prog}' is denied."
+    elif prog == "perl":
+        for letter, cluster in _short_option_clusters(rest, "IMmixdDC0", frozenset()):
+            if letter in "eE":
+                return f"Inline Perl evaluation ('-{letter}' in '{cluster}') is denied."
+            if letter in "Mm":
+                value = cluster.split(letter, 1)[1]
+                if value and not re.fullmatch(r"-?[A-Za-z0-9_:]+(=[A-Za-z0-9_,:]*)?", value):
+                    return f"Perl module option '{cluster}' contains code, which is denied."
+    elif prog == "ruby":
+        for letter, cluster in _short_option_clusters(rest, "IrCEKxi0FW", frozenset()):
+            if letter == "e":
+                return f"Inline Ruby evaluation ('-e' in '{cluster}') is denied."
+    elif prog == "php":
+        for letter, cluster in _short_option_clusters(rest, "cdfz", frozenset()):
+            if letter in "rRBE":
+                return f"Inline PHP evaluation ('-{letter}' in '{cluster}') is denied."
+        if "--run" in rest:
+            return "Inline PHP evaluation ('--run') is denied."
+    elif prog in _LUA_RUNTIMES:
+        for letter, cluster in _short_option_clusters(rest, "l", frozenset()):
+            if letter == "e":
+                return f"Inline Lua evaluation ('-e' in '{cluster}') via '{prog}' is denied."
+    elif prog == "find":
+        for arg in rest:
+            if arg in _FIND_EXEC_FLAGS:
+                return f"Dangerous 'find' action flag '{arg}' is denied."
+    elif prog == "git":
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "-c" or arg.startswith("-c") or arg == "--config-env" or arg.startswith("--config-env="):
+                return f"Inline git configuration override ('{arg}') is denied."
+            if arg.startswith("--exec-path="):
+                return f"Overriding git's helper directory ('{arg}') is denied."
+            if arg in ("-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"):
+                i += 2  # these take the next argument as their value
+                continue
+            if not arg.startswith("-"):
+                break  # the git subcommand
+            i += 1
+    return None
+
+
 def validate_argv(arguments: Mapping[str, Any], *, argv_key: str = "argv") -> tuple[bool, str]:
-    """Shell tools take a non-empty list of strings under `argv_key` and nothing that a shell would parse."""
+    """Shell tools take a non-empty list of strings under `argv_key`, and nothing a shell or inline eval would parse."""
     if "command" in arguments and argv_key != "command":
         return False, "Shell command strings are not accepted; pass an 'argv' list so no shell parses it."
     argv = arguments.get(argv_key)
     if not isinstance(argv, list | tuple) or not argv or not all(isinstance(a, str) and a for a in argv):
         return False, f"Shell tools require '{argv_key}' as a non-empty list of non-empty strings."
-    if program_name(argv[0]) in SHELL_INTERPRETERS:
-        return False, f"Running the command interpreter '{program_name(argv[0])}' is denied."
-    return True, f"Program '{program_name(argv[0])}' with {len(argv) - 1} argument(s)."
+    prog = program_name(argv[0])
+    if prog in SHELL_INTERPRETERS:
+        return False, f"Running the command interpreter '{prog}' is denied."
+    eval_reason = _has_inline_eval_flag(prog, tuple(argv[1:]))
+    if eval_reason is not None:
+        return False, eval_reason
+    return True, f"Program '{prog}' with {len(argv) - 1} argument(s)."
 
 
 def normalize_arg_value(value: Any) -> Any:

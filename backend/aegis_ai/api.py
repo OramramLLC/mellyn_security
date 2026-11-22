@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -69,6 +70,8 @@ def create_app(
     policy_config: PolicyConfig | None = None,
     credentials: CredentialConfig | None = None,
     audit_logger: AuditLogger | None = None,
+    *,
+    _owned_sink: IO[str] | None = None,
 ) -> FastAPI:
     """
     Build the FastAPI application wrapping an Authorizer instance.
@@ -76,7 +79,16 @@ def create_app(
     Credentials come from the environment unless passed in. If they are missing or malformed the app
     still starts, but every route except /healthz answers 503 (fail closed).
     """
-    app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="0.1.0")
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if _owned_sink is not None and not _owned_sink.closed:
+                _owned_sink.close()
+
+    app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="0.1.0", lifespan=_lifespan)
     authorizer = Authorizer(
         workspace_root=workspace_root or Path.cwd(),
         policy_config=policy_config,
@@ -200,14 +212,21 @@ def create_app_from_env() -> FastAPI:
 
     audit_path_raw = os.environ.get("AEGIS_AUDIT_LOG_PATH", "").strip()
     audit_logger: AuditLogger | None = None
+    sink: IO[str] | None = None
     if audit_path_raw:
         audit_path = Path(audit_path_raw)
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         sink = audit_path.open("a", encoding="utf-8")
         audit_logger = AuditLogger(sink=sink)
 
-    return create_app(
-        workspace_root=workspace_root,
-        policy_config=policy_config,
-        audit_logger=audit_logger,
-    )
+    try:
+        return create_app(
+            workspace_root=workspace_root,
+            policy_config=policy_config,
+            audit_logger=audit_logger,
+            _owned_sink=sink,
+        )
+    except Exception:
+        if sink is not None and not sink.closed:
+            sink.close()
+        raise

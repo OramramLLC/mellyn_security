@@ -24,4 +24,6 @@
 /config/                    @OramramLLC
 /deploy/                    @OramramLLC
 /Dockerfile                 @OramramLLC
+/.dockerignore              @OramramLLC
 /backend/aegis_ai/          @OramramLLC
+/tests/                     @OramramLLC

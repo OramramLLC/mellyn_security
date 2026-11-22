@@ -125,5 +125,56 @@ class TestApiFailsClosedWithoutCredentials(unittest.TestCase):
             self.assertEqual(client.get("/healthz").status_code, 200)
 
 
+@unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
+class TestCreateAppFromEnv(unittest.TestCase):
+    def test_fails_closed_on_invalid_policy_path(self) -> None:
+        from aegis_ai.api import create_app_from_env
+        from aegis_ai.policy_loader import PolicyLoadError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "AEGIS_POLICY_PATH": str(Path(tmp) / "missing.toml"),
+                "AEGIS_WORKSPACE_ROOT": tmp,
+                "AEGIS_REQUIRE_WORKSPACE_MOUNT": "0",
+            }
+            with unittest.mock.patch.dict("os.environ", env, clear=True), self.assertRaises(PolicyLoadError):
+                create_app_from_env()
+
+    def test_writes_audit_log_and_closes_sink_on_lifespan_shutdown(self) -> None:
+        from aegis_ai.api import create_app_from_env
+        from aegis_ai.credentials import key_digest
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            audit_file = Path(tmp) / "logs" / "audit.jsonl"
+            pepper = secrets.token_urlsafe(32)
+            agent_key = secrets.token_urlsafe(32)
+            approver_key = secrets.token_urlsafe(32)
+            env = {
+                "AEGIS_WORKSPACE_ROOT": str(workspace),
+                "AEGIS_REQUIRE_WORKSPACE_MOUNT": "0",
+                "AEGIS_AUDIT_LOG_PATH": str(audit_file),
+                "AEGIS_API_KEY_PEPPER": pepper,
+                "AEGIS_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
+                "AEGIS_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
+            }
+            with unittest.mock.patch.dict("os.environ", env, clear=True):
+                app = create_app_from_env()
+                with TestClient(app) as client:
+                    sid = client.post("/v1/sessions", headers={"X-Aegis-API-Key": agent_key}).json()["session_id"]
+                    res = client.post(
+                        "/v1/agent/authorize",
+                        headers={"X-Aegis-API-Key": agent_key},
+                        json={"session_id": sid, "tool_name": "git_status", "arguments": {}},
+                    )
+                    self.assertEqual(res.status_code, 200)
+
+            lines = audit_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("git_status", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()

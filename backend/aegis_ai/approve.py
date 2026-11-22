@@ -76,6 +76,11 @@ def _make_undumpable() -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Approve or reject tool calls held by the Mellyn MCP gateway.")
     parser.add_argument("--url", default=os.environ.get("AEGIS_APPROVAL_URL", ""), help="Approval server URL")
+    parser.add_argument(
+        "--key-stdin",
+        action="store_true",
+        help="Read the approver key as one line from stdin instead of AEGIS_APPROVER_KEY or a TTY prompt",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="Show calls waiting for approval")
     approve = sub.add_parser("approve", help="Approve one exact call")
@@ -93,7 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     _make_undumpable()
-    key = os.environ.get("AEGIS_APPROVER_KEY") or getpass.getpass("Approver key: ")
+    if args.key_stdin:
+        key = sys.stdin.readline().rstrip("\r\n")
+    else:
+        key = os.environ.get("AEGIS_APPROVER_KEY") or getpass.getpass("Approver key: ")
 
     if args.command == "list":
         pending = _call(base_url, key, "GET", "/v1/pending")["pending"]

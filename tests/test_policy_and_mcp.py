@@ -58,7 +58,7 @@ class TestPolicyLoader(unittest.TestCase):
         self.assertEqual(config.allowed_mcp_servers, frozenset({"local-workspace", "github-readonly"}))
         self.assertEqual(config.trusted_mcp_servers, frozenset({"local-workspace"}))
         self.assertIn("docs.python.org", config.allowed_egress_domains)
-        self.assertIn("config/", config.protected_paths)
+        self.assertEqual(config.protected_paths, ())  # generic example: no repository-specific paths
         self.assertEqual(config.tool_risk_tiers["local-workspace/workspace_read"], RiskTier.LOW)
         self.assertEqual(len(config.scoped_rules), 2)
         self.assertEqual(config.scoped_rules[0].rule_id, "allow-unit-tests-when-tainted")
