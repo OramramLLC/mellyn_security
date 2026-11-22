@@ -49,10 +49,69 @@ INTERNAL_NET = "mellyn-ci-internal"
 EXT_NET = "mellyn-ci-egress"
 SQUID_CONTAINER = "mellyn-ci-squid"
 AUTH_CONTAINER = "mellyn-ci-authorizer"
+GW_AUDIT_VOLUME = "mellyn-ci-gw-audit"
 
 
-def run_cmd(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, text=True, capture_output=True, check=check)  # noqa: S603
+_AUDIT_ISOLATION_FIXTURE = """
+import json, os, sys
+from pathlib import Path
+
+def denied(fn):
+    try:
+        fn()
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return False
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        res = {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "probe", "version": "1"},
+        }
+    elif method == "tools/call":
+        tmp_probe = Path("/tmp/probe-sentinel")
+        tmp_probe.write_text("forged", encoding="utf-8")
+        report = {
+            "uid": os.geteuid(),
+            "gid": os.getegid(),
+            "cwd": os.getcwd(),
+            "marker": Path("marker.txt").read_text(encoding="utf-8").strip(),
+            "list_dir_denied": denied(lambda: os.listdir("/var/log/mellyn")),
+            "write_audit_denied": denied(
+                lambda: Path("/var/log/mellyn/gateway-audit.jsonl").open("a", encoding="utf-8").close()
+            ),
+            "write_sentinel_denied": denied(
+                lambda: Path("/var/log/mellyn/sentinel.txt").write_text("tampered", encoding="utf-8")
+            ),
+            "unlink_sentinel_denied": denied(lambda: os.unlink("/var/log/mellyn/sentinel.txt")),
+            "replace_sentinel_denied": denied(
+                lambda: os.replace(tmp_probe, "/var/log/mellyn/sentinel.txt")
+            ),
+            # The point of the separate user: the gateway's environment holds the pepper and approver digest.
+            "read_gateway_environ_denied": denied(lambda: open(f"/proc/{os.getppid()}/environ", "rb").read()),
+            "read_gateway_mem_denied": denied(lambda: open(f"/proc/{os.getppid()}/mem", "rb").read(1)),
+            "parent_is_gateway": b"mellyn.mcp_gateway" in open(f"/proc/{os.getppid()}/cmdline", "rb").read(),
+            # The gateway cannot signal this process after its drop; only PID 1's exit ending the namespace stops it.
+            "gateway_is_pid1": os.getppid() == 1,
+        }
+        res = {"content": [{"type": "text", "text": json.dumps(report)}]}
+    else:
+        res = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}) + "\\n")
+    sys.stdout.flush()
+"""
+
+
+def run_cmd(argv: list[str], *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, input=input_text, text=True, capture_output=True, check=check)  # noqa: S603
 
 
 def wait_for_healthz(url: str, timeout: float = 25.0) -> None:
@@ -130,6 +189,7 @@ def cleanup() -> None:
         run_cmd(["docker", "rm", "-f", name], check=False)
     for net in (INTERNAL_NET, EXT_NET):
         run_cmd(["docker", "network", "rm", net], check=False)
+    run_cmd(["docker", "volume", "rm", "-f", GW_AUDIT_VOLUME], check=False)
 
 
 def main() -> int:
@@ -242,6 +302,152 @@ def main() -> int:
             except urllib.error.HTTPError as exc:
                 if exc.code != 403:
                     raise RuntimeError(f"Expected 403 for approver key on /v1/sessions, got {exc.code}") from exc
+
+            print("[3b/5] Verifying downstream MCP UID isolation from /var/log/mellyn and workspace cwd...")
+            marker_file = ws_dir / "marker.txt"
+            marker_file.write_text("WORKSPACE_MARKER\n", encoding="utf-8")
+            os.chmod(marker_file, 0o644)
+
+            cfg_dir = tmp_dir / "gw-cfg"
+            cfg_dir.mkdir()
+            fixture_py = cfg_dir / "fixture_mcp.py"
+            fixture_py.write_text(_AUDIT_ISOLATION_FIXTURE, encoding="utf-8", newline="\n")
+            gw_policy = cfg_dir / "policy.toml"
+            gw_policy.write_text(
+                'schema_version = 1\nallowed_mcp_servers = ["probe"]\ntrusted_mcp_servers = ["probe"]\n'
+                '[tool_risk_tiers]\n"probe/inspect_access" = "low"\n'
+                '[tool_capabilities."probe/inspect_access"]\npure = true\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            gw_toml = cfg_dir / "gateway.toml"
+            gw_toml.write_text(
+                'schema_version = 1\npolicy = "policy.toml"\n'
+                '[[servers]]\nname = "probe"\ncommand = ["python", "/etc/mellyn/fixture_mcp.py"]\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            for f in (fixture_py, gw_policy, gw_toml):
+                os.chmod(f, 0o644)
+
+            run_cmd(["docker", "volume", "create", GW_AUDIT_VOLUME])
+            run_cmd(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--user",
+                    "10001:10001",
+                    "-v",
+                    f"{GW_AUDIT_VOLUME}:/var/log/mellyn",
+                    "--entrypoint",
+                    "python",
+                    AUTH_IMAGE,
+                    "-c",
+                    "from pathlib import Path; Path('/var/log/mellyn/sentinel.txt').write_text('sentinel-intact\\n')",
+                ]
+            )
+            gw_input = "".join(
+                json.dumps(m) + "\n"
+                for m in (
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "probe__inspect_access"}},
+                    {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+                )
+            )
+            gw_run = run_cmd(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-i",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:noexec,nosuid,size=32m,mode=1777",  # noqa: S108
+                    "--user",
+                    "0:0",
+                    "--cap-drop",
+                    "ALL",
+                    "--cap-add",
+                    "SETUID",
+                    "--cap-add",
+                    "SETGID",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "-v",
+                    f"{ws_dir}:/workspace:ro",
+                    "-v",
+                    f"{cfg_dir}:/etc/mellyn:ro",
+                    "-v",
+                    f"{GW_AUDIT_VOLUME}:/var/log/mellyn",
+                    "--entrypoint",
+                    "python",
+                    AUTH_IMAGE,
+                    "-m",
+                    "mellyn.mcp_gateway",
+                    "--config",
+                    "/etc/mellyn/gateway.toml",
+                    "--workspace",
+                    "/workspace",
+                    "--audit-log",
+                    "/var/log/mellyn/gateway-audit.jsonl",
+                    "--gateway-user",
+                    "mellyn",
+                    "--downstream-user",
+                    "mellyn-mcp",
+                ],
+                input_text=gw_input,
+                check=False,
+            )
+            if gw_run.returncode != 0:
+                raise RuntimeError(f"Isolated gateway run failed ({gw_run.returncode}): {gw_run.stderr}")
+            gw_replies = {r["id"]: r for r in map(json.loads, gw_run.stdout.splitlines()) if "id" in r}
+            probe_report = json.loads(gw_replies[2]["result"]["content"][0]["text"])
+            if probe_report["uid"] != 10002 or probe_report["gid"] != 10002:
+                raise RuntimeError(f"Expected downstream UID/GID 10002, got: {probe_report}")
+            if probe_report["cwd"] != "/workspace" or probe_report["marker"] != "WORKSPACE_MARKER":
+                raise RuntimeError(f"Expected downstream cwd /workspace and WORKSPACE_MARKER, got: {probe_report}")
+            for check_key in (
+                "list_dir_denied",
+                "write_audit_denied",
+                "write_sentinel_denied",
+                "unlink_sentinel_denied",
+                "replace_sentinel_denied",
+                "read_gateway_environ_denied",
+                "read_gateway_mem_denied",
+                "parent_is_gateway",
+                "gateway_is_pid1",
+            ):
+                if not probe_report.get(check_key):
+                    raise RuntimeError(f"Downstream process was not blocked on {check_key}: {probe_report}")
+
+            audit_verify = run_cmd(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--user",
+                    "10001:10001",
+                    "-v",
+                    f"{GW_AUDIT_VOLUME}:/var/log/mellyn:ro",
+                    "--entrypoint",
+                    "python",
+                    AUTH_IMAGE,
+                    "-c",
+                    (
+                        "import json; from pathlib import Path; "
+                        "print(json.dumps({"
+                        "'sentinel': Path('/var/log/mellyn/sentinel.txt').read_text(), "
+                        "'audit': Path('/var/log/mellyn/gateway-audit.jsonl').read_text().splitlines()"
+                        "}))"
+                    ),
+                ]
+            )
+            verified_data = json.loads(audit_verify.stdout)
+            if verified_data["sentinel"] != "sentinel-intact\n":
+                raise RuntimeError(f"Audit sentinel was modified: {verified_data['sentinel']!r}")
+            if len(verified_data["audit"]) != 1 or json.loads(verified_data["audit"][0])["decision"] != "allow":
+                raise RuntimeError(f"Expected 1 appended allow audit event, got: {verified_data['audit']}")
 
             print("[4/5] Starting isolated internal network + Squid egress proxy...")
             run_cmd(["docker", "network", "create", "--internal", "--subnet", INTERNAL_SUBNET, INTERNAL_NET])

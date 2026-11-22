@@ -57,6 +57,19 @@ Compose refuses to start without it. The authorizer mounts it read-only and refu
 a mount point (`MELLYN_REQUIRE_WORKSPACE_MOUNT=1`): otherwise its path guard would resolve symlinks against an empty
 directory and could not see a link that points at a secret.
 
+**Linux hosts: give the MCP servers access to the workspace.** Inside the gateway container, MCP servers run as
+the `mellyn-mcp` user (UID `10002`), not as you. On Docker Desktop (Windows, macOS) bind mounts are usually
+writable by any container user, but on a Linux host the workspace keeps its host ownership, so a filesystem MCP
+server will get "permission denied" until UID 10002 is allowed in. Grant exactly that, rather than opening the
+directory to everyone:
+
+```bash
+setfacl -R -m u:10002:rwX -m d:u:10002:rwX "$MELLYN_WORKSPACE"   # read/write for 10002, inherited by new files
+```
+
+(Without ACL support, `chgrp -R 10002` plus `chmod -R g+rwX` and the setgid bit on directories does the same.)
+Read-only MCP servers only need `u:10002:rX`.
+
 ### 3. Sync the egress proxy config from your policy
 
 ```bash
@@ -107,7 +120,7 @@ PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 list
 PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
 ```
 
-Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). If you prefer not to run Python on the host, you can also run `docker exec -it mellyn-gateway python -m mellyn.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i ... --key-stdin`); never pass the key via `docker exec -e`.
+Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). Inside `mellyn-gateway`, downstream MCP servers run under the dedicated unprivileged `mellyn-mcp` (`10002`) UID while the gateway drops to `mellyn` (`10001`), keeping `/var/log/mellyn` (`0700`, mounted from its own isolated `mellyn-gateway-audit-logs` volume) inaccessible to child MCP processes. If you prefer not to run Python on the host, run `docker exec -it -u mellyn mellyn-gateway python -m mellyn.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i -u mellyn ... --key-stdin`); never pass the key via `docker exec -e`.
 
 ---
 

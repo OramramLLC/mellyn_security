@@ -11,9 +11,8 @@ from typing import Any
 from mellyn.models import Decision, RiskTier, ToolCallRequest
 
 DEFAULT_TOOL_RISK_TIERS: dict[str, RiskTier] = {
-    # Low-risk: read-only inside workspace
+    # Low-risk: single-file read-only or pure metadata inside workspace
     "workspace_read": RiskTier.LOW,
-    "workspace_search": RiskTier.LOW,
     "git_status": RiskTier.LOW,
     "git_diff": RiskTier.LOW,
     # Medium-risk: workspace writes or allowlisted read-only HTTP
@@ -133,9 +132,11 @@ UNBOUND_PATH_ARG_NAMES: frozenset[str] = frozenset(
 )
 
 # Built-in baseline capabilities for canonical tool names.
+# Recursive content-search tools are intentionally excluded unless implemented by a guard-enforcing adapter
+# (see WorkspacePathGuard.search_content), because checking only a starting directory does not enforce
+# per-file secret denial inside an opaque downstream tool.
 DEFAULT_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "workspace_read": ToolCapability(path_read_args=("path",)),
-    "workspace_search": ToolCapability(optional_path_read_args=("path",)),
     "workspace_write": ToolCapability(path_write_args=("path",)),
     "workspace_delete": ToolCapability(path_write_args=("path",)),
     "git_status": ToolCapability(pure=True),
@@ -148,6 +149,8 @@ DEFAULT_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
 }
 
 # Presets for widely deployed off-the-shelf MCP servers (e.g., @modelcontextprotocol/server-filesystem).
+# Recursive directory/content traversal tools (`search_files`, `directory_tree`) are omitted so they cannot
+# be marked LOW/MEDIUM without a per-file secret-filtering implementation.
 MCP_CAPABILITY_PRESETS: dict[str, dict[str, ToolCapability]] = {
     "mcp-filesystem": {
         "read_file": ToolCapability(path_read_args=("path",)),
@@ -156,8 +159,6 @@ MCP_CAPABILITY_PRESETS: dict[str, dict[str, ToolCapability]] = {
         "read_multiple_files": ToolCapability(path_read_list_args=("paths",)),
         "list_directory": ToolCapability(path_read_args=("path",)),
         "list_directory_with_sizes": ToolCapability(path_read_args=("path",)),
-        "directory_tree": ToolCapability(path_read_args=("path",)),
-        "search_files": ToolCapability(path_read_args=("path",)),
         "get_file_info": ToolCapability(path_read_args=("path",)),
         "list_allowed_directories": ToolCapability(pure=True),
         "write_file": ToolCapability(path_write_args=("path",)),
@@ -364,7 +365,7 @@ class ScopedRule:
             for val in allowed_values:
                 normalize_arg_value(val)
 
-    def matches(self, request: ToolCallRequest) -> bool:
+    def matches(self, request: ToolCallRequest, *, argv_key: str = "argv") -> bool:
         if self.tool_name != request.tool_name:
             return False
         if self.mcp_server != request.mcp_server and not (self.effect == Decision.DENY and self.mcp_server is None):
@@ -380,13 +381,13 @@ class ScopedRule:
             if not any(actual_norm == normalize_arg_value(v) for v in allowed_values):
                 return False
         if self.programs:
-            argv = args.get("argv")
+            argv = args.get(argv_key)
             if not isinstance(argv, list | tuple) or not argv or not isinstance(argv[0], str):
                 return False
             if program_name(argv[0]) not in {p.lower() for p in self.programs}:
                 return False
         if self.effect != Decision.DENY:
-            named = set(self.arg_equals) | ({"argv"} if self.programs else set())
+            named = set(self.arg_equals) | ({argv_key} if self.programs else set())
             if set(args) - named:
                 return False
         return True
@@ -503,12 +504,10 @@ class PolicyEngine:
         )
 
     def check_mcp_server(self, mcp_server: str | None) -> tuple[bool, str]:
-        """Verify MCP server against the allowlist when an allowlist is configured."""
+        """Verify MCP server against the allowlist (defaults to an empty allowlist when omitted)."""
         if mcp_server is None:
             return True, "Local/non-MCP tool call."
-        if self.config.allowed_mcp_servers is None:
-            return True, f"MCP server '{mcp_server}' accepted (no allowlist configured)."
-        if mcp_server in self.config.allowed_mcp_servers:
+        if self.config.allowed_mcp_servers and mcp_server in self.config.allowed_mcp_servers:
             return True, f"MCP server '{mcp_server}' is allowlisted."
         return False, f"MCP server '{mcp_server}' is not in the approved MCP server allowlist."
 
@@ -518,12 +517,17 @@ class PolicyEngine:
             return True
         return request.mcp_server is not None and request.mcp_server not in self.config.trusted_mcp_servers
 
-    def match_scoped_rule(self, request: ToolCallRequest) -> ScopedRule | None:
+    def match_scoped_rule(self, request: ToolCallRequest, *, argv_key: str | None = None) -> ScopedRule | None:
         """
         Return the highest-precedence matching scoped rule.
         Explicit DENY rules always take precedence over ALLOW/REQUIRE_APPROVAL rules.
         """
-        matched = [rule for rule in self.config.scoped_rules if rule.matches(request)]
+        if argv_key is None:
+            cap = self.capability_for(request.tool_name, request.mcp_server)
+            resolved_argv_key = cap.shell_argv_arg if cap is not None and cap.shell_argv_arg is not None else "argv"
+        else:
+            resolved_argv_key = argv_key
+        matched = [rule for rule in self.config.scoped_rules if rule.matches(request, argv_key=resolved_argv_key)]
         for rule in matched:
             if rule.effect == Decision.DENY:
                 return rule

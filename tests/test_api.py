@@ -112,6 +112,23 @@ class TestAuthorizerApi(unittest.TestCase):
         response = self.client.post("/v1/agent/authorize", headers=self.agent, json=body)
         self.assertEqual(response.status_code, 413)
 
+    def test_empty_policy_denies_mcp_server_even_with_grant_while_allowing_local(self) -> None:
+        session = self.new_session()
+        grant = {
+            "tool_name": "git_status",
+            "mcp_server": "dummy-mcp",
+            "arguments": {},
+            "approved_by": "reviewer@example.com",
+        }
+        grant_resp = self.client.post(f"/v1/sessions/{session}/grants", headers=self.approver, json=grant)
+        self.assertEqual(grant_resp.status_code, 201, grant_resp.text)
+
+        mcp_call = {"session_id": session, "tool_name": "git_status", "mcp_server": "dummy-mcp", "arguments": {}}
+        self.assertEqual(self.authorize(mcp_call)["decision"], "deny")
+
+        local_call = {"session_id": session, "tool_name": "git_status", "arguments": {}}
+        self.assertEqual(self.authorize(local_call)["decision"], "allow")
+
 
 @unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
 class TestApiFailsClosedWithoutCredentials(unittest.TestCase):

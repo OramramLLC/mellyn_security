@@ -21,11 +21,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Dedicated non-root user and a writable audit log directory
+# Dedicated non-root identities:
+#   - mellyn (10001): runs the authorizer/gateway and owns /var/log/mellyn (mode 0700)
+#   - mellyn-mcp (10002): unprivileged identity for downstream MCP child servers (zero access to /var/log/mellyn)
 RUN groupadd --gid 10001 mellyn \
     && useradd --uid 10001 --gid 10001 --shell /usr/sbin/nologin --create-home mellyn \
+    && groupadd --gid 10002 mellyn-mcp \
+    && useradd --uid 10002 --gid 10002 --shell /usr/sbin/nologin --create-home mellyn-mcp \
     && mkdir -p /var/log/mellyn /etc/mellyn /workspace \
-    && chown -R mellyn:mellyn /var/log/mellyn
+    && chown mellyn:mellyn /var/log/mellyn \
+    && chmod 0700 /var/log/mellyn
 
 COPY deploy/requirements.lock /tmp/requirements.lock
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --require-hashes --no-deps \

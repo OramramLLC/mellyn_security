@@ -38,7 +38,6 @@ deny_on_dlp_secret = true
 # its tool "workspace_read". "resources/read" is the tier for reading that server's resources.
 [tool_risk_tiers]
 "local-workspace/workspace_read" = "low"
-"local-workspace/workspace_search" = "low"
 "local-workspace/workspace_write" = "medium"
 "local-workspace/resources/read" = "low"
 "local-workspace/shell_exec" = "high"

@@ -71,7 +71,12 @@ class CredentialConfig:
             digest = self.digests.get(role, "")
             if not _HEX_DIGEST.fullmatch(digest):
                 raise CredentialConfigError(f"{DIGEST_ENV[role]} must be a 64-character lowercase hex digest.")
-        if set(Role) <= self.roles and self.digests[Role.AGENT] == self.digests[Role.APPROVER]:
+        for role, digest in self.digests.items():
+            if digest and not _HEX_DIGEST.fullmatch(digest):
+                raise CredentialConfigError(f"{DIGEST_ENV[role]} must be a 64-character lowercase hex digest.")
+        agent_digest = self.digests.get(Role.AGENT, "")
+        approver_digest = self.digests.get(Role.APPROVER, "")
+        if agent_digest and approver_digest and agent_digest == approver_digest:
             raise CredentialConfigError("The agent and approver keys must be different keys.")
 
     @classmethod
@@ -79,9 +84,15 @@ class CredentialConfig:
         cls, environ: Mapping[str, str] | None = None, roles: frozenset[Role] = frozenset(Role)
     ) -> CredentialConfig:
         env = os.environ if environ is None else environ
+        supplied = {role: raw for role in Role if (raw := env.get(DIGEST_ENV[role], "").strip().lower())}
+        for role, digest in supplied.items():
+            if not _HEX_DIGEST.fullmatch(digest):
+                raise CredentialConfigError(f"{DIGEST_ENV[role]} must be a 64-character lowercase hex digest.")
+        if Role.AGENT in supplied and Role.APPROVER in supplied and supplied[Role.AGENT] == supplied[Role.APPROVER]:
+            raise CredentialConfigError("The agent and approver keys must be different keys.")
         return cls(
             pepper=env.get(PEPPER_ENV, "").strip(),
-            digests={role: env.get(DIGEST_ENV[role], "").strip().lower() for role in roles},
+            digests={role: supplied.get(role, "") for role in roles},
             roles=roles,
         )
 
