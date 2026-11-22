@@ -25,32 +25,30 @@ SENSITIVE_PATH_PARTS: frozenset[str] = frozenset(
 # Exact workspace files that may hold credentials (e.g. a token embedded in a git remote URL).
 SENSITIVE_RELATIVE_PATHS: frozenset[str] = frozenset({".git/config"})
 
-# Paths an agent must never modify: its own steering rules, the security gates, the authorizer itself,
-# and .git/ (a written hook or core.hooksPath runs code on the developer's next commit).
+# Paths an agent must never modify in ANY workspace: its own steering rules, the CI and scanner gates, and
+# .git/ (a written hook or core.hooksPath runs code on the developer's next commit). This list applies to
+# every repository the authorizer protects, so it must hold only files that are guardrails everywhere.
+# Paths that matter to one repository (its security core, its tests, its deployment) belong in that
+# repository's policy `protected_paths` (see config/mellyn-self-policy.toml for this repository's own).
 # Entries ending in "/" protect a directory; others protect one file. Matching ignores case so that
 # case-insensitive filesystems (Windows, macOS) cannot be used to dodge it.
 GUARDRAIL_PATHS: tuple[str, ...] = (
     ".git/",
     ".agent/",
     ".claude/",
+    ".cursor/",
     ".semgrep/",
     ".github/",
     ".gitleaks.toml",
     ".gitattributes",
     ".pre-commit-config.yaml",
+    ".pre-commit-hooks.yaml",
     ".cursorrules",
     ".windsurfrules",
+    ".clinerules",
     "CLAUDE.md",
     "AGENTS.md",
     "GEMINI.md",
-    "pyproject.toml",
-    "scripts/verify_dependencies.py",
-    "scripts/sync_agent_rules.py",
-    "backend/aegis_ai/",
-    "tests/test_authorizer.py",
-    "tests/test_credentials.py",
-    "tests/test_api.py",
-    "tests/test_verify_dependencies.py",
 )
 
 

@@ -15,18 +15,25 @@ from aegis_ai.models import Decision, RiskTier, TaintSource, canonical_json, utc
 
 SECRET_REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-(?:proj|svcacct|None)-[A-Za-z0-9_-]{10,}"),
+    re.compile(r"sk-[A-Za-z0-9]{48}"),
     re.compile(r"sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{10,}"),
     re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
     re.compile(r"hf_[A-Za-z0-9]{20,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{12,}"),
+    re.compile(r"lsv2_(?:pt|sk)_[a-f0-9]{16,}_[a-f0-9]{6,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    re.compile(r"xox[baprs]-[0-9A-Za-z-]{16,}"),
+    re.compile(r"(?:sk|rk)_live_[0-9A-Za-z]{16,}"),
+    re.compile(r"(?i)(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"),
 )
+
+_URL_USERINFO_SECRET_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)")
 
 
 def redact_text(value: str) -> str:
-    """Replace known credential/token patterns with [REDACTED_SECRET]."""
-    sanitized = value
+    """Replace known credential/token patterns and embedded URL passwords with [REDACTED_SECRET]."""
+    sanitized = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", value)
     for pattern in SECRET_REDACTION_PATTERNS:
         sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
     return sanitized

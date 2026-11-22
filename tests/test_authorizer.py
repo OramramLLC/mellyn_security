@@ -165,14 +165,12 @@ class TestWorkspaceBoundaries(AuthorizerTestCase):
             ".github/CODEOWNERS",
             ".github/workflows/ai-security-gate.yml",
             ".semgrep/owasp-ai-code-rules.yaml",
-            "scripts/verify_dependencies.py",
             ".git/hooks/pre-commit",
             ".git/config",
-            "backend/aegis_ai/authorizer.py",
-            "tests/test_authorizer.py",
             "AGENTS.md",
-            "pyproject.toml",
             ".gitattributes",
+            # This repository's own security core (backend/aegis_ai/, scripts/, tests/, ...) is protected by
+            # config/mellyn-self-policy.toml, not by the built-in list; see test_pr2_runtime_and_scanners.py.
             # Case variants, which reach the same file on Windows and macOS
             "claude.md",
             ".AGENT/rules/owasp-secure-ai-coding.md",

@@ -55,13 +55,74 @@ def render_generated(root: Path) -> str:
     return HEADER.format(src=CANONICAL.as_posix()) + body
 
 
+# Non-Cf invisible fillers, joiners, and variation selectors used in hidden-prompt smuggling.
+_EXTRA_INVISIBLE_CODEPOINTS: frozenset[int] = frozenset(
+    {
+        0x034F,  # Combining Grapheme Joiner
+        0x115F,  # Hangul Choseong Filler
+        0x1160,  # Hangul Jungseong Filler
+        0x17B4,  # Khmer Vowel Inherent Aq
+        0x17B5,  # Khmer Vowel Inherent Aa
+        0x180B,  # Mongolian Free Variation Selector One
+        0x180C,  # Mongolian Free Variation Selector Two
+        0x180D,  # Mongolian Free Variation Selector Three
+        0x180E,  # Mongolian Vowel Separator
+        0x2800,  # Braille Pattern Blank
+        0x3164,  # Hangul Filler
+        0xFFA0,  # Halfwidth Hangul Filler
+    }
+)
+
+
+def _is_hidden_codepoint(char: str) -> bool:
+    cp = ord(char)
+    cat = unicodedata.category(char)
+    if cat == "Cf":
+        return True
+    if cat == "Cc" and char != "\t":
+        return True
+    if 0xE0000 <= cp <= 0xE007F:  # Tags block
+        return True
+    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:  # Variation Selectors & Supplement
+        return True
+    return cp in _EXTRA_INVISIBLE_CODEPOINTS
+
+
+_PRESENTATION_SELECTORS = frozenset({0xFE0E, 0xFE0F})  # text / emoji presentation (VS15, VS16)
+_ZERO_WIDTH_JOINER = 0x200D
+_KEYCAP_BASES = frozenset("0123456789#*")
+
+
+def _is_emoji_base(char: str) -> bool:
+    """A character that ordinary text legitimately follows with VS15/VS16: a symbol (So/Sk) or a keycap base."""
+    return unicodedata.category(char) in ("So", "Sk") or char in _KEYCAP_BASES
+
+
+def _legitimate_emoji_join(line: str, col: int) -> bool:
+    """
+    True for the two invisible characters that ordinary emoji need, used in their normal position:
+    VS15/VS16 right after an emoji or symbol base ("⚠️"), and a zero-width joiner between two
+    emoji ("👨‍💻"). Anywhere else (inside a word, doubled, at a line start) they
+    are still reported, because that is how text gets smuggled.
+    """
+    cp = ord(line[col])
+    prev = line[col - 1] if col > 0 else ""
+    if cp in _PRESENTATION_SELECTORS:
+        return bool(prev) and _is_emoji_base(prev)
+    if cp == _ZERO_WIDTH_JOINER:
+        before = prev if prev and ord(prev) not in _PRESENTATION_SELECTORS else (line[col - 2] if col > 1 else "")
+        after = line[col + 1] if col + 1 < len(line) else ""
+        return bool(before) and bool(after) and _is_emoji_base(before) and _is_emoji_base(after)
+    return False
+
+
 def hidden_characters(text: str) -> list[tuple[int, int, str]]:
-    """Return (line, column, codepoint) for invisible format/bidi/tag characters."""
+    """Return (line, column, codepoint) for invisible format/bidi/tag/variation-selector/filler characters."""
     found: list[tuple[int, int, str]] = []
     for line_no, line in enumerate(text.splitlines(), 1):
-        for col, char in enumerate(line, 1):
-            if unicodedata.category(char) == "Cf" or 0xE0000 <= ord(char) <= 0xE007F:
-                found.append((line_no, col, f"U+{ord(char):04X}"))
+        for index, char in enumerate(line):
+            if _is_hidden_codepoint(char) and not _legitimate_emoji_join(line, index):
+                found.append((line_no, index + 1, f"U+{ord(char):04X}"))
     return found
 
 

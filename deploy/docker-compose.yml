@@ -71,6 +71,8 @@ services:
       - /workspace
       - --audit-log
       - /var/log/mellyn/gateway-audit.jsonl
+      - --approval-host
+      - "0.0.0.0"
       - --approval-port
       - "8765"
     env_file:
@@ -84,13 +86,46 @@ services:
       - ../config:/etc/mellyn:ro
       - mellyn-audit-logs:/var/log/mellyn
     networks:
-      - mellyn-internal
+      mellyn-internal:
+        aliases:
+          - mellyn-gateway
     tmpfs:
       - /tmp:noexec,nosuid,size=64m
     healthcheck:
       disable: true # the image's HTTP health check is for the authorizer API
     depends_on:
       - mellyn-egress
+      - mellyn-approval-relay
+
+  mellyn-approval-relay:
+    <<: *hardening
+    profiles: ["gateway"]
+    image: mellyn-security:local
+    container_name: mellyn-approval-relay
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - aegis_ai.approval_relay
+      - --listen-host
+      - "0.0.0.0"
+      - --listen-port
+      - "8765"
+      - --upstream-host
+      - mellyn-gateway
+      - --upstream-port
+      - "8765"
+    ports:
+      # Host loopback only; forwards solely the 3 exact approval routes to mellyn-gateway on mellyn-internal.
+      # Holds zero credentials (.env is not mounted).
+      - "127.0.0.1:8765:8765"
+    networks:
+      - mellyn-frontend
+      - mellyn-internal
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    healthcheck:
+      disable: true
 
   mellyn-egress:
     <<: *hardening

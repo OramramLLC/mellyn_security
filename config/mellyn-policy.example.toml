@@ -21,11 +21,12 @@ allowed_egress_domains = [
     "api.github.com",
 ]
 
-# Additional workspace paths the agent may never modify (on top of built-in guardrail protections).
-# The gateway also protects its own config, this policy, and its audit log when they sit in the workspace.
-protected_paths = [
-    "config/",
-]
+# Additional workspace paths the agent may never modify, on top of the built-in guardrails (.git/, .github/,
+# agent instruction files, pre-commit and scanner configs). List the parts of YOUR repository that only a
+# human should change, for example:
+#   protected_paths = ["infra/", "migrations/", "src/auth/"]
+# The gateway also protects its own config, this policy and its audit log when they sit in the workspace.
+protected_paths = []
 
 # Supporting risk-signal thresholds (escalate-only; never grant access).
 injection_escalate_threshold = 0.70

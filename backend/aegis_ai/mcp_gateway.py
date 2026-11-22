@@ -529,6 +529,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace root directory")
     parser.add_argument("--audit-log", type=Path, required=True, help="Append-only JSONL audit file")
     parser.add_argument("--approval-port", type=int, default=0, help="Local approval server port (0 = any free)")
+    parser.add_argument(
+        "--approval-host",
+        default="127.0.0.1",
+        choices=("127.0.0.1", "0.0.0.0"),  # noqa: S104 - 0.0.0.0 only inside the internal-only container
+        help="Bind address for approval server (127.0.0.1 default; 0.0.0.0 inside isolated internal container)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -569,7 +575,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Approvals disabled ({exc}); calls needing approval will be denied.", file=sys.stderr)
             approvals = None
         else:
-            approval_server = ApprovalHTTPServer(approvals, credentials, port=args.approval_port)
+            approval_server = ApprovalHTTPServer(
+                approvals, credentials, port=args.approval_port, host=args.approval_host
+            )
             approval_server.start_in_background()
             print(f"Approvals: python -m aegis_ai.approve --url {approval_server.url} list", file=sys.stderr)
 
