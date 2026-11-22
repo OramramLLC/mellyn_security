@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 from mellyn.audit import AuditLogger
-from mellyn.egress import EgressValidator, WorkspacePathGuard
+from mellyn.egress import _CONTROL_CHARACTERS, EgressValidator, WorkspacePathGuard
 from mellyn.models import (
     ApprovalGrant,
     AuthorizationResult,
@@ -21,6 +21,7 @@ from mellyn.models import (
     TaintSource,
     ToolCallRequest,
     canonical_json,
+    effective_mcp_method,
     utc_now,
     validate_json_value,
 )
@@ -192,12 +193,13 @@ class Authorizer:
         arguments: dict[str, Any],
         approved_by: str,
         mcp_server: str | None = None,
+        mcp_method: str | None = None,
         ttl_seconds: int = 900,
         max_uses: int = 1,
         now: datetime | None = None,
     ) -> ApprovalGrant:
         """
-        Approve one exact tool call (session, tool, MCP server, and full argument set) for a short time.
+        Approve one exact tool call (session, operation, tool, MCP server, and full argument set) for a short time.
 
         Callers must restrict this to human approvers: the API exposes it only to the approver credential,
         never to the agent credential.
@@ -216,6 +218,7 @@ class Authorizer:
             approved_by=approved_by,
             expires_at=issued_at + timedelta(seconds=ttl_seconds),
             max_uses=max_uses,
+            mcp_method=mcp_method,
         )
         with self._lock:
             self._prune_sessions_locked(issued_at)
@@ -245,10 +248,16 @@ class Authorizer:
         *,
         now: datetime | None = None,
         record_taint_on_allow: bool = True,
+        denial_reason: str | None = None,
     ) -> AuthorizationResult:
         """Evaluate a tool call and record a redacted audit event."""
         with self._lock:
-            return self._authorize_locked(request, now or utc_now(), record_taint_on_allow=record_taint_on_allow)
+            return self._authorize_locked(
+                request,
+                now or utc_now(),
+                record_taint_on_allow=record_taint_on_allow,
+                denial_reason=denial_reason,
+            )
 
     def _authorize_locked(
         self,
@@ -256,6 +265,7 @@ class Authorizer:
         check_time: datetime,
         *,
         record_taint_on_allow: bool,
+        denial_reason: str | None = None,
     ) -> AuthorizationResult:
         self._prune_sessions_locked(check_time)
         risk_tier = self.policy.classify_risk(request.tool_name, request.mcp_server)
@@ -289,8 +299,19 @@ class Authorizer:
         if not mcp_ok:
             return deny(mcp_reason)
 
+        # 1b. Hard boundary: MCP operation identity separation (tools/call vs resources/read)
+        op_method = effective_mcp_method(request.tool_name, request.mcp_method)
+        if request.mcp_method == "tools/call" and (request.tool_name == RESOURCE_READ_TOOL or "/" in request.tool_name):
+            return deny(f"Tool name '{request.tool_name}' is reserved and cannot be invoked via tools/call.")
+        if op_method == "resources/read" and request.tool_name != RESOURCE_READ_TOOL:
+            return deny("resources/read requests must use the reserved resource-read operation identity.")
+
+        # 1c. Hard boundary: caller-detected protocol/pinning denial (e.g. failed pinned_tool_hashes check)
+        if denial_reason is not None:
+            return deny(denial_reason)
+
         # 2. Hard boundary: MCP resource reads of file:// URIs
-        if request.tool_name == RESOURCE_READ_TOOL:
+        if op_method == "resources/read":
             uri_ok, uri_reason = self._check_resource_uri(request.arguments.get("uri"))
             if not uri_ok:
                 return deny(uri_reason)
@@ -298,6 +319,9 @@ class Authorizer:
 
         # 3. Hard boundary: Capability-bound path, shell, and URL guards
         capability = self.policy.capability_for(request.tool_name, request.mcp_server)
+        argv_key = (
+            capability.shell_argv_arg if capability is not None and capability.shell_argv_arg is not None else "argv"
+        )
         if capability is not None:
             cap_ok, cap_reasons = self._enforce_capability(capability, request.arguments)
             if not cap_ok:
@@ -319,7 +343,7 @@ class Authorizer:
             reasons.append(url_reason)
 
         # 4. Evaluate scoped policy rules (explicit DENY always wins)
-        matched_rule = self.policy.match_scoped_rule(request)
+        matched_rule = self.policy.match_scoped_rule(request, argv_key=argv_key)
         if matched_rule and matched_rule.effect == Decision.DENY:
             reasons.append(f"Denied by scoped policy '{matched_rule.rule_id}': {matched_rule.description}")
             return self._finalize(
@@ -436,12 +460,34 @@ class Authorizer:
     def _check_resource_uri(self, uri: object) -> tuple[bool, str]:
         if not isinstance(uri, str) or not uri.strip():
             return False, "resources/read requires a non-empty string 'uri'."
-        parsed = urlparse(uri)
+        if _CONTROL_CHARACTERS.search(uri):
+            return False, "Resource URI contains control characters."
+        try:
+            parsed = urlparse(uri.strip())
+            port = parsed.port
+        except ValueError:
+            return False, "Malformed resource URI authority or port."
+        if not parsed.scheme:
+            return False, "Resource URI is missing a scheme."
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            return False, "Resource URIs with embedded credentials/userinfo are forbidden."
+        hostport = parsed.netloc
+        if "]" in hostport:
+            _, _, after_bracket = hostport.rpartition("]")
+            has_colon_port = ":" in after_bracket
+        else:
+            has_colon_port = ":" in hostport
+        if has_colon_port and (port is None or port <= 0):
+            return False, "Resource URI specifies an empty or invalid port."
         if parsed.scheme.lower() != "file":
             return True, f"Resource URI scheme '{parsed.scheme}' (non-file); risk tier decides."
-        if parsed.netloc not in ("", "localhost"):
+        if port is not None or parsed.netloc.lower() not in ("", "localhost"):
             return False, f"file:// URI on remote host '{parsed.netloc}' is denied."
-        return self.path_guard.validate_path(url2pathname(parsed.path), is_write=False)
+        try:
+            local_path = url2pathname(parsed.path)
+        except (OSError, ValueError):
+            return False, "Malformed file:// resource URI path."
+        return self.path_guard.validate_path(local_path, is_write=False)
 
     @staticmethod
     def _evaluate_base_decision(

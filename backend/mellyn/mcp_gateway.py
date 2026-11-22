@@ -31,13 +31,14 @@ import itertools
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, TextIO
+from typing import IO, Any, Protocol, TextIO
 
 from mellyn.approvals import ApprovalHTTPServer, PendingApprovals
 from mellyn.audit import AuditLogger
@@ -63,6 +64,7 @@ JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
 DOWNSTREAM_ERROR = -32000
 MELLYN_APPROVAL_REQUIRED = -32001
 MELLYN_POLICY_DENIED = -32003
@@ -147,6 +149,100 @@ def downstream_environment(environ: Mapping[str, str] | None = None) -> dict[str
     return {key: value for key, value in source.items() if not key.upper().startswith(SECRET_ENV_PREFIXES)}
 
 
+def _valid_request_id(req_id: Any) -> bool:
+    """MCP base protocol: request IDs must be strings or integers, excluding booleans and null."""
+    return isinstance(req_id, str | int) and not isinstance(req_id, bool)
+
+
+def _valid_jsonrpc_response(response: Mapping[str, Any]) -> bool:
+    """A JSON-RPC 2.0 response must declare '2.0' and carry exclusively 'result' or a dict 'error'."""
+    if response.get("jsonrpc") != "2.0":
+        return False
+    has_result = "result" in response
+    has_error = "error" in response
+    if has_result == has_error:
+        return False
+    if has_error and not isinstance(response["error"], dict):
+        return False
+    return True
+
+
+def _resolve_executable(argv0: str, env: Mapping[str, str], launcher_cwd: Path) -> str:
+    """
+    Resolve `argv[0]` against `launcher_cwd` or trusted `PATH` before changing a child's `cwd` to
+    `workspace_root`. Uses `os.path.abspath` (not `Path.resolve()`) so Python venv symlinks keep
+    their identity, and prevents bare command names from matching binaries inside `workspace_root`.
+    """
+    if os.path.isabs(argv0):
+        return argv0
+    if "/" in argv0 or (os.sep != "/" and os.sep in argv0):
+        return os.path.abspath(launcher_cwd / argv0)
+    found = shutil.which(argv0, path=env.get("PATH"))
+    if found is None:
+        raise FileNotFoundError(f"Executable '{argv0}' was not found on PATH.")
+    return os.path.abspath(found)
+
+
+def _resolve_posix_account(spec: str) -> tuple[int, int, str, str]:
+    """Return `(uid, gid, username, home_dir)` for a POSIX account name or numeric UID."""
+    import pwd
+
+    pw = pwd.getpwuid(int(spec)) if spec.isdigit() else pwd.getpwnam(spec)
+    return pw.pw_uid, pw.pw_gid, pw.pw_name, pw.pw_dir
+
+
+def check_privilege_separation(
+    *, running_as_root: bool, is_pid1: bool, gateway_user: str | None, downstream_user: str | None
+) -> None:
+    """
+    Refuse configurations that would leave the gateway, or its MCP servers, running with root's privileges.
+
+    Started as root, the gateway must be told both users: MCP servers run as `downstream_user` and the gateway
+    drops to `gateway_user` for good. Without them it would run its whole life as root (with CAP_SETUID in the
+    container), or hand root to every MCP server it launches. Switching users needs a root start, so naming
+    users while not root is refused too, with a clear message rather than a failed spawn later.
+
+    With separate users the gateway must also be PID 1 of its PID namespace (the container's main process, no
+    `init`). After the drop it may not signal its MCP servers, and Linux applies the same permission check to the
+    parent-death signal, so neither the gateway nor PR_SET_PDEATHSIG can stop a server that ignores stdin EOF.
+    What does stop it is the kernel killing every process in the namespace when PID 1 exits.
+    """
+    if running_as_root and (gateway_user is None or downstream_user is None):
+        raise RuntimeError(
+            "The gateway is running as root: pass both --gateway-user and --downstream-user so it drops privileges "
+            "and MCP servers run as a separate user (or start it as an unprivileged user without either flag)."
+        )
+    if not running_as_root and (gateway_user is not None or downstream_user is not None):
+        raise RuntimeError("--gateway-user and --downstream-user need the gateway to start as root to switch users.")
+    if (gateway_user is None) != (downstream_user is None):
+        raise RuntimeError("--gateway-user and --downstream-user must be given together.")
+    if downstream_user is not None and not is_pid1:
+        raise RuntimeError(
+            "--downstream-user needs the gateway to be PID 1 (the container's main process, without `init`): once "
+            "it drops privileges it cannot signal its MCP servers, so only the end of the PID namespace stops them."
+        )
+
+
+def _drop_gateway_privileges(gateway_user: str) -> None:
+    """
+    Permanently set real, effective, and saved UID/GID (and clear supplementary groups) to `gateway_user`.
+    Transitioning from UID 0 on Linux clears permitted and effective capabilities (`CAP_SETUID`, `CAP_SETGID`).
+    """
+    if os.name != "posix":
+        raise RuntimeError("--gateway-user privilege separation requires a POSIX platform.")
+    uid, gid, uname, home = _resolve_posix_account(gateway_user)
+    if os.geteuid() == uid and os.getuid() == uid and os.getegid() == gid and os.getgid() == gid:
+        return
+    os.setgroups([])
+    os.setresgid(gid, gid, gid)
+    os.setresuid(uid, uid, uid)
+    if os.geteuid() != uid or os.getuid() != uid or os.getegid() != gid:
+        raise RuntimeError(f"Failed to drop gateway privileges to '{gateway_user}'.")
+    os.environ["HOME"] = home
+    os.environ["USER"] = uname
+    os.environ["LOGNAME"] = uname
+
+
 class StdioDownstream:
     """
     A downstream MCP server launched as a subprocess (argv list, no shell) and spoken to over stdio.
@@ -162,20 +258,48 @@ class StdioDownstream:
         name: str,
         argv: Sequence[str],
         *,
+        cwd: Path | None = None,
+        launcher_cwd: Path | None = None,
+        user: str | int | None = None,
+        group: str | int | None = None,
+        child_home: str | None = None,
+        child_username: str | None = None,
         on_notification: Callable[[str, dict[str, Any]], None] | None = None,
         stderr: TextIO | None = None,
     ) -> None:
+        if not argv:
+            raise ValueError(f"Server '{name}' requires a non-empty command argv.")
         self.name = name
         self.on_notification = on_notification or (lambda _server, _msg: None)
         self._ids = itertools.count(1)
         self._inbox: queue.Queue[Any] = queue.Queue()
         self._write_lock = threading.Lock()
+
+        child_env = downstream_environment()
+        if child_home is not None:
+            child_env["HOME"] = child_home
+        if child_username is not None:
+            child_env["USER"] = child_username
+            child_env["LOGNAME"] = child_username
+
+        resolved_argv = [_resolve_executable(argv[0], child_env, launcher_cwd or Path.cwd()), *argv[1:]]
+        popen_kwargs: dict[str, Any] = {}
+        if cwd is not None:
+            popen_kwargs["cwd"] = str(cwd)
+        if user is not None:
+            popen_kwargs["user"] = user
+        if group is not None:
+            popen_kwargs["group"] = group
+        if user is not None or group is not None:
+            popen_kwargs["extra_groups"] = []
+
         self.proc = subprocess.Popen(  # noqa: S603 - argv list validated by gateway_config; never a shell
-            list(argv),
+            resolved_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr if stderr is not None else sys.stderr,
-            env=downstream_environment(),
+            env=child_env,
+            **popen_kwargs,
         )
         self._reader = threading.Thread(target=self._read_loop, name=f"mcp-{name}-reader", daemon=True)
         self._reader.start()
@@ -239,28 +363,50 @@ class StdioDownstream:
                 continue
             if isinstance(message.get("method"), str):
                 if "id" in message:  # server-to-client request (sampling, elicitation, roots): refuse
-                    self._write(_jsonrpc_error(message["id"], JSONRPC_METHOD_NOT_FOUND, "Not permitted by gateway."))
+                    srv_id = message["id"] if _valid_request_id(message["id"]) else None
+                    self._write(_jsonrpc_error(srv_id, JSONRPC_METHOD_NOT_FOUND, "Not permitted by gateway."))
                 else:
                     self.on_notification(self.name, message)
                 continue
             if message.get("id") == req_id:
+                if not _valid_jsonrpc_response(message):
+                    return _local_downstream_error(
+                        req_id, f"Downstream server '{self.name}' returned a malformed JSON-RPC response."
+                    )
                 return message
             # A response to some earlier, timed-out request: drop it.
 
     def close(self) -> None:
+        """
+        Stop the server: close its stdin (an MCP server exits on EOF), wait, then signal it if it is still running.
+
+        When the server runs as a separate user and the gateway has dropped privileges, signalling is not allowed
+        (EPERM). That is expected, not an error: such a gateway runs as PID 1 (see check_privilege_separation), so
+        the kernel kills the server when the gateway exits. close() must therefore return, not hang.
+        """
         try:
             if self.proc.stdin is not None:
                 self.proc.stdin.close()
         except OSError:
             pass
-        self.proc.terminate()
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=5)
+            for stop in (self.proc.terminate, self.proc.kill):
+                try:
+                    stop()
+                except PermissionError:
+                    break  # separate user: the kernel kills it when the gateway (PID 1) exits
+                try:
+                    self.proc.wait(timeout=5)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         self._reader.join(timeout=5)
-        if self.proc.stdout is not None:
+        # If the server could not be stopped, the reader thread is still blocked in readline() holding the stream's
+        # lock, and close() would wait for it forever. Leave the pipe to the (daemon) reader: the server is killed,
+        # and the pipe reaches EOF, when the gateway exits.
+        if self.proc.stdout is not None and not self._reader.is_alive():
             self.proc.stdout.close()
 
 
@@ -271,8 +417,11 @@ def initialize_downstream(server: Downstream, timeout: float = INIT_TIMEOUT_SECO
         {"protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0], "capabilities": {}, "clientInfo": GATEWAY_INFO},
         timeout=timeout,
     )
-    if not isinstance(response.get("result"), dict):
+    if not _valid_jsonrpc_response(response) or not isinstance(response.get("result"), dict):
         raise RuntimeError(f"Downstream server '{server.name}' failed to initialize: {response.get('error')}")
+    negotiated = response["result"].get("protocolVersion")
+    if not isinstance(negotiated, str) or negotiated not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise RuntimeError(f"Downstream server '{server.name}' negotiated unsupported protocolVersion: {negotiated!r}")
     server.notify("notifications/initialized")
 
 
@@ -320,12 +469,18 @@ class MCPGateway:
         """Process one JSON-RPC 2.0 message from the MCP client. Returns the reply, or None for notifications."""
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return _jsonrpc_error(None, JSONRPC_INVALID_REQUEST, "Invalid JSON-RPC 2.0 message.")
+        has_id = "id" in message
+        raw_id = message.get("id")
+        if has_id and not _valid_request_id(raw_id):
+            return _jsonrpc_error(
+                None, JSONRPC_INVALID_REQUEST, "Request 'id' must be a string or integer (not null or boolean)."
+            )
         method = message.get("method")
         if not isinstance(method, str) or not method:
-            return _jsonrpc_error(message.get("id"), JSONRPC_INVALID_REQUEST, "Missing or invalid 'method'.")
-        if "id" not in message:
+            return _jsonrpc_error(raw_id if has_id else None, JSONRPC_INVALID_REQUEST, "Missing or invalid 'method'.")
+        if not has_id:
             return None  # client notifications (initialized, cancelled, ...) need no reply; nothing is executed
-        req_id = message["id"]
+        req_id = raw_id
         params = message.get("params", {})
         if not isinstance(params, dict):
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "'params' must be a JSON object.")
@@ -361,35 +516,88 @@ class MCPGateway:
 
     def _list_all(self, server: Downstream, method: str, key: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        seen_cursors: set[str] = set()
         cursor: str | None = None
         for _ in range(MAX_LIST_PAGES):
             response = server.request(method, {"cursor": cursor} if cursor else {})
+            if not _valid_jsonrpc_response(response):
+                break
             result = response.get("result")
             if not isinstance(result, dict):
                 break
             items.extend(item for item in result.get(key, []) if isinstance(item, dict))
-            cursor = result.get("nextCursor") if isinstance(result.get("nextCursor"), str) else None
-            if not cursor:
+            next_cursor = result.get("nextCursor") if isinstance(result.get("nextCursor"), str) else None
+            if not next_cursor or next_cursor in seen_cursors:
                 break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
         return items
+
+    def _fetch_tools_strict(self, server: Downstream) -> tuple[bool, list[dict[str, Any]], str]:
+        """
+        Fetch a complete, error-free `tools/list` from `server`.
+        Requires every page to return a valid JSON-RPC result, every tool entry to carry a valid
+        non-reserved unique name, and pagination to finish cleanly within `MAX_LIST_PAGES`.
+        """
+        items: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+        for _ in range(MAX_LIST_PAGES):
+            response = server.request("tools/list", {"cursor": cursor} if cursor else {})
+            if not _valid_jsonrpc_response(response) or not isinstance(response.get("result"), dict):
+                return False, [], f"Downstream MCP server '{server.name}' did not return a valid tools/list result."
+            raw_tools = response["result"].get("tools")
+            if not isinstance(raw_tools, list):
+                return False, [], f"Downstream MCP server '{server.name}' returned a malformed tools array."
+            for entry in raw_tools:
+                if not isinstance(entry, dict) or not _valid_name(entry.get("name")):
+                    return False, [], f"Downstream MCP server '{server.name}' returned an invalid tool definition."
+                tname = entry["name"]
+                if tname in seen_names:
+                    return False, [], f"Downstream MCP server '{server.name}' returned duplicate tool '{tname}'."
+                seen_names.add(tname)
+                items.append(entry)
+            next_cursor = response["result"].get("nextCursor")
+            if next_cursor is None or next_cursor == "":
+                return True, items, ""
+            if not isinstance(next_cursor, str) or next_cursor in seen_cursors:
+                return False, [], f"Downstream MCP server '{server.name}' returned an invalid pagination cursor."
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return False, [], f"Downstream MCP server '{server.name}' exceeded MAX_LIST_PAGES ({MAX_LIST_PAGES})."
+
+    def _verify_pinned_server(self, server_name: str, expected_hash: str) -> tuple[bool, list[dict[str, Any]], str]:
+        ok, listed, err = self._fetch_tools_strict(self.servers[server_name])
+        if not ok:
+            return False, [], err
+        try:
+            actual_hash = compute_tools_hash(listed)
+        except (TypeError, ValueError):
+            return False, [], f"Downstream MCP server '{server_name}' tool definitions failed canonical hashing."
+        if actual_hash != expected_hash:
+            return (
+                False,
+                [],
+                f"Downstream MCP server '{server_name}' tool definitions do not match pinned SHA-256 hash.",
+            )
+        return True, listed, ""
 
     def _tools_list(self, req_id: Any, _params: dict[str, Any]) -> dict[str, Any]:
         tools: list[dict[str, Any]] = []
         pinned = self.authorizer.policy.config.pinned_tool_hashes
         for name, server in self.servers.items():
-            listed = [t for t in self._list_all(server, "tools/list", "tools") if _valid_name(t.get("name"))]
             if name in pinned:
-                try:
-                    actual_hash = compute_tools_hash(listed)
-                except (TypeError, ValueError):
-                    actual_hash = ""
-                if actual_hash != pinned[name]:
+                ok, listed, err = self._verify_pinned_server(name, pinned[name])
+                if not ok:
                     return _jsonrpc_error(
                         req_id,
                         MELLYN_POLICY_DENIED,
-                        f"Downstream MCP server '{name}' tool definitions do not match pinned SHA-256 hash.",
+                        err,
                         {"decision": Decision.DENY.value, "mcp_server": name},
                     )
+            else:
+                listed = [t for t in self._list_all(server, "tools/list", "tools") if _valid_name(t.get("name"))]
             for tool in listed:
                 tools.append({**tool, "name": f"{name}{TOOL_SEPARATOR}{tool['name']}"})
             if listed and name not in pinned:
@@ -427,12 +635,29 @@ class MCPGateway:
         if len(encoded_args) > MAX_ARGUMENTS_BYTES:
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "tools/call 'arguments' exceed 64 KiB.")
 
-        request = ToolCallRequest(self.session_id, tool_name, arguments, mcp_server=server_name)
-        blocked = self._authorize(req_id, request)
+        request = ToolCallRequest(
+            self.session_id,
+            tool_name,
+            arguments,
+            mcp_server=server_name,
+            mcp_method="tools/call",
+        )
+        pinned = self.authorizer.policy.config.pinned_tool_hashes
+        pin_denial: str | None = None
+        if server_name in pinned:
+            ok, listed, err = self._verify_pinned_server(server_name, pinned[server_name])
+            if not ok:
+                pin_denial = err
+            elif all(t["name"] != tool_name for t in listed):
+                pin_denial = f"Tool '{tool_name}' is not present in pinned tool definitions for '{server_name}'."
+
+        blocked = self._authorize(req_id, request, denial_reason=pin_denial)
         if blocked is not None:
             return blocked
         # Forward exactly what was authorized, rebuilt from validated fields.
         response = self.servers[server_name].request("tools/call", {"name": tool_name, "arguments": arguments})
+        if not _valid_jsonrpc_response(response):
+            return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, "Malformed downstream JSON-RPC response.")
         # Taint on anything the server wrote, errors included: a relayed error message reaches the agent too,
         # so an injection delivered as an error must taint just like one delivered as a result.
         if _came_from_server(response):
@@ -448,20 +673,30 @@ class MCPGateway:
             return _jsonrpc_error(
                 req_id, JSONRPC_INVALID_PARAMS, "Unknown or ambiguous resource URI; call resources/list first."
             )
-        request = ToolCallRequest(self.session_id, RESOURCE_READ_TOOL, {"uri": uri}, mcp_server=server_name)
+        request = ToolCallRequest(
+            self.session_id,
+            RESOURCE_READ_TOOL,
+            {"uri": uri},
+            mcp_server=server_name,
+            mcp_method="resources/read",
+        )
         blocked = self._authorize(req_id, request)
         if blocked is not None:
             return blocked
         response = self.servers[server_name].request("resources/read", {"uri": uri})
+        if not _valid_jsonrpc_response(response):
+            return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, "Malformed downstream JSON-RPC response.")
         # Taint on anything the server wrote, errors included: a relayed error message reaches the agent too,
         # so an injection delivered as an error must taint just like one delivered as a result.
         if _came_from_server(response):
             self.authorizer.record_tool_result_taint(request)
         return _relay(req_id, response)
 
-    def _authorize(self, req_id: Any, request: ToolCallRequest) -> dict[str, Any] | None:
+    def _authorize(
+        self, req_id: Any, request: ToolCallRequest, *, denial_reason: str | None = None
+    ) -> dict[str, Any] | None:
         """Return None when the call may proceed, otherwise the JSON-RPC error to send back."""
-        result = self.authorizer.authorize(request, record_taint_on_allow=False)
+        result = self.authorizer.authorize(request, record_taint_on_allow=False, denial_reason=denial_reason)
         if result.decision == Decision.ALLOW:
             return None
         # Full reasons go to the audit log and the approver, not to the agent: they would tell an injected
@@ -484,15 +719,25 @@ class MCPGateway:
 
 
 def _valid_name(name: Any) -> bool:
-    return isinstance(name, str) and 0 < len(name) <= 128 and name.isprintable() and not name.isspace()
+    if not isinstance(name, str) or not 0 < len(name) <= 128:
+        return False
+    if not name.isprintable() or name.isspace():
+        return False
+    return name != RESOURCE_READ_TOOL and "/" not in name
 
 
 def _relay(req_id: Any, response: dict[str, Any]) -> dict[str, Any]:
     """Re-address a downstream response to the client's request ID, keeping only result or a sanitized error."""
+    if not _valid_jsonrpc_response(response):
+        return _jsonrpc_error(req_id, DOWNSTREAM_ERROR, "Malformed downstream JSON-RPC response.")
     if "result" in response:
         return _jsonrpc_result(req_id, response["result"])
-    error = response.get("error") if isinstance(response.get("error"), dict) else {}
-    code = error.get("code") if isinstance(error.get("code"), int) else DOWNSTREAM_ERROR
+    error = response["error"]
+    code = (
+        error.get("code")
+        if isinstance(error.get("code"), int) and not isinstance(error.get("code"), bool)
+        else (DOWNSTREAM_ERROR)
+    )
     message = error.get("message") if isinstance(error.get("message"), str) else "Downstream server error."
     return _jsonrpc_error(req_id, code, message[:1000])
 
@@ -511,7 +756,12 @@ def run_stdio_proxy(*, gateway: MCPGateway, client_in: TextIO, client_out: TextI
             except json.JSONDecodeError:
                 reply = _jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Malformed JSON-RPC message.")
             else:
-                reply = gateway.handle_message(message)
+                try:
+                    reply = gateway.handle_message(message)
+                except Exception:  # noqa: BLE001 - contain unexpected errors so the stdio loop fails closed
+                    raw_id = message.get("id") if isinstance(message, dict) else None
+                    err_id = raw_id if _valid_request_id(raw_id) else None
+                    reply = _jsonrpc_error(err_id, JSONRPC_INTERNAL_ERROR, "Internal gateway error (fail-closed).")
         if reply is not None:
             client_out.write(json.dumps(reply) + "\n")
             client_out.flush()
@@ -537,8 +787,19 @@ def main(argv: list[str] | None = None) -> int:
         choices=("127.0.0.1", "0.0.0.0"),  # noqa: S104 - 0.0.0.0 only inside the internal-only container
         help="Bind address for approval server (127.0.0.1 default; 0.0.0.0 inside isolated internal container)",
     )
+    parser.add_argument(
+        "--gateway-user",
+        default=os.environ.get("MELLYN_GATEWAY_USER", "").strip() or None,
+        help="POSIX user/UID the gateway drops to after spawning isolated downstream servers",
+    )
+    parser.add_argument(
+        "--downstream-user",
+        default=os.environ.get("MELLYN_DOWNSTREAM_USER", "").strip() or None,
+        help="Unprivileged POSIX user/UID used for downstream MCP child processes",
+    )
     args = parser.parse_args(argv)
 
+    launcher_cwd = Path.cwd()
     try:
         check_no_legacy_env()
         config = load_gateway_config(args.config)
@@ -555,62 +816,109 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Servers not in the policy's allowed_mcp_servers: {not_allowed}", file=sys.stderr)
         return 2
 
+    workspace_root = args.workspace.resolve()
+    audit_log_path = args.audit_log.resolve()
+
+    ds_uid: int | None = None
+    ds_gid: int | None = None
+    ds_name: str | None = None
+    ds_home: str | None = None
+    try:
+        check_privilege_separation(
+            running_as_root=os.name == "posix" and os.geteuid() == 0,
+            is_pid1=os.getpid() == 1,
+            gateway_user=args.gateway_user,
+            downstream_user=args.downstream_user,
+        )
+        if args.downstream_user is not None:
+            if os.name != "posix":
+                raise RuntimeError("--downstream-user requires a POSIX platform.")
+            ds_uid, ds_gid, ds_name, ds_home = _resolve_posix_account(args.downstream_user)
+        if args.gateway_user is not None:
+            if os.name != "posix":
+                raise RuntimeError("--gateway-user requires a POSIX platform.")
+            gw_uid, _, _, _ = _resolve_posix_account(args.gateway_user)
+            if ds_uid is not None and ds_uid == gw_uid:
+                raise RuntimeError("--downstream-user and --gateway-user must resolve to distinct UIDs.")
+    except (KeyError, ValueError, RuntimeError) as exc:
+        print(f"Privilege separation configuration rejected (fail-closed): {exc}", file=sys.stderr)
+        return 2
+
     # The agent must never be able to edit the files that control or record its own enforcement.
-    own_files = [_inside(p, args.workspace) for p in (config.path, config.policy_path, args.audit_log)]
+    own_files = [_inside(p, workspace_root) for p in (config.path, config.policy_path, audit_log_path)]
     policy = dataclasses.replace(policy, protected_paths=(*policy.protected_paths, *[p for p in own_files if p]))
+
+    credentials: CredentialConfig | None = None
+    try:
+        credentials = CredentialConfig.from_env(roles=frozenset({Role.APPROVER}))
+    except CredentialConfigError as exc:
+        print(f"Approvals disabled ({exc}); calls needing approval will be denied.", file=sys.stderr)
 
     approval_server: ApprovalHTTPServer | None = None
     servers: dict[str, StdioDownstream] = {}
-    with args.audit_log.open("a", encoding="utf-8") as audit_file:
+    audit_file: IO[str] | None = None
+    gateway: MCPGateway | None = None
+
+    def notify_client(message: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+    def on_notification(server: str, message: dict[str, Any]) -> None:
+        if gateway is not None:
+            gateway.on_downstream_notification(server, message)
+
+    try:
+        for spec in config.servers:
+            servers[spec.name] = StdioDownstream(
+                spec.name,
+                spec.command,
+                cwd=workspace_root,
+                launcher_cwd=launcher_cwd,
+                user=ds_uid,
+                group=ds_gid,
+                child_home=ds_home,
+                child_username=ds_name,
+                on_notification=on_notification,
+            )
+        if args.gateway_user is not None:
+            _drop_gateway_privileges(args.gateway_user)
+
+        audit_fd = os.open(audit_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        audit_file = os.fdopen(audit_fd, "a", encoding="utf-8")
+
         # One session for the life of the process: no idle expiry, or a client left open overnight would be
         # locked out (the expired session fails closed and the gateway cannot mint a clean one without
         # laundering taint).
         authorizer = Authorizer(
-            workspace_root=args.workspace,
+            workspace_root=workspace_root,
             policy_config=policy,
             audit_logger=AuditLogger(audit_file),
             session_ttl_seconds=None,
         )
-        approvals = PendingApprovals(authorizer)
-        try:
-            credentials = CredentialConfig.from_env(roles=frozenset({Role.APPROVER}))
-        except CredentialConfigError as exc:
-            print(f"Approvals disabled ({exc}); calls needing approval will be denied.", file=sys.stderr)
-            approvals = None
-        else:
+        approvals: PendingApprovals | None = None
+        if credentials is not None:
+            approvals = PendingApprovals(authorizer)
             approval_server = ApprovalHTTPServer(
                 approvals, credentials, port=args.approval_port, host=args.approval_host
             )
             approval_server.start_in_background()
             print(f"Approvals: python -m mellyn.approve --url {approval_server.url} list", file=sys.stderr)
 
-        def notify_client(message: dict[str, Any]) -> None:
-            sys.stdout.write(json.dumps(message) + "\n")
-            sys.stdout.flush()
-
-        gateway: MCPGateway | None = None
-
-        def on_notification(server: str, message: dict[str, Any]) -> None:
-            if gateway is not None:
-                gateway.on_downstream_notification(server, message)
-
-        try:
-            for spec in config.servers:
-                servers[spec.name] = StdioDownstream(spec.name, spec.command, on_notification=on_notification)
-                initialize_downstream(servers[spec.name])
-            gateway = MCPGateway(
-                authorizer=authorizer, servers=servers, approvals=approvals, notify_client=notify_client
-            )
-            return run_stdio_proxy(gateway=gateway, client_in=sys.stdin, client_out=sys.stdout)
-        except (OSError, RuntimeError) as exc:
-            print(f"Gateway stopped (fail-closed): {exc}", file=sys.stderr)
-            return 2
-        finally:
-            for server in servers.values():
-                server.close()
-            if approval_server is not None:
-                approval_server.shutdown()
-                approval_server.server_close()
+        for srv in servers.values():
+            initialize_downstream(srv)
+        gateway = MCPGateway(authorizer=authorizer, servers=servers, approvals=approvals, notify_client=notify_client)
+        return run_stdio_proxy(gateway=gateway, client_in=sys.stdin, client_out=sys.stdout)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Gateway stopped (fail-closed): {exc}", file=sys.stderr)
+        return 2
+    finally:
+        for server in servers.values():
+            server.close()
+        if approval_server is not None:
+            approval_server.shutdown()
+            approval_server.server_close()
+        if audit_file is not None and not audit_file.closed:
+            audit_file.close()
 
 
 if __name__ == "__main__":

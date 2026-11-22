@@ -14,6 +14,8 @@ policy = "mellyn-policy.example.toml"
 
 # Each server's name must also be in the policy's allowed_mcp_servers. Names are lowercase letters, digits
 # and single hyphens. Commands are argv lists, launched without a shell; command interpreters are rejected.
+# Each child process starts with its working directory set to `--workspace` (`/workspace` in Docker), so
+# relative arguments such as `--root .` resolve against the same workspace root the path guard validates.
 # The commands below are placeholders: replace them with the MCP servers you actually run.
 [[servers]]
 name = "local-workspace"

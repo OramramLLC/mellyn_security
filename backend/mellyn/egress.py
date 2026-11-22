@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -79,12 +80,26 @@ class EgressValidator:
         if _CONTROL_CHARACTERS.search(raw_url):
             return False, "URL contains control characters."
 
-        parsed = urlparse(raw_url.strip())
+        try:
+            parsed = urlparse(raw_url.strip())
+            port = parsed.port
+        except ValueError:
+            return False, "Malformed URL authority or port."
+
         if parsed.scheme.lower() != "https":
             return False, f"Disallowed URL scheme '{parsed.scheme}'; only https is permitted."
 
-        if parsed.username or parsed.password:
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             return False, "URLs with embedded credentials/userinfo are forbidden."
+
+        hostport = parsed.netloc
+        if "]" in hostport:
+            _, _, after_bracket = hostport.rpartition("]")
+            has_colon_port = ":" in after_bracket
+        else:
+            has_colon_port = ":" in hostport
+        if has_colon_port and (port is None or port <= 0):
+            return False, "URL specifies an empty or invalid port."
 
         hostname = (parsed.hostname or "").strip().lower().rstrip(".")
         if not hostname:
@@ -142,6 +157,15 @@ def check_workspace_root(workspace_root: Path, *, require_mount: bool) -> None:
         )
 
 
+@dataclass(frozen=True)
+class SearchMatch:
+    """One permitted line match returned by WorkspacePathGuard.search_content()."""
+
+    path: str
+    line_number: int
+    line: str
+
+
 class WorkspacePathGuard:
     """Enforces workspace confinement, secret-file denial, and guardrail protection."""
 
@@ -150,13 +174,23 @@ class WorkspacePathGuard:
         self.protected_paths = tuple(p.casefold() for p in (*GUARDRAIL_PATHS, *extra_protected_paths))
 
     def is_protected(self, rel_posix: str) -> bool:
-        """True when a workspace-relative POSIX path is, or is inside, a guardrail path (case-insensitive)."""
-        path = rel_posix.casefold()
+        """
+        True when a workspace-relative POSIX path is, is inside, or is an ancestor directory of a
+        guardrail/protected path (case-insensitive). Denying ancestor directories prevents moving or
+        deleting a parent tree (e.g. 'backend/') whose subtree contains 'backend/mellyn/'.
+        """
+        norm_path = "" if rel_posix == "." else rel_posix.casefold().strip("/")
+        if norm_path == "":
+            return bool(self.protected_paths)
         for protected in self.protected_paths:
-            if protected.endswith("/"):
-                if path.startswith(protected) or f"{path}/" == protected:
-                    return True
-            elif path == protected:
+            norm_prot = protected.strip("/")
+            if not norm_prot:
+                continue
+            if norm_path == norm_prot:
+                return True
+            if protected.endswith("/") and norm_path.startswith(f"{norm_prot}/"):
+                return True
+            if norm_prot.startswith(f"{norm_path}/"):
                 return True
         return False
 
@@ -194,8 +228,73 @@ class WorkspacePathGuard:
         if rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS:
             return False, f"Access to sensitive file '{rel_posix}' is denied."
 
-        # Block agent self-modification of security guardrails
+        # Block agent self-modification of security guardrails (and ancestor directories containing them)
         if is_write and self.is_protected(rel_posix):
             return False, f"Modifying guardrail path '{rel_posix}' is denied."
 
         return True, f"Workspace path '{rel_posix}' permitted."
+
+    def search_content(
+        self,
+        query: str,
+        start_path: str = ".",
+        *,
+        max_matches: int = 200,
+        max_file_bytes: int = 1024 * 1024,
+    ) -> list[SearchMatch]:
+        """
+        Recursively search workspace text files while applying `validate_path(..., is_write=False)`
+        to every directory and file BEFORE opening it, so secret files (`.env`, `*.pem`, `.ssh/`, ...)
+        are never read even when `start_path` is the workspace root.
+        """
+        if not isinstance(query, str) or not query:
+            raise ValueError("Search query must be a non-empty string.")
+        ok, reason = self.validate_path(start_path, is_write=False)
+        if not ok:
+            raise PermissionError(reason)
+
+        candidate = Path(start_path)
+        start_resolved = (candidate if candidate.is_absolute() else self.workspace_root / candidate).resolve()
+        matches: list[SearchMatch] = []
+
+        def _scan_file(file_path: Path) -> None:
+            file_ok, _ = self.validate_path(str(file_path), is_write=False)
+            if not file_ok:
+                return
+            try:
+                st = file_path.stat()
+                if st.st_size > max_file_bytes:
+                    return
+                raw = file_path.read_bytes()
+            except OSError:
+                return
+            if b"\x00" in raw:
+                return
+            rel_posix = file_path.resolve().relative_to(self.workspace_root).as_posix()
+            for idx, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), start=1):
+                if query in line:
+                    matches.append(SearchMatch(path=rel_posix, line_number=idx, line=line))
+                    if len(matches) >= max_matches:
+                        return
+
+        if start_resolved.is_file():
+            _scan_file(start_resolved)
+            return matches
+
+        for root, dirs, files in os.walk(start_resolved, followlinks=False):
+            root_path = Path(root)
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if d != ".git"
+                and not (root_path / d).is_symlink()
+                and self.validate_path(str(root_path / d), is_write=False)[0]
+            )
+            for fname in sorted(files):
+                fpath = root_path / fname
+                if fpath.is_symlink():
+                    continue
+                _scan_file(fpath)
+                if len(matches) >= max_matches:
+                    return matches
+        return matches

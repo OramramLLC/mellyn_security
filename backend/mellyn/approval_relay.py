@@ -26,25 +26,26 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from mellyn.approvals import API_KEY_HEADER, MAX_BODY_BYTES, MAX_PENDING
+from mellyn.approvals import (
+    API_KEY_HEADER,
+    MAX_BODY_BYTES,
+    MAX_PENDING,
+    ApprovalRedirectError,
+    build_approval_opener,
+    parse_approval_route,
+)
 
 # Largest reply the relay will pass back. GET /v1/pending can hold MAX_PENDING calls, each with up to 64 KiB of
 # arguments plus their reasons, so this must comfortably exceed MAX_PENDING * 64 KiB. A larger reply is
 # refused with 502 rather than cut short, which would hand the approver CLI broken JSON.
 MAX_RELAY_RESPONSE_BYTES = MAX_PENDING * 80 * 1024
 
-_ALLOWED_GET_PATH = "/v1/pending"
-_ALLOWED_POST_RE = re.compile(r"^/v1/pending/apr_[A-Za-z0-9_-]{8,64}/(?:approve|reject)$")
 _HOST_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def is_allowed_approval_route(method: str, path: str) -> bool:
     """Return True only for the exact pending-approval endpoints."""
-    if method == "GET":
-        return path == _ALLOWED_GET_PATH
-    if method == "POST":
-        return _ALLOWED_POST_RE.fullmatch(path) is not None
-    return False
+    return parse_approval_route(method, path) is not None
 
 
 def validate_upstream(host: str, port: int) -> str:
@@ -53,6 +54,62 @@ def validate_upstream(host: str, port: int) -> str:
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError(f"Invalid upstream port '{port}'.")
     return f"http://{host}:{port}"
+
+
+def _json_error_bytes(message: str) -> bytes:
+    return json.dumps({"error": message}).encode("utf-8")
+
+
+def forward_approval_request(
+    upstream_base: str,
+    method: str,
+    path: str,
+    *,
+    api_key: str | None = None,
+    body: bytes | None = None,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> tuple[int, bytes]:
+    """
+    Forward a validated approval request to `upstream_base + path` without following redirects or proxies.
+    Never reflects credentials into error messages.
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key is not None:
+        headers[API_KEY_HEADER] = api_key
+
+    req = urllib.request.Request(  # noqa: S310 - fixed internal upstream validated at startup
+        upstream_base + path,
+        data=body,
+        method=method,
+        headers=headers,
+    )
+    active_opener = opener or build_approval_opener()
+    try:
+        with active_opener.open(req, timeout=10) as resp:
+            status, payload = resp.status, resp.read(MAX_RELAY_RESPONSE_BYTES + 1)
+    except ApprovalRedirectError as exc:
+        return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes(
+            f"Approval server returned unexpected redirect ({exc.code}); refusing to follow."
+        )
+    except urllib.error.HTTPError as exc:
+        with exc:
+            if 300 <= exc.code < 400:
+                return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes(
+                    f"Approval server returned unexpected redirect ({exc.code}); refusing to follow."
+                )
+            status, payload = exc.code, exc.read(MAX_RELAY_RESPONSE_BYTES + 1)
+    except (urllib.error.URLError, OSError):
+        return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes(
+            "MCP gateway approval server is not reachable (ensure mellyn-gateway is running)."
+        )
+
+    if 300 <= status < 400:
+        return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes(
+            f"Approval server returned unexpected redirect ({status}); refusing to follow."
+        )
+    if len(payload) > MAX_RELAY_RESPONSE_BYTES:
+        return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes("Approval server reply is too large to relay.")
+    return status, payload
 
 
 class _RelayHandler(BaseHTTPRequestHandler):
@@ -70,7 +127,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _send_error_json(self, status: HTTPStatus, message: str) -> None:
-        self._send_bytes(int(status), json.dumps({"error": message}).encode("utf-8"))
+        self._send_bytes(int(status), _json_error_bytes(message))
 
     def _forward(self, method: str) -> None:
         if not is_allowed_approval_route(method, self.path):
@@ -88,33 +145,14 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length)
 
-        headers = {"Content-Type": "application/json"}
-        api_key = self.headers.get(API_KEY_HEADER)
-        if api_key is not None:
-            headers[API_KEY_HEADER] = api_key
-
-        req = urllib.request.Request(  # noqa: S310 - fixed internal upstream validated at startup
-            self.server.upstream_base + self.path,
-            data=body,
-            method=method,
-            headers=headers,
+        status, payload = forward_approval_request(
+            self.server.upstream_base,
+            method,
+            self.path,
+            api_key=self.headers.get(API_KEY_HEADER),
+            body=body,
+            opener=self.server.opener,
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(req, timeout=10) as resp:
-                status, payload = resp.status, resp.read(MAX_RELAY_RESPONSE_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            with exc:
-                status, payload = exc.code, exc.read(MAX_RELAY_RESPONSE_BYTES + 1)
-        except OSError:
-            self._send_error_json(
-                HTTPStatus.BAD_GATEWAY,
-                "MCP gateway approval server is not reachable (ensure mellyn-gateway is running).",
-            )
-            return
-        if len(payload) > MAX_RELAY_RESPONSE_BYTES:
-            self._send_error_json(HTTPStatus.BAD_GATEWAY, "Approval server reply is too large to relay.")
-            return
         self._send_bytes(status, payload)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -127,8 +165,17 @@ class _RelayHandler(BaseHTTPRequestHandler):
 class ApprovalRelayServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, *, listen_host: str, listen_port: int, upstream_host: str, upstream_port: int) -> None:
+    def __init__(
+        self,
+        *,
+        listen_host: str,
+        listen_port: int,
+        upstream_host: str,
+        upstream_port: int,
+        opener: urllib.request.OpenerDirector | None = None,
+    ) -> None:
         self.upstream_base = validate_upstream(upstream_host, upstream_port)
+        self.opener = opener or build_approval_opener()
         super().__init__((listen_host, listen_port), _RelayHandler)
 
 

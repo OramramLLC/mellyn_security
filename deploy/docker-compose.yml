@@ -48,7 +48,7 @@ services:
       # The authorizer must see the same files the agent's tools see, or symlink/junction checks are blind.
       - ${MELLYN_WORKSPACE:?Set MELLYN_WORKSPACE to the absolute path of the agent workspace}:/workspace:ro
       - ../config:/etc/mellyn:ro
-      - mellyn-audit-logs:/var/log/mellyn
+      - mellyn-authorizer-audit-logs:/var/log/mellyn
     networks:
       - mellyn-frontend
     tmpfs:
@@ -60,6 +60,15 @@ services:
     # Your MCP servers must be installed in this image. Build one FROM mellyn-security:local that adds them,
     # then set MELLYN_GATEWAY_IMAGE to it. The server commands come from config/mellyn-gateway.example.toml.
     image: ${MELLYN_GATEWAY_IMAGE:-mellyn-security:local}
+    # Starts with only CAP_SETUID/CAP_SETGID so downstream MCP servers are spawned as `mellyn-mcp` (10002)
+    # and the gateway immediately drops permanently to `mellyn` (10001, clearing all capabilities) before
+    # opening /var/log/mellyn/gateway-audit.jsonl (mode 0700 owned by 10001).
+    # Do not add `init: true`: the gateway must be PID 1. After its drop it cannot signal the servers it launched,
+    # so they stop only because the kernel ends the PID namespace when PID 1 exits; it refuses to start otherwise.
+    user: "0:0"
+    cap_add:
+      - SETUID
+      - SETGID
     stdin_open: true
     command:
       - python
@@ -71,6 +80,10 @@ services:
       - /workspace
       - --audit-log
       - /var/log/mellyn/gateway-audit.jsonl
+      - --gateway-user
+      - mellyn
+      - --downstream-user
+      - mellyn-mcp
       - --approval-host
       - "0.0.0.0"
       - --approval-port
@@ -84,7 +97,7 @@ services:
     volumes:
       - ${MELLYN_WORKSPACE:?Set MELLYN_WORKSPACE to the absolute path of the agent workspace}:/workspace
       - ../config:/etc/mellyn:ro
-      - mellyn-audit-logs:/var/log/mellyn
+      - mellyn-gateway-audit-logs:/var/log/mellyn
     networks:
       mellyn-internal:
         aliases:
@@ -159,4 +172,5 @@ networks:
     driver: bridge
 
 volumes:
-  mellyn-audit-logs:
+  mellyn-authorizer-audit-logs:
+  mellyn-gateway-audit-logs:

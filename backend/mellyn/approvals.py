@@ -16,6 +16,8 @@ import json
 import re
 import secrets
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -24,13 +26,65 @@ from typing import Any
 
 from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer
 from mellyn.credentials import CredentialConfig, Role
-from mellyn.models import ApprovalGrant, AuthorizationResult, ToolCallRequest, canonical_json, utc_now
+from mellyn.models import (
+    ApprovalGrant,
+    AuthorizationResult,
+    ToolCallRequest,
+    canonical_json,
+    effective_mcp_method,
+    utc_now,
+)
 
 MAX_PENDING = 100
 PENDING_TTL_SECONDS = 3600
 MAX_BODY_BYTES = 16 * 1024
 API_KEY_HEADER = "X-Mellyn-API-Key"
+PENDING_LIST_PATH = "/v1/pending"
 _APPROVE_PATH = re.compile(r"^/v1/pending/(apr_[A-Za-z0-9_-]{8,64})/(approve|reject)$")
+
+
+def parse_approval_route(method: str, path: str) -> tuple[str | None, str] | None:
+    """
+    Parse an exact approval HTTP route shared by the approval server and loopback relay.
+
+    Returns `(None, "list")` for `GET /v1/pending`, `(approval_id, "approve" | "reject")`
+    for `POST /v1/pending/apr_.../(approve|reject)`, or `None` for any other method/path.
+    """
+    if method == "GET" and path == PENDING_LIST_PATH:
+        return (None, "list")
+    if method == "POST":
+        match = _APPROVE_PATH.fullmatch(path)
+        if match is not None:
+            approval_id, action = match.groups()
+            return (approval_id, action)
+    return None
+
+
+class ApprovalRedirectError(urllib.error.URLError):
+    """Raised when an approval endpoint responds with a 3xx redirect (never followed)."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"Refusing HTTP {code} redirect from approval endpoint.")
+        self.code = code
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every HTTP redirect so X-Mellyn-API-Key is never forwarded across origins."""
+
+    def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        if fp is not None:
+            fp.close()
+        raise ApprovalRedirectError(code)
+
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise ApprovalRedirectError(code)
+
+
+def build_approval_opener(*extra_handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+    """Build an HTTP opener that disables environment proxies and refuses every 3xx redirect."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler(), *extra_handlers)
 
 
 @dataclass(frozen=True)
@@ -43,6 +97,7 @@ class PendingApproval:
     reasons: tuple[str, ...]
     audit_id: str
     created_at: datetime = field(default_factory=utc_now)
+    mcp_method: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -60,14 +115,24 @@ class PendingApprovals:
         self._lock = threading.Lock()
         self._pending: dict[str, PendingApproval] = {}
 
-    def add(self, request: ToolCallRequest, result: AuthorizationResult) -> PendingApproval:
-        key = (request.session_id, request.mcp_server, request.tool_name, canonical_json(request.arguments))
+    def add(
+        self, request: ToolCallRequest, result: AuthorizationResult, *, now: datetime | None = None
+    ) -> PendingApproval:
+        check_time = now or utc_now()
+        key = (
+            request.session_id,
+            request.mcp_server,
+            effective_mcp_method(request.tool_name, request.mcp_method),
+            request.tool_name,
+            canonical_json(request.arguments),
+        )
         with self._lock:
-            self._expire()
+            self._expire(check_time)
             for existing in self._pending.values():
                 if key == (
                     existing.session_id,
                     existing.mcp_server,
+                    effective_mcp_method(existing.tool_name, existing.mcp_method),
                     existing.tool_name,
                     canonical_json(existing.arguments),
                 ):
@@ -83,37 +148,51 @@ class PendingApprovals:
                 arguments=dict(request.arguments),
                 reasons=result.reasons,
                 audit_id=result.audit_id,
+                created_at=check_time,
+                mcp_method=request.mcp_method,
             )
             self._pending[pending.approval_id] = pending
             return pending
 
-    def list(self) -> list[PendingApproval]:
+    def list(self, *, now: datetime | None = None) -> list[PendingApproval]:
         with self._lock:
-            self._expire()
+            self._expire(now or utc_now())
             return sorted(self._pending.values(), key=lambda p: p.created_at)
 
     def approve(
-        self, approval_id: str, *, approved_by: str, ttl_seconds: int = 900, max_uses: int = 1
+        self,
+        approval_id: str,
+        *,
+        approved_by: str,
+        ttl_seconds: int = 900,
+        max_uses: int = 1,
+        now: datetime | None = None,
     ) -> ApprovalGrant:
+        check_time = now or utc_now()
         with self._lock:
+            self._expire(check_time)
             pending = self._pending.pop(approval_id)  # KeyError when unknown or expired
         return self.authorizer.issue_grant(
             session_id=pending.session_id,
             tool_name=pending.tool_name,
             mcp_server=pending.mcp_server,
+            mcp_method=pending.mcp_method,
             arguments=pending.arguments,
             approved_by=approved_by,
             ttl_seconds=ttl_seconds,
             max_uses=max_uses,
+            now=check_time,
         )
 
-    def reject(self, approval_id: str) -> None:
+    def reject(self, approval_id: str, *, now: datetime | None = None) -> None:
+        check_time = now or utc_now()
         with self._lock:
+            self._expire(check_time)
             del self._pending[approval_id]
 
     def _expire(self, now: datetime | None = None) -> None:
         cutoff = (now or utc_now()) - timedelta(seconds=PENDING_TTL_SECONDS)
-        for approval_id in [p.approval_id for p in self._pending.values() if p.created_at < cutoff]:
+        for approval_id in [p.approval_id for p in self._pending.values() if p.created_at <= cutoff]:
             del self._pending[approval_id]
 
 
@@ -158,7 +237,7 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the stdlib
         if not self._authorized():
             return
-        if self.path != "/v1/pending":
+        if parse_approval_route("GET", self.path) is None:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         self._send(HTTPStatus.OK, {"pending": [p.to_json() for p in self.server.approvals.list()]})
@@ -166,14 +245,14 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - name fixed by the stdlib
         if not self._authorized():
             return
-        match = _APPROVE_PATH.fullmatch(self.path)
-        if match is None:
+        parsed_route = parse_approval_route("POST", self.path)
+        if parsed_route is None or parsed_route[0] is None:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         body = self._read_json()
         if body is None:
             return
-        approval_id, action = match.groups()
+        approval_id, action = parsed_route
         try:
             if action == "reject":
                 self.server.approvals.reject(approval_id)

@@ -22,34 +22,66 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
-from mellyn.approvals import API_KEY_HEADER
+from mellyn.approvals import API_KEY_HEADER, ApprovalRedirectError, build_approval_opener
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def validate_approval_url(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.hostname not in LOOPBACK_HOSTS or parsed.username or parsed.password:
+    if not isinstance(url, str) or not url.strip():
         raise ValueError("The approval URL must be http://127.0.0.1:<port> (loopback only).")
+    try:
+        parsed = urlparse(url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("The approval URL must be http://127.0.0.1:<port> (loopback only).") from exc
+    has_userinfo = parsed.username is not None or parsed.password is not None or "@" in parsed.netloc
+    if parsed.scheme != "http" or parsed.hostname not in LOOPBACK_HOSTS or has_userinfo:
+        raise ValueError("The approval URL must be http://127.0.0.1:<port> (loopback only).")
+    hostport = parsed.netloc.rpartition("]")[2] if "]" in parsed.netloc else parsed.netloc
+    if ":" in hostport and (port is None or port <= 0):
+        raise ValueError("The approval URL specifies an invalid port.")
     if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
         raise ValueError("The approval URL must not include a path, query, or fragment.")
     return f"http://{parsed.netloc}"
 
 
-def _call(base_url: str, key: str, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+def _call(
+    base_url: str,
+    key: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(  # noqa: S310 - base_url is restricted to loopback http by validate_approval_url
         base_url + path, data=data, method=method, headers={API_KEY_HEADER: key, "Content-Type": "application/json"}
     )
-    # No proxies: urllib would otherwise honor HTTP_PROXY and hand the approver key to whatever it names.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # Shared opener disables proxies and refuses every 3xx redirect so X-Mellyn-API-Key never leaves base_url.
+    active_opener = opener or build_approval_opener()
     try:
-        with opener.open(request, timeout=10) as response:
+        with active_opener.open(request, timeout=10) as response:
+            if 300 <= response.status < 400:
+                raise ApprovalRedirectError(response.status)
             return json.load(response)
+    except ApprovalRedirectError as exc:
+        raise SystemExit(f"Approval server returned unexpected redirect ({exc.code}); refusing to follow.") from None
     except urllib.error.HTTPError as exc:
         with exc:
-            detail = json.loads(exc.read() or b"{}").get("error", exc.reason)
+            if 300 <= exc.code < 400:
+                raise SystemExit(
+                    f"Approval server returned unexpected redirect ({exc.code}); refusing to follow."
+                ) from None
+            raw_err = exc.read()
+        try:
+            detail = json.loads(raw_err or b"{}").get("error", exc.reason)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            detail = exc.reason
         raise SystemExit(f"Approval server refused the request ({exc.code}): {detail}") from None
+    except (urllib.error.URLError, OSError):
+        raise SystemExit("Approval server is not reachable.") from None
 
 
 PR_SET_DUMPABLE = 4

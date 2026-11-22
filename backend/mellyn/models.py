@@ -96,6 +96,13 @@ class RiskSignals:
             raise ValueError("injection_score must be between 0.0 and 1.0")
 
 
+def effective_mcp_method(tool_name: str, mcp_method: str | None) -> str:
+    """Return the MCP operation identity ('tools/call' vs 'resources/read') for policy and grant matching."""
+    if mcp_method is not None:
+        return mcp_method
+    return "resources/read" if tool_name == "resources/read" else "tools/call"
+
+
 @dataclass(frozen=True)
 class ToolCallRequest:
     """A single tool or MCP invocation submitted for authorization."""
@@ -105,6 +112,7 @@ class ToolCallRequest:
     arguments: dict[str, Any] = field(default_factory=dict)
     mcp_server: str | None = None
     signals: RiskSignals = field(default_factory=RiskSignals)
+    mcp_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,9 +120,9 @@ class ApprovalGrant:
     """
     Short-lived human approval for one exact tool call.
 
-    The grant is bound to the session, the tool, the MCP server, and the complete argument set
-    (compared as canonical RFC 8259 JSON). A call with any different, extra, or missing argument
-    does not match, so approving `git_push(branch="feature/x")` can never authorize
+    The grant is bound to the session, the MCP operation, the tool, the MCP server, and the complete
+    argument set (compared as canonical RFC 8259 JSON). A call with any different, extra, or missing
+    argument does not match, so approving `git_push(branch="feature/x")` can never authorize
     `branch="feature/x:main"` or an added `force=True`. Grants are single-use unless `max_uses`
     says otherwise.
     """
@@ -127,6 +135,7 @@ class ApprovalGrant:
     approved_by: str
     expires_at: datetime
     max_uses: int = 1
+    mcp_method: str | None = None
 
     def is_valid(self, now: datetime | None = None) -> bool:
         check_time = now or utc_now()
@@ -143,6 +152,8 @@ class ApprovalGrant:
             self.session_id == request.session_id
             and self.tool_name == request.tool_name
             and self.mcp_server == request.mcp_server
+            and effective_mcp_method(self.tool_name, self.mcp_method)
+            == effective_mcp_method(request.tool_name, request.mcp_method)
             and self.arguments_json == req_json
         )
 
