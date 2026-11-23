@@ -123,7 +123,9 @@ V1/
 ├── deploy/
 │   ├── README.md                    # Self-hosted container & egress proxy deployment guide
 │   ├── docker-compose.yml           # Isolated internal network, Squid egress, authorizer & approval relay
-│   ├── requirements.lock            # Hash-pinned Python runtime & transitive wheel lockfile
+│   ├── requirements.lock            # Hash-pinned container runtime Python lockfile
+│   ├── requirements-ci-scanners.lock # Hash-pinned CI SAST & lint lockfile (Semgrep + Ruff)
+│   ├── requirements-ci-tests.lock   # Hash-pinned CI API test lockfile (FastAPI + Starlette + HTTPX)
 │   └── egress/
 │       ├── Dockerfile               # Digest-pinned Ubuntu Squid egress image
 │       └── squid.conf               # Policy-generated Squid config
@@ -133,6 +135,7 @@ V1/
 │   ├── OWASP_AI_CODING_SECURITY.md  # OWASP AI-assisted & agentic security synthesis
 │   └── THREAT_MODEL.md              # Gateway threat model & automated test traceability matrix
 ├── scripts/
+│   ├── ci_guardrails.py             # Shared checksummed Gitleaks, base-allowlist & baseline-gate CI runner
 │   ├── verify_dependencies.py       # Manifest, lockfile, hash, 90d package & 14d release-cooldown verifier
 │   ├── sync_agent_rules.py          # Canonical rules generator & hidden-Unicode smuggling detector
 │   └── verify_container_stack.py    # End-to-end Docker build, mount, role & DNS-rebinding CI harness

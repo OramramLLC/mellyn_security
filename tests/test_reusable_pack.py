@@ -92,30 +92,37 @@ class TestReusableWorkflowSecurity(unittest.TestCase):
             self.assertNotIn(".mellyn-guardrails", line)
 
     def test_code_under_review_cannot_suppress_the_scanners(self) -> None:
-        self.assertIn("--disable-nosem", self.text)
-        self.assertIn("find . -name .semgrepignore", self.text)
-        self.assertIn("--ignore-gitleaks-allow", self.text)
-        self.assertIn("--gitleaks-ignore-path", self.text)
-        self.assertIn("rm -f .gitleaksignore", self.text)  # gitleaks also reads it from the scanned root
+        helper_text = (REPO_ROOT / "scripts" / "ci_guardrails.py").read_text(encoding="utf-8")
+        self.assertIn("mellyn/scripts/ci_guardrails.py run-gitleaks", self.text)
+        self.assertIn("mellyn/scripts/ci_guardrails.py run-semgrep", self.text)
         self.assertNotIn("gitleaks/gitleaks-action", self.text)
+        for needle in (
+            "--disable-nosem",
+            '".semgrepignore"',
+            "--ignore-gitleaks-allow",
+            "--gitleaks-ignore-path",
+            '".gitleaksignore"',
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, helper_text)
 
     def test_gitleaks_binary_is_checksum_verified(self) -> None:
-        self.assertRegex(self.text, r'GITLEAKS_SHA256: "[0-9a-f]{64}"')
-        self.assertIn("sha256sum --check --strict", self.text)
+        helper_text = (REPO_ROOT / "scripts" / "ci_guardrails.py").read_text(encoding="utf-8")
+        self.assertIn("mellyn/scripts/ci_guardrails.py install-gitleaks", self.text)
+        self.assertRegex(helper_text, r'GITLEAKS_LINUX_X64_SHA256 = "[0-9a-f]{64}"')
+        self.assertIn("hashlib.sha256(", helper_text)
 
 
 class TestOwnGateSuppressions(unittest.TestCase):
     def test_this_repositorys_gate_ignores_suppressions_too(self) -> None:
         text = OWN_GATE.read_text(encoding="utf-8")
-        for needle in (
-            "--disable-nosem",
-            "find . -name .semgrepignore",
-            "--ignore-gitleaks-allow",
-            "rm -f .gitleaksignore",
-            "sha256sum --check",
-        ):
-            with self.subTest(needle=needle):
+        helper_text = (REPO_ROOT / "scripts" / "ci_guardrails.py").read_text(encoding="utf-8")
+        for needle in ("install-gitleaks", "run-gitleaks", "run-suite", "--run-semgrep"):
+            with self.subTest(workflow_needle=needle):
                 self.assertIn(needle, text)
+        for needle in ("--disable-nosem", "--ignore-gitleaks-allow", "hashlib.sha256("):
+            with self.subTest(helper_needle=needle):
+                self.assertIn(needle, helper_text)
         self.assertNotIn("gitleaks/gitleaks-action", text)
 
 

@@ -34,14 +34,15 @@ permissions:
   contents: read
 
 # Design rules for this workflow:
-# - Third-party actions are pinned to full commit SHAs; the Gitleaks binary is pinned by version and SHA-256.
+# - Third-party actions are pinned to full commit SHAs; Gitleaks is SHA-256 verified by scripts/ci_guardrails.py.
+# - Python scanner dependencies are installed with `--require-hashes --no-deps` from deploy/requirements-ci-scanners.lock.
 # - The caller's code is checked out to `caller/` and Mellyn's guardrails to `mellyn/`, side by side, so the code
 #   under review can never stand in for (or overwrite) the scripts, rules and configs that review it.
 # - The guardrails come from `job.workflow_repository` at `job.workflow_sha`: the repository and commit of THIS
 #   workflow file. (`github.*` in a called workflow describes the caller, so `github.workflow_sha` would check out
 #   the caller's own commit.) The `job.workflow_*` context is not available on GitHub Enterprise Server.
 # - Nothing in the code under review can switch the scanners off: `# nosemgrep` and `# gitleaks:allow` comments
-#   are ignored, and the caller's `.semgrepignore` / `.gitleaksignore` files are not used.
+#   are ignored, and the caller's `.semgrepignore` / `.gitleaksignore` files are replaced or bypassed.
 # - No `${{ }}` expression appears inside a `run:` script; values reach scripts through `env:`.
 
 jobs:
@@ -77,20 +78,10 @@ jobs:
           path: mellyn
           sparse-checkout: |
             .gitleaks.toml
+            scripts
           persist-credentials: false
 
-      - name: Install pinned Gitleaks (checksum verified)
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-        run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gitleaks.tgz" \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum --check --strict
-          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
-
-      - name: Run Gitleaks with Mellyn AI & cloud secret rules
-        working-directory: caller
+      - name: Install pinned Gitleaks and scan caller commits
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -98,22 +89,12 @@ jobs:
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          is_sha() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{40}$' && [ "$1" != "0000000000000000000000000000000000000000" ]; }
-          range=""
-          if [ "$EVENT_NAME" = "pull_request" ] && is_sha "$PR_BASE_SHA" && is_sha "$PR_HEAD_SHA"; then
-            range="$PR_BASE_SHA..$PR_HEAD_SHA"
-          elif [ "$EVENT_NAME" = "push" ] && is_sha "$PUSH_BEFORE_SHA" && git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
-            range="$PUSH_BEFORE_SHA..$COMMIT_SHA"
-          fi
-          echo "Scanning ${range:-full history}"
-          # The code under review must not allowlist itself. Gitleaks reads .gitleaksignore from --gitleaks-ignore-path
-          # AND from the root of the scanned directory, so point the flag at an empty directory and delete the file.
-          rm -f .gitleaksignore
-          mkdir -p "$RUNNER_TEMP/no-gitleaksignore"
-          set -- git . --config ../mellyn/.gitleaks.toml --ignore-gitleaks-allow \
-            --gitleaks-ignore-path "$RUNNER_TEMP/no-gitleaksignore" --redact --no-banner --exit-code 1
-          if [ -n "$range" ]; then set -- "$@" --log-opts="$range"; fi
-          "$RUNNER_TEMP/gitleaks" "$@"
+          python3 mellyn/scripts/ci_guardrails.py install-gitleaks --dest-dir "$RUNNER_TEMP/gitleaks-bin"
+          python3 mellyn/scripts/ci_guardrails.py run-gitleaks \
+            --gitleaks-bin "$RUNNER_TEMP/gitleaks-bin/gitleaks" \
+            --target caller \
+            --guardrails mellyn \
+            --mode caller-range
 
   supply-chain-and-sast:
     name: Mellyn Supply-Chain & OWASP AI SAST Gate
@@ -135,7 +116,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: caller
-          fetch-depth: 2 # the PR's base commit, for the allowlist
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Checkout Mellyn Security guardrails (this workflow's own commit)
@@ -146,6 +127,7 @@ jobs:
           path: mellyn
           sparse-checkout: |
             .semgrep
+            deploy
             scripts
           persist-credentials: false
 
@@ -155,48 +137,31 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Verify dependencies (existence, package age, pinning, registry-only)
-        working-directory: caller
         env:
           MELLYN_MIN_AGE_DAYS: ${{ inputs.min-package-age-days }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          # Exemptions on a pull request come from its BASE commit (the merge commit's first parent), so the
-          # change under review cannot exempt its own dependencies. If HEAD is not a two-parent merge commit,
-          # no exemptions apply. On pushes the reviewed, merged file is used.
           allowlist="$RUNNER_TEMP/mellyn-allowlist.toml"
-          rm -f "$allowlist"
-          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
-            if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]; then
-              git show HEAD^1:.mellyn-allowlist.toml > "$allowlist" 2>/dev/null || rm -f "$allowlist"
-            fi
-          elif [ -f .mellyn-allowlist.toml ]; then
-            cp .mellyn-allowlist.toml "$allowlist"
-          fi
-          python ../mellyn/scripts/verify_dependencies.py --online --min-age-days "$MELLYN_MIN_AGE_DAYS"             --allowlist "$allowlist"
+          python mellyn/scripts/ci_guardrails.py extract-allowlist \
+            --repo caller \
+            --output "$allowlist" \
+            --event-name "$EVENT_NAME"
+          python mellyn/scripts/verify_dependencies.py \
+            --root caller \
+            --online \
+            --min-age-days "$MELLYN_MIN_AGE_DAYS" \
+            --allowlist "$allowlist"
 
       - name: Check AI instruction files for hidden Unicode and drift
         if: ${{ inputs.check-agent-rules }}
-        working-directory: caller
-        run: python ../mellyn/scripts/sync_agent_rules.py --check
+        run: python mellyn/scripts/sync_agent_rules.py --check --root caller
 
-      - name: Install pinned Semgrep
+      - name: Install hash-locked Semgrep
         if: ${{ inputs.run-semgrep }}
-        run: python -m pip install --disable-pip-version-check "semgrep==1.182.0"
-
-      - name: Replace caller-controlled Semgrep ignore files
-        if: ${{ inputs.run-semgrep }}
-        working-directory: caller
-        run: |
-          # .semgrepignore files (at any depth) are part of the code under review; a PR could add one to hide itself.
-          find . -name .semgrepignore -not -path './.git/*' -print -delete
-          printf '%s\n' 'node_modules/' '.venv/' 'venv/' 'vendor/' 'dist/' 'build/' '*.min.js' > .semgrepignore
-
-      - name: Semgrep scan with Mellyn OWASP AI rules
-        if: ${{ inputs.run-semgrep }}
-        working-directory: caller
         run: >
-          semgrep scan
-          --config ../mellyn/.semgrep/owasp-ai-code-rules.yaml
-          --disable-nosem
-          --error
-          --metrics=off
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps
+          -r mellyn/deploy/requirements-ci-scanners.lock
+
+      - name: Semgrep scan with Mellyn OWASP AI rules (suppressions disabled)
+        if: ${{ inputs.run-semgrep }}
+        run: python mellyn/scripts/ci_guardrails.py run-semgrep --target caller --guardrails mellyn
