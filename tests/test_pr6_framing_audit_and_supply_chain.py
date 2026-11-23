@@ -28,7 +28,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-for p in (BACKEND_DIR, SCRIPTS_DIR):
+for p in (REPO_ROOT, BACKEND_DIR, SCRIPTS_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -56,24 +56,15 @@ from mellyn.mcp_gateway import (  # noqa: E402
 )
 from mellyn.models import canonical_json, canonical_json_value  # noqa: E402
 
+from tests.fakes import FakeDownstream  # noqa: E402
 
-class _HealthyPeerDownstream:
-    def __init__(self, name: str) -> None:
-        self.name = name
 
-    def request(self, method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-        if method == "tools/list":
-            tools = [{"name": "ping", "inputSchema": {"type": "object"}}]
-            return {"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}}
-        if method == "tools/call":
-            return {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "pong"}]}}
-        return {"jsonrpc": "2.0", "id": 1, "result": {}}
-
-    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
+def _healthy_peer(name: str) -> FakeDownstream:
+    return FakeDownstream(
+        name,
+        [{"name": "ping", "inputSchema": {"type": "object"}}],
+        call_response={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "pong"}]}},
+    )
 
 
 class TestBoundedFramingInboxAndWriteDeadline(unittest.TestCase):
@@ -98,7 +89,7 @@ class TestBoundedFramingInboxAndWriteDeadline(unittest.TestCase):
             policy = PolicyConfig(allowed_mcp_servers=frozenset({"peer"}), trusted_mcp_servers=frozenset({"peer"}))
             gateway = MCPGateway(
                 authorizer=Authorizer(workspace_root=Path(tmp), policy_config=policy),
-                servers={"peer": _HealthyPeerDownstream("peer")},
+                servers={"peer": _healthy_peer("peer")},
             )
             oversized = "🚀" * 16 + "\n"
             valid_ping = '{"jsonrpc":"2.0","id":7,"method":"ping"}\n'
@@ -216,7 +207,7 @@ class TestBoundedFramingInboxAndWriteDeadline(unittest.TestCase):
             # Now verify gateway dispatch isolates the dead server from a healthy peer server
             gateway = MCPGateway(
                 authorizer=authorizer,
-                servers={"stalled": stalled, "healthy": _HealthyPeerDownstream("healthy")},
+                servers={"stalled": stalled, "healthy": _healthy_peer("healthy")},
             )
             gateway.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
 

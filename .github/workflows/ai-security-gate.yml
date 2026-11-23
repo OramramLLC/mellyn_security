@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# Least privilege: nothing in this workflow writes to the repository or uploads results.
+# Least privilege: read-only repository token; test and container jobs publish sanitized assurance artifacts only.
 permissions:
   contents: read
 
@@ -193,6 +193,34 @@ jobs:
           MELLYN_REQUIRE_API_TESTS: "1"
         run: python -m unittest discover -s tests -v
 
+      - name: Generate fast Control Assurance Report
+        if: always()
+        env:
+          MATRIX_PY: ${{ matrix.python-version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/assurance"
+          python scripts/run_conformance_report.py \
+            --json-out "$RUNNER_TEMP/assurance/control-assurance-fast-py${MATRIX_PY}.json" \
+            --markdown-out "$RUNNER_TEMP/assurance/control-assurance-fast-py${MATRIX_PY}.md"
+        continue-on-error: false
+
+      - name: Publish fast Control Assurance Summary
+        if: always()
+        env:
+          MATRIX_PY: ${{ matrix.python-version }}
+        run: |
+          md="$RUNNER_TEMP/assurance/control-assurance-fast-py${MATRIX_PY}.md"
+          if [ -f "$md" ]; then cat "$md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload fast Control Assurance Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: control-assurance-fast-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/assurance/control-assurance-fast-py${{ matrix.python-version }}.*
+          if-no-files-found: error
+          retention-days: 30
+
   container-and-egress:
     name: Container build & Squid egress integration
     runs-on: ubuntu-latest
@@ -207,4 +235,23 @@ jobs:
           python-version: "3.12"
 
       - name: Build digest-pinned images and verify Squid egress and private-address blocking
-        run: python scripts/verify_container_stack.py
+        run: |
+          mkdir -p "$RUNNER_TEMP/assurance"
+          python scripts/verify_container_stack.py \
+            --json-out "$RUNNER_TEMP/assurance/control-assurance-linux-container.json" \
+            --markdown-out "$RUNNER_TEMP/assurance/control-assurance-linux-container.md"
+
+      - name: Publish Linux container Control Assurance Summary
+        if: always()
+        run: |
+          md="$RUNNER_TEMP/assurance/control-assurance-linux-container.md"
+          if [ -f "$md" ]; then cat "$md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload Linux container Control Assurance Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: control-assurance-linux-container
+          path: ${{ runner.temp }}/assurance/control-assurance-linux-container.*
+          if-no-files-found: error
+          retention-days: 30

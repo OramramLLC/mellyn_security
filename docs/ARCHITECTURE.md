@@ -136,10 +136,13 @@ V1/
 │   └── THREAT_MODEL.md              # Gateway threat model & automated test traceability matrix
 ├── scripts/
 │   ├── ci_guardrails.py             # Shared checksummed Gitleaks, base-allowlist & baseline-gate CI runner
+│   ├── run_conformance_report.py    # Fast-profile conformance runner & JSON/Markdown assurance exporter
 │   ├── verify_dependencies.py       # Manifest, lockfile, hash, 90d package & 14d release-cooldown verifier
 │   ├── sync_agent_rules.py          # Canonical rules generator & hidden-Unicode smuggling detector
-│   └── verify_container_stack.py    # End-to-end Docker build, mount, role & DNS-rebinding CI harness
+│   └── verify_container_stack.py    # End-to-end Docker build, mount, role, egress & Linux assurance harness
 ├── tests/                           # Security & regression test suites
+│   ├── fakes.py                     # Unified recording in-memory MCP FakeDownstream fixture
+│   └── conformance/                 # OWASP/ATLAS control validation suite & assurance report recorder
 ├── .cursorrules                     # Generated from .agent/rules (verified by sync check)
 ├── .dockerignore                    # Excludes secrets, .git, and .venv from container build context
 ├── .env.example                     # Placeholder environment configuration

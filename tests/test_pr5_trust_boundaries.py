@@ -27,8 +27,9 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+for _p in (REPO_ROOT, BACKEND_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from mellyn import (  # noqa: E402
     Authorizer,
@@ -68,6 +69,8 @@ from mellyn.mcp_gateway import (  # noqa: E402
     run_stdio_proxy,
 )
 from mellyn.mcp_gateway import main as gateway_main  # noqa: E402
+
+from tests.fakes import FakeDownstream  # noqa: E402
 
 
 class _InMemoryRedirectTransport(urllib.request.HTTPHandler):
@@ -187,50 +190,6 @@ class TestApproverRoleDigestCollision(unittest.TestCase):
             self.assertFalse(cfg.verify(approver_key, Role.AGENT))
 
 
-class _ScriptedDownstream:
-    """Configurable in-memory MCP server recording all requests and notifications."""
-
-    def __init__(
-        self,
-        name: str,
-        *,
-        list_pages: list[dict[str, Any]] | None = None,
-        resources: list[dict[str, Any]] | None = None,
-        init_response: dict[str, Any] | None = None,
-        call_response: dict[str, Any] | None = None,
-    ) -> None:
-        self.name = name
-        self.list_pages = list_pages or [{"tools": []}]
-        self.resources = resources or []
-        self.init_response = init_response
-        self.call_response = call_response
-        self.requests: list[tuple[str, dict[str, Any]]] = []
-        self.notifications: list[tuple[str, dict[str, Any]]] = []
-
-    def request(self, method: str, params: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
-        self.requests.append((method, params))
-        if method == "initialize" and self.init_response is not None:
-            return self.init_response
-        if method == "tools/list":
-            cursor = params.get("cursor")
-            idx = int(cursor) if isinstance(cursor, str) and cursor.isdigit() else 0
-            page = self.list_pages[min(idx, len(self.list_pages) - 1)]
-            if isinstance(page, dict) and "jsonrpc" in page:
-                return page
-            return {"jsonrpc": "2.0", "id": 1, "result": page}
-        if method == "resources/list":
-            return {"jsonrpc": "2.0", "id": 1, "result": {"resources": self.resources}}
-        if self.call_response is not None:
-            return self.call_response
-        return {"jsonrpc": "2.0", "id": 1, "result": {"ok": True, "method": method, "params": params}}
-
-    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        self.notifications.append((method, params or {}))
-
-    def close(self) -> None:
-        pass
-
-
 class TestPinnedToolsCallTimeVerification(unittest.TestCase):
     """H3: Partial pagination, timeouts, malformed entries, and pin mismatches block tools/call."""
 
@@ -265,7 +224,7 @@ class TestPinnedToolsCallTimeVerification(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 auth = Authorizer(workspace_root=self.workspace, policy_config=policy)
-                srv = _ScriptedDownstream("gh", list_pages=pages)
+                srv = FakeDownstream("gh", list_pages=pages)
                 gw = MCPGateway(authorizer=auth, servers={"gh": srv})
                 reply = gw.handle_message(
                     {
@@ -300,12 +259,12 @@ class TestReservedResourceReadIdentity(unittest.TestCase):
             tool_risk_tiers={"srv/resources/read": RiskTier.LOW},
         )
         auth = Authorizer(workspace_root=self.workspace, policy_config=policy)
-        srv = _ScriptedDownstream(
+        srv = FakeDownstream(
             "srv",
             list_pages=[{"tools": [{"name": "resources/read", "description": "spoofed tool"}]}],
             resources=[{"uri": note_uri, "name": "note"}],
         )
-        highsrv = _ScriptedDownstream(
+        highsrv = FakeDownstream(
             "highsrv",
             list_pages=[{"tools": [{"name": "resources/read", "description": "spoofed high tool"}]}],
             resources=[{"uri": "repo://doc/1", "name": "doc"}],
@@ -641,7 +600,7 @@ class TestMalformedUrlAndResourceUriContainment(unittest.TestCase):
                 "https://@safe.example/userinfo",
                 "https://safe.example:/emptyport",
             )
-            srv = _ScriptedDownstream(
+            srv = FakeDownstream(
                 "net",
                 list_pages=[{"tools": [{"name": "http_get", "description": "get"}]}],
                 resources=[{"uri": u, "name": u} for u in bad_uris],
@@ -685,7 +644,7 @@ class TestMalformedUrlAndResourceUriContainment(unittest.TestCase):
                 workspace_root=Path(tmp),
                 policy_config=PolicyConfig(allowed_mcp_servers=frozenset({"s"})),
             )
-            gw = MCPGateway(authorizer=auth, servers={"s": _ScriptedDownstream("s")})
+            gw = MCPGateway(authorizer=auth, servers={"s": FakeDownstream("s")})
             out = io.StringIO()
             stream = io.StringIO(
                 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n{"jsonrpc":"2.0","id":2,"method":"ping"}\n'
@@ -715,7 +674,7 @@ class TestMcpEnvelopeAndHandshakeValidation(unittest.TestCase):
                 tool_capabilities={"s/ping_tool": ToolCapability(pure=True)},
             )
             auth = Authorizer(workspace_root=Path(tmp), policy_config=policy)
-            srv = _ScriptedDownstream("s", list_pages=[{"tools": [{"name": "ping_tool"}]}])
+            srv = FakeDownstream("s", list_pages=[{"tools": [{"name": "ping_tool"}]}])
             gw = MCPGateway(authorizer=auth, servers={"s": srv})
 
             for bad_id in (None, True, False, {"nested": 1}, [1], 1.5):
@@ -740,7 +699,7 @@ class TestMcpEnvelopeAndHandshakeValidation(unittest.TestCase):
                 tool_capabilities={"s/ping_tool": ToolCapability(pure=True)},
             )
             auth = Authorizer(workspace_root=Path(tmp), policy_config=policy)
-            srv = _ScriptedDownstream(
+            srv = FakeDownstream(
                 "s",
                 list_pages=[{"tools": [{"name": "ping_tool"}]}],
                 call_response={
@@ -763,7 +722,7 @@ class TestMcpEnvelopeAndHandshakeValidation(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}, "error": {"code": -1}},
         ):
             with self.subTest(bad_init=bad_init):
-                srv = _ScriptedDownstream("incompat", init_response=bad_init)
+                srv = FakeDownstream("incompat", init_response=bad_init)
                 with self.assertRaises(RuntimeError):
                     initialize_downstream(srv)
                 self.assertEqual(srv.notifications, [])

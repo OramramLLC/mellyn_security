@@ -22,6 +22,7 @@ Proves in CI (on real Docker Engine + Linux namespaces) that:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import secrets
@@ -35,12 +36,30 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+for _p in (REPO_ROOT, BACKEND_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from mellyn.credentials import key_digest  # noqa: E402
 from mellyn.egress_proxy import generate_squid_config  # noqa: E402
 from mellyn.policy_loader import load_policy_file  # noqa: E402
+
+from tests.conformance.cases import (  # noqa: E402
+    FORBIDDEN_CONFORMANCE_MARKERS,
+    LINUX_AUDIT_ISOLATION_SPEC,
+    LINUX_NETWORK_EGRESS_SPEC,
+    execute_conformance_profile,
+)
+from tests.conformance.recorder import (  # noqa: E402
+    CaseOutcome,
+    EvidenceRecorder,
+    build_assurance_report,
+    evaluate_observation,
+    make_error_record,
+    non_audit_verification,
+    verify_audit_sink,
+    write_assurance_artifacts,
+)
 
 AUTH_IMAGE = "mellyn-security:ci-verify"
 EGRESS_IMAGE = "mellyn-egress:ci-verify"
@@ -328,7 +347,34 @@ def cleanup() -> None:
     run_cmd(["docker", "volume", "rm", "-f", GW_AUDIT_VOLUME], check=False)
 
 
-def main() -> int:
+def emit_linux_assurance_report(
+    recorder: EvidenceRecorder,
+    *,
+    json_out: Path | None,
+    markdown_out: Path | None,
+) -> None:
+    if json_out is None or markdown_out is None:
+        return
+    report = build_assurance_report(
+        recorder.records,
+        execution_profile="linux-container",
+        forbidden_markers=FORBIDDEN_CONFORMANCE_MARKERS,
+    )
+    write_assurance_artifacts(
+        report,
+        json_path=json_out,
+        markdown_path=markdown_out,
+        forbidden_markers=FORBIDDEN_CONFORMANCE_MARKERS,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Mellyn Security Docker & Squid egress integration verifier")
+    parser.add_argument("--json-out", type=Path, default=None, help="Optional JSON Control Assurance Report path")
+    parser.add_argument("--markdown-out", type=Path, default=None, help="Optional Markdown summary report path")
+    args = parser.parse_args(argv)
+
+    recorder = execute_conformance_profile("linux-container")
     cleanup()
     try:
         print("[1/5] Building digest- and hash-pinned container images...")
@@ -580,10 +626,44 @@ def main() -> int:
                 ]
             )
             verified_data = json.loads(audit_verify.stdout)
-            if verified_data["sentinel"] != "sentinel-intact\n":
+            sentinel_ok = verified_data["sentinel"] == "sentinel-intact\n"
+            audit_lines = verified_data["audit"]
+            audit_appended = len(audit_lines) == 1 and json.loads(audit_lines[0])["decision"] == "allow"
+            audit_ver = verify_audit_sink(
+                "\n".join(audit_lines),
+                expected_decision="allow",
+                expected_arguments={},
+                forbidden_markers=FORBIDDEN_CONFORMANCE_MARKERS,
+            )
+            recorder.record_direct(
+                evaluate_observation(
+                    LINUX_AUDIT_ISOLATION_SPEC,
+                    CaseOutcome(
+                        observed={
+                            "child_uid_isolated": probe_report["uid"] == 10002 and probe_report["gid"] == 10002,
+                            "audit_dir_tamper_blocked": all(
+                                bool(probe_report.get(k))
+                                for k in (
+                                    "list_dir_denied",
+                                    "write_audit_denied",
+                                    "write_sentinel_denied",
+                                    "unlink_sentinel_denied",
+                                    "replace_sentinel_denied",
+                                )
+                            ),
+                            "proc_environ_blocked": bool(probe_report.get("read_gateway_environ_denied"))
+                            and bool(probe_report.get("read_gateway_mem_denied")),
+                            "sentinel_intact": sentinel_ok,
+                            "gateway_audit_appended": audit_appended,
+                        },
+                        audit=audit_ver,
+                    ),
+                )
+            )
+            if not sentinel_ok:
                 raise RuntimeError(f"Audit sentinel was modified: {verified_data['sentinel']!r}")
-            if len(verified_data["audit"]) != 1 or json.loads(verified_data["audit"][0])["decision"] != "allow":
-                raise RuntimeError(f"Expected 1 appended allow audit event, got: {verified_data['audit']}")
+            if not audit_appended or not audit_ver.complete:
+                raise RuntimeError(f"Expected 1 valid allow audit event, got: {audit_lines}")
 
             print("[4/5] Starting isolated internal network, outside target listener, and Squid egress proxy...")
             run_cmd(["docker", "network", "create", "--internal", "--subnet", INTERNAL_SUBNET, INTERNAL_NET])
@@ -657,35 +737,59 @@ def main() -> int:
             # 1a. Positive control: confirm the controlled outside listener is live on EXT_NET.
             ext_probe = run_direct_probe(outside_url, network=EXT_NET, timeout=4.0)
             ext_parsed = parse_probe_json(ext_probe.stdout, ext_probe.returncode)
-            if not ext_parsed or ext_parsed.get("status") != "allowed" or ext_parsed.get("http_status") != 200:
-                raise RuntimeError(
-                    f"Controlled outside target {outside_url} was not reachable on {EXT_NET}: "
-                    f"rc={ext_probe.returncode} stdout={ext_probe.stdout!r} stderr={ext_probe.stderr!r}"
-                )
+            outside_ok = bool(
+                ext_parsed and ext_parsed.get("status") == "allowed" and ext_parsed.get("http_status") == 200
+            )
 
             # 1b. Isolation check: from INTERNAL_NET without Squid, kernel routing must reject direct egress.
             direct_probe = run_direct_probe(outside_url, network=INTERNAL_NET, timeout=4.0)
             isolated_ok, isolated_reason = classify_direct_egress_probe(direct_probe.stdout, direct_probe.returncode)
+
+            # 2. Through Squid, each of these must be refused by Squid itself (a 403), not merely fail somehow.
+            disallowed_urls = (
+                "http://docs.python.org/",  # plaintext HTTP
+                "https://169.254.169.254/latest/meta-data/",  # IP literal / cloud metadata
+                "https://example.com/",  # not on the allowlist
+                "https://private.docs.python.org/",  # allowlisted name resolving to 127.0.0.1
+            )
+            squid_denials: dict[str, str] = {}
+            for url in disallowed_urls:
+                squid_denials[url] = fetch_outcome(url, use_proxy=True)
+            all_squid_denied = all(denied_by_squid(out) for out in squid_denials.values())
+
+            # 3. An allowlisted HTTPS domain through Squid must succeed.
+            allowed = fetch_outcome("https://docs.python.org/3/", use_proxy=True, timeout=15)
+            squid_allowed_ok = allowed == "ALLOWED"
+
+            recorder.record_direct(
+                evaluate_observation(
+                    LINUX_NETWORK_EGRESS_SPEC,
+                    CaseOutcome(
+                        observed={
+                            "outside_target_reachable_from_ext": outside_ok,
+                            "direct_internal_egress_routing_denied": isolated_ok,
+                            "squid_denied_four_disallowed_vectors": all_squid_denied,
+                            "squid_allowed_https_allowlist": squid_allowed_ok,
+                        },
+                        audit=non_audit_verification(),
+                    ),
+                )
+            )
+
+            if not outside_ok:
+                raise RuntimeError(
+                    f"Controlled outside target {outside_url} was not reachable on {EXT_NET}: "
+                    f"rc={ext_probe.returncode} stdout={ext_probe.stdout!r} stderr={ext_probe.stderr!r}"
+                )
             if not isolated_ok:
                 raise RuntimeError(
                     f"Direct egress check from {INTERNAL_NET} to {outside_url} failed ({isolated_reason}): "
                     f"stdout={direct_probe.stdout!r} stderr={direct_probe.stderr!r}"
                 )
-
-            # 2. Through Squid, each of these must be refused by Squid itself (a 403), not merely fail somehow.
-            for url in (
-                "http://docs.python.org/",  # plaintext HTTP
-                "https://169.254.169.254/latest/meta-data/",  # IP literal / cloud metadata
-                "https://example.com/",  # not on the allowlist
-                "https://private.docs.python.org/",  # allowlisted name resolving to 127.0.0.1
-            ):
-                outcome = fetch_outcome(url, use_proxy=True)
-                if not denied_by_squid(outcome):
-                    raise RuntimeError(f"Expected Squid to refuse {url} with 403, got: {outcome}")
-
-            # 3. An allowlisted HTTPS domain through Squid must succeed.
-            allowed = fetch_outcome("https://docs.python.org/3/", use_proxy=True, timeout=15)
-            if allowed != "ALLOWED":
+            for url, out in squid_denials.items():
+                if not denied_by_squid(out):
+                    raise RuntimeError(f"Expected Squid to refuse {url} with 403, got: {out}")
+            if not squid_allowed_ok:
                 squid_logs = run_cmd(["docker", "logs", SQUID_CONTAINER], check=False).stderr
                 raise RuntimeError(
                     f"Allowlisted HTTPS fetch through Squid failed: {allowed}\nSquid logs:\n{squid_logs}"
@@ -693,8 +797,15 @@ def main() -> int:
 
         print("Container build, workspace mount check, role isolation, and Squid egress checks PASSED.")
         return 0
+    except Exception as exc:
+        for spec in (LINUX_AUDIT_ISOLATION_SPEC, LINUX_NETWORK_EGRESS_SPEC):
+            existing = next((r for r in recorder.records if r.case_id == spec.case_id), None)
+            if existing is None or existing.status == "not_run":
+                recorder.record_direct(make_error_record(spec, exc))
+        raise
     finally:
         cleanup()
+        emit_linux_assurance_report(recorder, json_out=args.json_out, markdown_out=args.markdown_out)
 
 
 if __name__ == "__main__":
