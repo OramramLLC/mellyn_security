@@ -18,8 +18,9 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
 FAKE_SERVER = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+for _p in (REPO_ROOT, BACKEND_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from mellyn import (  # noqa: E402
     Authorizer,
@@ -48,6 +49,8 @@ from mellyn.mcp_gateway import (  # noqa: E402
     initialize_downstream,
     run_stdio_proxy,
 )
+
+from tests.fakes import FakeDownstream  # noqa: E402
 
 EXAMPLE_POLICY = REPO_ROOT / "config" / "mellyn-policy.example.toml"
 
@@ -176,32 +179,6 @@ class TestGatewayConfig(unittest.TestCase):
                 load_gateway_config(self.write(f'schema_version = 1\npolicy = "p.toml"\n{servers}'))
         with self.assertRaises(PolicyLoadError):
             load_gateway_config(self.write('policy = "p.toml"\n' + server.format(name="a", command='["srv"]')))
-
-
-class FakeDownstream:
-    """In-memory downstream server: records requests and answers with canned results."""
-
-    def __init__(self, name: str, tools: list[str], resources: list[str] | None = None) -> None:
-        self.name = name
-        self.tools = tools
-        self.resources = resources or []
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-
-    def request(self, method: str, params: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
-        self.calls.append((method, params))
-        if method == "tools/list":
-            result: Any = {"tools": [{"name": t, "description": f"{t} from {self.name}"} for t in self.tools]}
-        elif method == "resources/list":
-            result = {"resources": [{"uri": uri, "name": uri} for uri in self.resources]}
-        else:
-            result = {"served_by": self.name, "method": method, "params": params}
-        return {"jsonrpc": "2.0", "id": "x", "result": result}
-
-    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        self.calls.append((method, params or {}))
-
-    def close(self) -> None:
-        pass
 
 
 class GatewayTestCase(unittest.TestCase):
