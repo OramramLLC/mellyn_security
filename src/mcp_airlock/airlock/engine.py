@@ -1,0 +1,581 @@
+"""
+Pure Airlock policy enforcement engine.
+
+Strict DAG & Invariants:
+  - Imports ONLY from `mcp_airlock.core` and `mcp_airlock.egress` (+ stdlib / pydantic).
+  - Performs no network, subprocess, stdout, or disk write I/O. Path checks call `Path.resolve(strict=False)`,
+    which does read symlinks that already exist, so run the engine with the same filesystem view as the
+    downstream server it guards.
+  - Pins, artifact hashes, and size caps use the exact bytes that will be forwarded (`exact_json_bytes`).
+    Unicode normalization is used only to widen matching (deny rules, canaries), never to make a value pass.
+  - Defaults fail-closed (`verdict_allow=False`) on missing policy pins, schema errors,
+    invisible Unicode smuggling, traversal escapes, regex violations, or canary/secret detection.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Sequence
+from pathlib import Path
+from typing import cast
+from urllib.parse import unquote, urlparse
+
+from pydantic import ValidationError
+
+from mcp_airlock.airlock.models import (
+    AirlockPolicy,
+    JsonRpcErrorResponse,
+    JsonRpcRequest,
+    JsonRpcSuccessResponse,
+    ToolCallParams,
+    ToolDefinition,
+    ToolPolicyRule,
+)
+from mcp_airlock.core.normalize import (
+    JsonObject,
+    JsonValue,
+    canonical_json_bytes,
+    exact_json_bytes,
+    has_invisible_unicode,
+    normalize_str,
+    sha256_exact,
+)
+from mcp_airlock.core.schemas import Verdict
+from mcp_airlock.egress.guards import WorkspacePathGuard
+from mcp_airlock.egress.scanner import scan_payload
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_URI_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
+_WINDOWS_DRIVE_URI_PATH_RE = re.compile(r"^/[A-Za-z]:/")
+
+# Argument keys treated as filesystem paths at ANY nesting depth (compared case-insensitively with `_`/`-` removed),
+# in addition to a rule's explicit `path_arg_names`. Any string value anywhere that is a `file:` URI is also checked.
+_PATH_KEY_EXACT: frozenset[str] = frozenset(
+    {"root", "src", "dst", "source", "sources", "target", "targets", "destination", "destinations"}
+)
+_PATH_KEY_SUFFIXES: tuple[str, ...] = (
+    "path",
+    "paths",
+    "file",
+    "files",
+    "filename",
+    "filenames",
+    "dir",
+    "dirs",
+    "directory",
+    "directories",
+    "folder",
+    "folders",
+    "uri",
+    "uris",
+)
+
+
+def _is_path_like_key(key: str) -> bool:
+    folded = "".join(ch for ch in key.casefold() if ch.isalnum())
+    return folded in _PATH_KEY_EXACT or folded.endswith(_PATH_KEY_SUFFIXES)
+
+
+def _uri_scheme(value: str) -> str | None:
+    """Return the casefolded URI scheme of `value`, or None. A single letter is a Windows drive (`C:`), not a scheme."""
+    match = _URI_SCHEME_RE.match(value)
+    if match is None or len(match.group(1)) == 1:
+        return None
+    return match.group(1).casefold()
+
+
+def compute_tool_pin(tool: ToolDefinition) -> str:
+    """Compute the AgBOM SHA-256 digest of a single `ToolDefinition` over its exact wire form."""
+    return sha256_exact(tool.wire_dict())
+
+
+def compute_manifest_pin(tools: Sequence[ToolDefinition]) -> str:
+    """Compute the AgBOM SHA-256 digest of a complete `tools/list` manifest over its exact wire form."""
+    payload: list[JsonValue] = [tool.wire_dict() for tool in tools]
+    return sha256_exact(payload)
+
+
+def _safe_artifact_sha256(obj: JsonValue) -> str:
+    """Compute the exact SHA-256 safely; fall back to a repr digest if the input is not strict JSON."""
+    try:
+        return sha256_exact(obj)
+    except (TypeError, ValueError):
+        return hashlib.sha256(repr(obj).encode("utf-8", errors="replace")).hexdigest()
+
+
+def verify_tools_list(tools: Sequence[ToolDefinition], policy: AirlockPolicy) -> Verdict:
+    """
+    Verify downstream MCP `tools/list` definitions against pinned SHA-256 AgBOM hashes.
+
+    Fails closed (`verdict_allow=False`):
+      - Invisible Unicode tag/zero-width/bidi characters anywhere in manifest -> `AAD_FIRE`.
+      - Missing AgBOM pins (`agbom_pins` empty and `manifest_sha256 is None`) -> `BLOCK`.
+      - Manifest hash mismatch, unpinned tool, or per-tool AgBOM pin mismatch -> `AAD_FIRE`.
+    """
+    raw_manifest: list[JsonValue] = [t.wire_dict() for t in tools]
+    try:
+        artifact_sha256 = sha256_exact(raw_manifest)
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="airlock.manifest_canonicalization_error",
+            reason=f"Tool manifest is not strict JSON: {exc}",
+            artifact_sha256=_safe_artifact_sha256(raw_manifest),
+        )
+
+    if has_invisible_unicode(raw_manifest):
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="airlock.invisible_unicode_injection",
+            reason="Invisible Unicode format/tag characters detected in downstream tool definition.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    if not policy.agbom_pins and policy.manifest_sha256 is None:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.missing_agbom_pin",
+            reason="AirlockPolicy does not pin any AgBOM tool or manifest digests (fail-closed).",
+            artifact_sha256=artifact_sha256,
+        )
+
+    if policy.manifest_sha256 is not None and artifact_sha256 != policy.manifest_sha256:
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="airlock.agbom_manifest_mismatch",
+            reason="Downstream tools/list manifest SHA-256 does not match pinned AgBOM digest.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    if policy.agbom_pins:
+        for tool in tools:
+            pinned_hash = policy.agbom_pins.get(tool.name)
+            if pinned_hash is None:
+                return Verdict(
+                    verdict_allow=False,
+                    severity="AAD_FIRE",
+                    rule_id="airlock.agbom_unpinned_tool",
+                    reason=f"Downstream tool '{tool.name}' has no pinned AgBOM digest.",
+                    artifact_sha256=artifact_sha256,
+                )
+            actual_hash = compute_tool_pin(tool)
+            if actual_hash != pinned_hash:
+                return Verdict(
+                    verdict_allow=False,
+                    severity="AAD_FIRE",
+                    rule_id="airlock.agbom_pin_mismatch",
+                    reason=f"AgBOM SHA-256 mismatch for tool '{tool.name}' (possible rug pull).",
+                    artifact_sha256=artifact_sha256,
+                )
+
+    return Verdict(
+        verdict_allow=True,
+        severity="ALLOW",
+        rule_id="airlock.agbom_verified",
+        reason="Downstream tool manifest matches pinned AgBOM SHA-256 digests.",
+        artifact_sha256=artifact_sha256,
+        redacted_payload=raw_manifest,
+    )
+
+
+def _check_lexical_path_containment(
+    raw_path: str,
+    *,
+    roots: Sequence[str],
+    block_guardrail_paths: bool,
+) -> tuple[bool, str]:
+    """
+    Validate workspace path containment (`Path.resolve(strict=False)`) and secret-file rules across configured
+    `roots`. `file:` URIs (any letter case, any slash count) are decoded to their path; other URI schemes are denied.
+    """
+    if not raw_path.strip():
+        return False, "Empty path argument is forbidden."
+    if _CONTROL_CHARS_RE.search(raw_path) or has_invisible_unicode(raw_path):
+        return False, "Path argument contains control or invisible Unicode characters."
+
+    normalized_raw = normalize_str(raw_path).replace("\\", "/")
+    if normalized_raw.startswith("~"):
+        return False, "Home-directory tilde paths are forbidden."
+
+    scheme = _uri_scheme(normalized_raw)
+    if scheme is not None:
+        if scheme != "file":
+            return False, f"URI scheme '{scheme}' is not a workspace file path."
+        parsed = urlparse(normalized_raw)
+        if parsed.netloc.casefold() not in ("", "localhost"):
+            return False, "Remote file:// authority is forbidden."
+        normalized_raw = unquote(parsed.path)
+        if _CONTROL_CHARS_RE.search(normalized_raw) or has_invisible_unicode(normalized_raw):
+            return False, "Decoded file: URI path contains control or invisible Unicode characters."
+        # Strip leading slash before Windows drive letters (`file:///C:/...`)
+        if _WINDOWS_DRIVE_URI_PATH_RE.match(normalized_raw):
+            normalized_raw = normalized_raw[1:]
+        if not normalized_raw:
+            return False, "file: URI has no path."
+
+    candidate = Path(normalized_raw)
+    matched_any_root = False
+    last_guard_reason = "Path escapes configured workspace boundary."
+
+    for root_str in roots:
+        if not root_str.strip():
+            continue
+        root_path = Path(root_str).resolve(strict=False)
+        try:
+            resolved = (candidate if candidate.is_absolute() else root_path / candidate).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not resolved.is_relative_to(root_path):
+            continue
+        matched_any_root = True
+        guard = WorkspacePathGuard(root_path)
+        allowed, reason = guard.validate_path(str(resolved), is_write=block_guardrail_paths)
+        if allowed:
+            return True, "Path confined inside allowed workspace root."
+        last_guard_reason = reason
+
+    if not matched_any_root:
+        return False, "Path escapes allowed workspace roots (traversal denied)."
+    return False, last_guard_reason
+
+
+def _gather_path_candidates(
+    arguments: JsonObject, explicit_keys: frozenset[str]
+) -> tuple[list[tuple[str, str, bool]], str | None]:
+    """
+    Walk every argument at every depth and return `(location, value, explicit)` for each string to path-check,
+    plus an error message if an explicitly declared path argument has the wrong type.
+    """
+    found: list[tuple[str, str, bool]] = []
+
+    def visit(value: JsonValue, location: str, key: str) -> str | None:
+        explicit = key in explicit_keys
+        if isinstance(value, str):
+            if explicit or _is_path_like_key(key):
+                found.append((location, value, explicit))
+            elif _uri_scheme(normalize_str(value)) == "file":
+                found.append((location, value, True))
+            return None
+        if isinstance(value, list):
+            if explicit and (not value or not all(isinstance(item, str) for item in value)):
+                return f"Path list argument '{location}' must contain non-empty strings."
+            for idx, item in enumerate(value):
+                error = visit(item, f"{location}[{idx}]", key)
+                if error is not None:
+                    return error
+            return None
+        if isinstance(value, dict):
+            if explicit:
+                return f"Path argument '{location}' must be a string."
+            for child_key, child in value.items():
+                error = visit(child, f"{location}.{child_key}", child_key)
+                if error is not None:
+                    return error
+            return None
+        if explicit:
+            return f"Path argument '{location}' must be a string."
+        return None
+
+    for top_key, top_value in arguments.items():
+        error = visit(top_value, top_key, top_key)
+        if error is not None:
+            return found, error
+    return found, None
+
+
+def _evaluate_path_rules(
+    arguments: JsonObject,
+    *,
+    tool_rule: ToolPolicyRule | None,
+    policy: AirlockPolicy,
+) -> tuple[bool, str]:
+    roots = tool_rule.allowed_path_roots if (tool_rule and tool_rule.allowed_path_roots) else policy.workspace_roots
+    explicit_keys = frozenset(tool_rule.path_arg_names) if tool_rule is not None else frozenset()
+    candidates, error = _gather_path_candidates(arguments, explicit_keys)
+    if error is not None:
+        return False, error
+    if not candidates:
+        return True, "No path arguments provided."
+    if not roots:
+        return False, "Path argument supplied without configured workspace_roots (fail-closed)."
+
+    block_guardrails = tool_rule.block_guardrail_paths if tool_rule is not None else True
+    for location, raw_value, explicit in candidates:
+        if not explicit:
+            # A path-like key holding a non-file URI (`uri: https://...`) is not a filesystem path.
+            scheme = _uri_scheme(normalize_str(raw_value).replace("\\", "/"))
+            if scheme is not None and scheme != "file":
+                continue
+        ok, reason = _check_lexical_path_containment(
+            raw_value,
+            roots=roots,
+            block_guardrail_paths=block_guardrails,
+        )
+        if not ok:
+            return False, f"Path rule failed on '{location}': {reason}"
+    return True, "Path boundaries satisfied."
+
+
+def _evaluate_argument_names(arguments: JsonObject, *, tool_rule: ToolPolicyRule | None) -> tuple[bool, str]:
+    if tool_rule is None or tool_rule.allowed_arg_names is None:
+        return True, "No argument-name allowlist configured."
+    permitted = {*tool_rule.allowed_arg_names, *tool_rule.path_arg_names}
+    undeclared = [key for key in arguments if key not in permitted]
+    if undeclared:
+        return False, f"{len(undeclared)} argument(s) not declared in allowed_arg_names."
+    return True, "All arguments declared."
+
+
+def _evaluate_regex_rules(arguments: JsonObject, *, tool_rule: ToolPolicyRule | None) -> tuple[bool, str]:
+    if tool_rule is None:
+        return True, "No regex rules configured."
+    for key, allow_pattern in tool_rule.arg_regex_rules.items():
+        if key not in arguments:
+            return False, f"Missing required argument '{key}' for regex policy rule."
+        val = arguments[key]
+        if not isinstance(val, str):
+            return False, f"Argument '{key}' must be a string for regex policy validation."
+        if has_invisible_unicode(val):
+            return False, f"Argument '{key}' contains invisible Unicode characters."
+        # The exact value is what gets forwarded, so the allow-rule must match the exact value. Rejecting
+        # non-NFKC input stops compatibility characters (e.g. full-width letters) matching after normalization.
+        if normalize_str(val) != val:
+            return False, f"Argument '{key}' is not in Unicode NFKC normal form."
+        if re.fullmatch(allow_pattern, val) is None:
+            return False, f"Argument '{key}' failed required regex constraint."
+
+    for key, deny_pattern in tool_rule.arg_deny_regex_rules.items():
+        if key not in arguments:
+            continue
+        val = arguments[key]
+        if not isinstance(val, str):
+            return False, f"Argument '{key}' must be a string for deny regex inspection."
+        norm_val = normalize_str(val)
+        if re.search(deny_pattern, val) is not None or re.search(deny_pattern, norm_val) is not None:
+            return False, f"Argument '{key}' matched blocked regex constraint."
+    return True, "Regex rules satisfied."
+
+
+def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdict:
+    """
+    Pure fail-closed evaluation of an outbound MCP `tools/call` request:
+      1. Computes `artifact_sha256` and the payload size over the exact bytes to be forwarded.
+      2. Enforces the payload byte cap BEFORE any content scanning.
+      3. Scans arguments with `egress.scanner` (planted canary -> `AAD_FIRE`).
+      4. Enforces allowlisted tool name, invisible-Unicode rejection, declared argument names, workspace path
+         containment, regex argument rules, and egress secret/blocked-pattern policies (`BLOCK`).
+    """
+    raw_req: JsonObject = cast(JsonObject, request.model_dump(mode="json"))
+    try:
+        raw_bytes = exact_json_bytes(raw_req)
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.request_canonicalization_error",
+            reason=f"Request is not strict JSON: {exc}",
+            artifact_sha256=_safe_artifact_sha256(raw_req),
+        )
+    artifact_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    if request.method != "tools/call":
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.unsupported_method",
+            reason=f"Expected method 'tools/call', got '{request.method}'.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    try:
+        call_params = ToolCallParams.model_validate(request.params)
+    except ValidationError as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.invalid_tool_call_params",
+            reason=f"Invalid tools/call parameters ({exc.error_count()} validation error(s)).",
+            artifact_sha256=artifact_sha256,
+        )
+
+    tool_rule = policy.tool_rules.get(call_params.name)
+    max_bytes = (
+        tool_rule.max_payload_bytes
+        if (tool_rule is not None and tool_rule.max_payload_bytes is not None)
+        else policy.max_payload_bytes
+    )
+    if len(raw_bytes) > max_bytes:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.payload_too_large",
+            reason=f"Request size {len(raw_bytes)} exceeds limit of {max_bytes} bytes.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    try:
+        canonical_json_bytes(raw_req)  # rejects keys that collide after NFKC normalization
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.request_canonicalization_error",
+            reason=f"Request failed canonical normalization: {exc}",
+            artifact_sha256=artifact_sha256,
+        )
+
+    scan = scan_payload(
+        call_params.arguments,
+        canary_tokens=policy.canary_tokens,
+        blocked_patterns=policy.blocked_patterns,
+        entropy_threshold=policy.entropy_threshold,
+        min_entropy_length=policy.min_entropy_length,
+    )
+
+    if scan.canary_matched:
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="egress.canary_exfiltration",
+            reason="Planted canary token detected in tool call arguments.",
+            artifact_sha256=artifact_sha256,
+            redactions=scan.findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    def _block(rule_id: str, reason: str) -> Verdict:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id=rule_id,
+            reason=reason,
+            artifact_sha256=artifact_sha256,
+            redactions=scan.findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    if call_params.name not in policy.allowed_tools or (tool_rule is not None and not tool_rule.allowed):
+        return _block("airlock.tool_not_allowed", f"Tool '{call_params.name}' is not allowlisted by AirlockPolicy.")
+
+    names_ok, names_reason = _evaluate_argument_names(call_params.arguments, tool_rule=tool_rule)
+    if not names_ok:
+        return _block("airlock.undeclared_argument", names_reason)
+
+    path_ok, path_reason = _evaluate_path_rules(call_params.arguments, tool_rule=tool_rule, policy=policy)
+    if not path_ok:
+        return _block("airlock.path_boundary_violation", path_reason)
+
+    regex_ok, regex_reason = _evaluate_regex_rules(call_params.arguments, tool_rule=tool_rule)
+    if not regex_ok:
+        return _block("airlock.arg_regex_violation", regex_reason)
+
+    # After the path and regex checks so they report their own, more specific reason first.
+    if has_invisible_unicode(call_params.arguments):
+        return _block(
+            "airlock.invisible_unicode_in_arguments",
+            "Tool call arguments contain invisible Unicode format/tag characters (smuggling channel).",
+        )
+
+    if not scan.clean:
+        return _block(
+            "egress.secret_or_blocked_pattern",
+            "Egress scanner detected secret material or blocked pattern in tool call arguments.",
+        )
+
+    return Verdict(
+        verdict_allow=True,
+        severity="ALLOW",
+        rule_id="airlock.tool_call_allowed",
+        reason=f"Tool call '{call_params.name}' satisfied all airlock and egress checks.",
+        artifact_sha256=artifact_sha256,
+        redacted_payload=scan.redacted_payload,
+    )
+
+
+def evaluate_tool_response(
+    response: JsonRpcSuccessResponse | JsonRpcErrorResponse,
+    policy: AirlockPolicy,
+) -> Verdict:
+    """Scan inbound downstream tool outputs through `egress.scanner` (canary -> `AAD_FIRE`, secrets -> `BLOCK`)."""
+    raw_resp: JsonObject = cast(JsonObject, response.model_dump(mode="json"))
+    try:
+        raw_bytes = exact_json_bytes(raw_resp)
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.response_canonicalization_error",
+            reason=f"Response is not strict JSON: {exc}",
+            artifact_sha256=_safe_artifact_sha256(raw_resp),
+        )
+    artifact_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Size cap before any scanning, so an oversized response cannot buy unbounded scanner time.
+    if len(raw_bytes) > policy.max_payload_bytes:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.response_too_large",
+            reason=f"Response size {len(raw_bytes)} exceeds limit of {policy.max_payload_bytes} bytes.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    try:
+        canonical_json_bytes(raw_resp)  # the scanner hashes canonically; surface collisions as a verdict
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.response_canonicalization_error",
+            reason=f"Response failed canonical normalization: {exc}",
+            artifact_sha256=artifact_sha256,
+        )
+
+    payload: JsonValue = (
+        response.result
+        if isinstance(response, JsonRpcSuccessResponse)
+        else cast(JsonObject, response.error.model_dump(mode="json"))
+    )
+    scan = scan_payload(
+        payload,
+        canary_tokens=policy.canary_tokens,
+        blocked_patterns=policy.blocked_patterns,
+        entropy_threshold=policy.entropy_threshold,
+        min_entropy_length=policy.min_entropy_length,
+    )
+
+    if scan.canary_matched:
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="egress.response_canary_detected",
+            reason="Planted canary token detected in inbound tool response.",
+            artifact_sha256=artifact_sha256,
+            redactions=scan.findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    if not scan.clean:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="egress.response_secret_or_blocked",
+            reason="Egress scanner detected secret material or blocked pattern in inbound tool response.",
+            artifact_sha256=artifact_sha256,
+            redactions=scan.findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    return Verdict(
+        verdict_allow=True,
+        severity="ALLOW",
+        rule_id="airlock.response_allowed",
+        reason="Inbound tool response cleared egress scanning.",
+        artifact_sha256=artifact_sha256,
+        redacted_payload=scan.redacted_payload,
+    )
