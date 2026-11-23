@@ -19,7 +19,9 @@ characters. Without --check, it refuses to generate anything.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+import tomllib
 import unicodedata
 from pathlib import Path
 
@@ -80,7 +82,39 @@ def render_generated(root: Path) -> str:
     return HEADER.format(src=CANONICAL.as_posix()) + body
 
 
-def render_self_policy(root: Path) -> str:
+_SAFE_PROTECTED_PATH_RE = re.compile(r"[A-Za-z0-9._/@+-]+")
+
+
+def self_policy_paths(current_text: str | None) -> tuple[str, ...]:
+    """
+    Return the `protected_paths` the self-policy must list: every entry in SELF_PROTECTED_PATHS, plus any EXTRA
+    entries already in the current self-policy.
+
+    Extra entries only add write protection, so they are allowed. This matters because CI judges a pull request
+    with the copy of this script on `main`: a PR that adds a protected path to both SELF_PROTECTED_PATHS and the
+    self-policy would otherwise fail `main`'s exact-match drift check, which does not know the new path yet.
+
+    If the current list already contains every required entry, its order is kept. Otherwise (or if it is missing,
+    unparsable, has duplicates, or has an entry outside `[A-Za-z0-9._/@+-]`) the required entries come first,
+    followed by any valid extras, so `--check` reports drift and regeneration restores every required entry.
+    """
+    current: list[str] = []
+    if current_text is not None:
+        try:
+            parsed = tomllib.loads(current_text).get("protected_paths")
+        except tomllib.TOMLDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            current = [p for p in parsed if isinstance(p, str) and _SAFE_PROTECTED_PATH_RE.fullmatch(p)]
+            if len(current) != len(parsed) or len(set(current)) != len(current):
+                current = list(dict.fromkeys(current))
+                return SELF_PROTECTED_PATHS + tuple(p for p in current if p not in SELF_PROTECTED_PATHS)
+    if set(SELF_PROTECTED_PATHS) <= set(current):
+        return tuple(current)
+    return SELF_PROTECTED_PATHS + tuple(p for p in current if p not in SELF_PROTECTED_PATHS)
+
+
+def render_self_policy(root: Path, protected_paths: tuple[str, ...] = SELF_PROTECTED_PATHS) -> str:
     source_text = read_text(root / SELF_POLICY_SOURCE)
     lines = source_text.split("\n")
     idx = 0
@@ -90,7 +124,7 @@ def render_self_policy(root: Path) -> str:
     target_block = "\nprotected_paths = []\n"
     if body.count(target_block) != 1:
         raise ValueError(f"{SELF_POLICY_SOURCE.as_posix()} must contain exactly one 'protected_paths = []' line")
-    rendered_paths = "".join(f'    "{entry}",\n' for entry in SELF_PROTECTED_PATHS)
+    rendered_paths = "".join(f'    "{entry}",\n' for entry in protected_paths)
     replacement = f"\nprotected_paths = [\n{rendered_paths}]\n"
     return SELF_POLICY_HEADER + body.replace(target_block, replacement, 1)
 
@@ -208,9 +242,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Regenerated {rel.as_posix()}")
 
     if has_canonical and (root / SELF_POLICY_SOURCE).is_file():
-        expected_policy = render_self_policy(root)
         policy_path = root / SELF_POLICY_TARGET
         current_policy = read_text(policy_path) if policy_path.exists() else None
+        expected_policy = render_self_policy(root, self_policy_paths(current_policy))
         if current_policy != expected_policy:
             if args.check:
                 problems.append(
