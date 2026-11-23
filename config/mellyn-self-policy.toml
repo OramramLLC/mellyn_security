@@ -30,6 +30,7 @@ allowed_egress_domains = [
 # The gateway also protects its own config, this policy and its audit log when they sit in the workspace.
 protected_paths = [
     "backend/mellyn/",
+    "src/",
     "scripts/",
     "tests/",
     "config/",

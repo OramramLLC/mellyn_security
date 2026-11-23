@@ -22,8 +22,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
+    "mypy>=1.13.0",
     "ruff>=0.8.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 120
@@ -35,6 +39,15 @@ extend-exclude = ["./.semgrep"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "S", "B", "UP"]
 
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["backend", "scripts"]
+pythonpath = ["backend", "scripts", "src"]
