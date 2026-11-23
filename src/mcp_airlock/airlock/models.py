@@ -279,6 +279,9 @@ class AirlockPolicy(_StrictAirlockModel):
     allowed_tools: list[str] = Field(default_factory=list)
     agbom_pins: dict[str, str] = Field(default_factory=dict)
     manifest_sha256: str | None = None
+    # Pin for the server's `initialize` `instructions` text (`engine.compute_instructions_pin`). Without a pin the
+    # proxy strips `instructions` (unpinned text the model would read); a mismatch with a pin fires AAD.
+    instructions_sha256: str | None = None
     max_payload_bytes: int = Field(default=65_536, ge=1)
     workspace_roots: list[str] = Field(default_factory=list)
     tool_rules: dict[str, ToolPolicyRule] = Field(default_factory=dict)
@@ -294,11 +297,11 @@ class AirlockPolicy(_StrictAirlockModel):
                 raise ValueError(f"tool_rules[{key!r}] has name {rule.name!r}; the key and name must match.")
         return self
 
-    @field_validator("manifest_sha256")
+    @field_validator("manifest_sha256", "instructions_sha256")
     @classmethod
     def _validate_manifest_hash(cls, v: str | None) -> str | None:
         if v is not None and not _SHA256_HEX_RE.fullmatch(v):
-            raise ValueError("manifest_sha256 must be a 64-character lowercase hex digest.")
+            raise ValueError("Pinned digests must be 64-character lowercase hex.")
         return v
 
     @field_validator("agbom_pins")

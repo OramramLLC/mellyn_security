@@ -393,7 +393,7 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 
-def _rpc_id_problem(rpc_id: int | str | None) -> str | None:
+def rpc_id_problem(rpc_id: int | str | None) -> str | None:
     """
     Bound the JSON-RPC `id` so it cannot carry bulk data: strings up to `MAX_RPC_ID_CHARS`, integers within
     signed 64-bit. Returns a reason string when the id is out of bounds.
@@ -405,18 +405,25 @@ def _rpc_id_problem(rpc_id: int | str | None) -> str | None:
     return None
 
 
-def _scan_rpc_id(request_id: int | str | None, policy: AirlockPolicy) -> EgressScanResult | None:
-    """
-    Scan string JSON-RPC `id` fields so canary/secret/blocked data cannot ride on the envelope ID.
+MAX_OPAQUE_TOKEN_CHARS = 1024
 
-    The high-entropy detector is switched off here (an infinite threshold never matches): clients legitimately
-    use random string ids such as `secrets.token_urlsafe(16)`, which it would flag. Size is bounded separately
-    by `_rpc_id_problem`, and canaries, known secret formats and blocked patterns are still detected.
+
+def compute_instructions_pin(instructions: str) -> str:
+    """SHA-256 of a server's `initialize` `instructions` text, exactly as sent (UTF-8, no normalization)."""
+    return hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+
+
+def scan_opaque_token(value: str, policy: AirlockPolicy, *, field_path: str) -> EgressScanResult:
     """
-    if not isinstance(request_id, str):
-        return None
+    Scan an opaque protocol token (a JSON-RPC `id`, a pagination cursor) for canaries, known secret formats and
+    blocked patterns.
+
+    The high-entropy detector is switched off here (an infinite threshold never matches): such tokens are
+    legitimately random, e.g. `secrets.token_urlsafe(16)` ids or base64 cursors, which it would flag. Callers bound
+    the size separately (`rpc_id_problem`, `MAX_OPAQUE_TOKEN_CHARS`).
+    """
     result = scan_payload(
-        request_id,
+        value,
         canary_tokens=policy.canary_tokens,
         blocked_patterns=policy.blocked_patterns,
         entropy_threshold=math.inf,
@@ -426,7 +433,7 @@ def _scan_rpc_id(request_id: int | str | None, policy: AirlockPolicy) -> EgressS
         RedactionRecord(
             kind=rec.kind,
             rule_id=rec.rule_id,
-            field_path="$.id" if rec.field_path == "$" else rec.field_path,
+            field_path=field_path if rec.field_path == "$" else rec.field_path,
             match_sha256=rec.match_sha256,
         )
         for rec in result.findings
@@ -441,6 +448,13 @@ def _scan_rpc_id(request_id: int | str | None, policy: AirlockPolicy) -> EgressS
         findings=remapped,
         redacted_payload=result.redacted_payload,
     )
+
+
+def scan_rpc_id(request_id: int | str | None, policy: AirlockPolicy) -> EgressScanResult | None:
+    """Scan a string JSON-RPC `id` (see `scan_opaque_token`); integer and null ids carry no text to scan."""
+    if not isinstance(request_id, str):
+        return None
+    return scan_opaque_token(request_id, policy, field_path="$.id")
 
 
 def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdict:
@@ -500,7 +514,7 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
             artifact_sha256=artifact_sha256,
         )
 
-    id_problem = _rpc_id_problem(request.id)
+    id_problem = rpc_id_problem(request.id)
     if id_problem is not None:
         return Verdict(
             verdict_allow=False,
@@ -528,7 +542,7 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
-    id_scan = _scan_rpc_id(request.id, policy)
+    id_scan = scan_rpc_id(request.id, policy)
     all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
 
     if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
@@ -625,7 +639,7 @@ def evaluate_tool_response(
             artifact_sha256=artifact_sha256,
         )
 
-    id_problem = _rpc_id_problem(response.id)
+    id_problem = rpc_id_problem(response.id)
     if id_problem is not None:
         return Verdict(
             verdict_allow=False,
@@ -658,7 +672,7 @@ def evaluate_tool_response(
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
-    id_scan = _scan_rpc_id(response.id, policy)
+    id_scan = scan_rpc_id(response.id, policy)
     all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
 
     if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):

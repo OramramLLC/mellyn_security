@@ -1,6 +1,7 @@
 """Mellyn airlock zone: strict JSON-RPC wire models and pure fail-closed policy evaluation engine."""
 
 from mcp_airlock.airlock.engine import (
+    compute_instructions_pin,
     compute_manifest_pin,
     compute_tool_pin,
     evaluate_tool_call,
@@ -22,9 +23,22 @@ from mcp_airlock.airlock.models import (
     parse_jsonrpc_bytes,
     parse_jsonrpc_message,
 )
+from mcp_airlock.airlock.proxy import (
+    AAD_EXIT_CODE,
+    AirlockProxy,
+    BoundedLineReader,
+    ClientWriter,
+    InFlightRequest,
+    build_minimal_subprocess_env,
+)
 
 __all__ = [
+    "AAD_EXIT_CODE",
     "AirlockPolicy",
+    "AirlockProxy",
+    "BoundedLineReader",
+    "ClientWriter",
+    "InFlightRequest",
     "JsonRpcErrorObject",
     "JsonRpcErrorResponse",
     "JsonRpcMessage",
@@ -34,6 +48,8 @@ __all__ = [
     "ToolCallParams",
     "ToolDefinition",
     "ToolPolicyRule",
+    "build_minimal_subprocess_env",
+    "compute_instructions_pin",
     "compute_manifest_pin",
     "compute_tool_pin",
     "evaluate_tool_call",

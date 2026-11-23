@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from mcp_airlock.core.normalize import JsonObject, JsonValue
 
-type Severity = Literal["ALLOW", "WARN", "BLOCK", "AAD_FIRE"]
+type Severity = Literal["ALLOW", "INFO", "WARN", "BLOCK", "AAD_FIRE"]
 type Zone = Literal["core", "egress", "airlock", "ir_lab"]
 type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_pattern"]
 
