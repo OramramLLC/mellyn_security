@@ -49,7 +49,11 @@ INTERNAL_NET = "mellyn-ci-internal"
 EXT_NET = "mellyn-ci-egress"
 SQUID_CONTAINER = "mellyn-ci-squid"
 AUTH_CONTAINER = "mellyn-ci-authorizer"
+OUTSIDE_TARGET_CONTAINER = "mellyn-ci-outside-target"
 GW_AUDIT_VOLUME = "mellyn-ci-gw-audit"
+
+ROUTING_DENIAL_ERRNOS: frozenset[str] = frozenset({"ENETUNREACH", "EHOSTUNREACH"})
+_PROBE_REQUIRED_KEYS: frozenset[str] = frozenset({"phase", "status", "http_status", "errno_name", "exc_type"})
 
 
 _AUDIT_ISOLATION_FIXTURE = """
@@ -129,6 +133,60 @@ def wait_for_healthz(url: str, timeout: float = 25.0) -> None:
     raise RuntimeError(f"Timed out waiting for {url}: {last_err}")
 
 
+_OUTSIDE_LISTENER_SCRIPT = """
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        body = b"OUTSIDE_TARGET_OK\\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+http.server.HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+"""
+
+_DIRECT_PROBE_SCRIPT = """
+import errno, json, socket, ssl, sys, urllib.error, urllib.request
+
+def emit(**fields):
+    print("PROBE_JSON " + json.dumps(fields, sort_keys=True))
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(sys.argv[1], timeout=float(sys.argv[2])) as resp:
+        emit(phase="http", status="allowed", http_status=resp.status, errno_name=None, exc_type=None)
+except urllib.error.HTTPError as exc:
+    emit(phase="http", status="http_error", http_status=exc.code, errno_name=None, exc_type="HTTPError")
+except ssl.SSLError as exc:
+    emit(phase="tls", status="error", http_status=None, errno_name=None, exc_type=type(exc).__name__)
+except socket.gaierror as exc:
+    ename = errno.errorcode.get(exc.errno) if isinstance(exc.errno, int) else None
+    emit(phase="dns", status="error", http_status=None, errno_name=ename, exc_type="gaierror")
+except urllib.error.URLError as exc:
+    reason = exc.reason
+    if isinstance(reason, ssl.SSLError):
+        emit(phase="tls", status="error", http_status=None, errno_name=None, exc_type=type(reason).__name__)
+    elif isinstance(reason, socket.gaierror):
+        ename = errno.errorcode.get(reason.errno) if isinstance(reason.errno, int) else None
+        emit(phase="dns", status="error", http_status=None, errno_name=ename, exc_type="gaierror")
+    elif isinstance(reason, TimeoutError):
+        emit(phase="connect", status="error", http_status=None, errno_name="ETIMEDOUT", exc_type=type(reason).__name__)
+    elif isinstance(reason, OSError):
+        ename = errno.errorcode.get(reason.errno) if isinstance(reason.errno, int) else None
+        emit(phase="connect", status="error", http_status=None, errno_name=ename, exc_type=type(reason).__name__)
+    else:
+        emit(phase="unknown", status="error", http_status=None, errno_name=None, exc_type=type(reason).__name__)
+except TimeoutError as exc:
+    emit(phase="connect", status="error", http_status=None, errno_name="ETIMEDOUT", exc_type=type(exc).__name__)
+except OSError as exc:
+    ename = errno.errorcode.get(exc.errno) if isinstance(exc.errno, int) else None
+    emit(phase="connect", status="error", http_status=None, errno_name=ename, exc_type=type(exc).__name__)
+"""
+
 _FETCH_REPORT = """
 import sys, urllib.error, urllib.request
 try:
@@ -141,6 +199,84 @@ except urllib.error.URLError as exc:
 except OSError as exc:
     print(f"OUTCOME OSERROR {type(exc).__name__}")
 """
+
+
+def parse_probe_json(stdout: str, returncode: int) -> dict[str, object] | None:
+    """Parse structured `PROBE_JSON {...}` output from `_DIRECT_PROBE_SCRIPT`; `None` if missing or malformed."""
+    if returncode != 0:
+        return None
+    marker_lines = [line[len("PROBE_JSON ") :] for line in stdout.splitlines() if line.startswith("PROBE_JSON ")]
+    if len(marker_lines) != 1:
+        return None
+    try:
+        parsed = json.loads(marker_lines[0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or not (_PROBE_REQUIRED_KEYS <= parsed.keys()):
+        return None
+    return parsed
+
+
+def classify_direct_egress_probe(stdout: str, returncode: int) -> tuple[bool, str]:
+    """
+    Validate that a direct-egress probe from the internal network failed specifically due to kernel
+    network/host routing denial (`ENETUNREACH` or `EHOSTUNREACH`), rejecting missing, malformed, DNS,
+    TLS, HTTP, or non-routing socket outcomes.
+    """
+    if returncode != 0:
+        return False, f"probe container failed to execute cleanly (exit {returncode})"
+    payload = parse_probe_json(stdout, returncode)
+    if payload is None:
+        return False, "probe output was missing or malformed JSON"
+
+    phase = payload.get("phase")
+    status = payload.get("status")
+    errno_name = payload.get("errno_name")
+    exc_type = payload.get("exc_type")
+    http_status = payload.get("http_status")
+
+    if status == "allowed" or phase == "http":
+        return False, f"direct egress reached HTTP layer (status={http_status})"
+    if phase == "dns":
+        return False, f"probe failed during DNS lookup ({exc_type}/{errno_name}), not routing isolation"
+    if phase == "tls":
+        return False, f"probe reached TLS handshake ({exc_type}), indicating TCP route leaked"
+    if phase == "connect" and status == "error" and isinstance(errno_name, str) and errno_name in ROUTING_DENIAL_ERRNOS:
+        return True, f"kernel routing denial confirmed ({errno_name})"
+    return (
+        False,
+        f"unexpected connection outcome (phase={phase!r}, status={status!r}, errno={errno_name!r}, exc={exc_type!r})",
+    )
+
+
+def run_direct_probe(url: str, *, network: str, timeout: float = 4.0) -> subprocess.CompletedProcess[str]:
+    """Run `_DIRECT_PROBE_SCRIPT` with proxies disabled from `network` against `url`."""
+    return run_cmd(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            network,
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "-e",
+            "HTTPS_PROXY=",
+            "-e",
+            "HTTP_PROXY=",
+            "--entrypoint",
+            "python",
+            AUTH_IMAGE,
+            "-c",
+            _DIRECT_PROBE_SCRIPT,
+            url,
+            str(timeout),
+        ],
+        check=False,
+    )
 
 
 def fetch_outcome(url: str, *, use_proxy: bool, timeout: float = 8.0) -> str:
@@ -185,7 +321,7 @@ def denied_by_squid(outcome: str) -> bool:
 
 
 def cleanup() -> None:
-    for name in (AUTH_CONTAINER, SQUID_CONTAINER):
+    for name in (AUTH_CONTAINER, SQUID_CONTAINER, OUTSIDE_TARGET_CONTAINER):
         run_cmd(["docker", "rm", "-f", name], check=False)
     for net in (INTERNAL_NET, EXT_NET):
         run_cmd(["docker", "network", "rm", net], check=False)
@@ -449,9 +585,43 @@ def main() -> int:
             if len(verified_data["audit"]) != 1 or json.loads(verified_data["audit"][0])["decision"] != "allow":
                 raise RuntimeError(f"Expected 1 appended allow audit event, got: {verified_data['audit']}")
 
-            print("[4/5] Starting isolated internal network + Squid egress proxy...")
+            print("[4/5] Starting isolated internal network, outside target listener, and Squid egress proxy...")
             run_cmd(["docker", "network", "create", "--internal", "--subnet", INTERNAL_SUBNET, INTERNAL_NET])
             run_cmd(["docker", "network", "create", EXT_NET])
+            run_cmd(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    OUTSIDE_TARGET_CONTAINER,
+                    "--network",
+                    EXT_NET,
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "--entrypoint",
+                    "python",
+                    AUTH_IMAGE,
+                    "-c",
+                    _OUTSIDE_LISTENER_SCRIPT,
+                ]
+            )
+            outside_ip = run_cmd(
+                [
+                    "docker",
+                    "inspect",
+                    "-f",
+                    "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                    OUTSIDE_TARGET_CONTAINER,
+                ]
+            ).stdout.strip()
+            if not outside_ip:
+                raise RuntimeError("Could not determine IPv4 address of controlled outside listener container.")
+            outside_url = f"http://{outside_ip}:8080/healthz"
+
             run_cmd(
                 [
                     "docker",
@@ -484,10 +654,23 @@ def main() -> int:
             time.sleep(3)
 
             print("[5/5] Probing internal-network isolation, the allowlist, and private-address blocking...")
-            # 1. Without the proxy there is no route out: the request fails before any HTTP exchange.
-            direct = fetch_outcome("https://docs.python.org/", use_proxy=False, timeout=4)
-            if direct == "ALLOWED" or direct.startswith("HTTP "):
-                raise RuntimeError(f"Direct internet connection from the internal network got through: {direct}")
+            # 1a. Positive control: confirm the controlled outside listener is live on EXT_NET.
+            ext_probe = run_direct_probe(outside_url, network=EXT_NET, timeout=4.0)
+            ext_parsed = parse_probe_json(ext_probe.stdout, ext_probe.returncode)
+            if not ext_parsed or ext_parsed.get("status") != "allowed" or ext_parsed.get("http_status") != 200:
+                raise RuntimeError(
+                    f"Controlled outside target {outside_url} was not reachable on {EXT_NET}: "
+                    f"rc={ext_probe.returncode} stdout={ext_probe.stdout!r} stderr={ext_probe.stderr!r}"
+                )
+
+            # 1b. Isolation check: from INTERNAL_NET without Squid, kernel routing must reject direct egress.
+            direct_probe = run_direct_probe(outside_url, network=INTERNAL_NET, timeout=4.0)
+            isolated_ok, isolated_reason = classify_direct_egress_probe(direct_probe.stdout, direct_probe.returncode)
+            if not isolated_ok:
+                raise RuntimeError(
+                    f"Direct egress check from {INTERNAL_NET} to {outside_url} failed ({isolated_reason}): "
+                    f"stdout={direct_probe.stdout!r} stderr={direct_probe.stderr!r}"
+                )
 
             # 2. Through Squid, each of these must be refused by Squid itself (a 403), not merely fail somehow.
             for url in (

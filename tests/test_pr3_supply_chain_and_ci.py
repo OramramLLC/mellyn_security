@@ -323,11 +323,13 @@ class TestLockfileSourceAndHashIntegrity(unittest.TestCase):
                 self.assertEqual(vd.main(["--root", tmp, "--online", "--allowlist", missing]), 1)
 
     def test_workflows_take_the_allowlist_from_the_pull_requests_base(self) -> None:
+        helper_text = (REPO_ROOT / "scripts" / "ci_guardrails.py").read_text(encoding="utf-8")
+        self.assertIn("HEAD^1:.mellyn-allowlist.toml", helper_text)
+        self.assertIn('"--allowlist"', helper_text)
         for workflow in ("ai-security-gate.yml", "mellyn-reusable-ai-security-gate.yml"):
             text = (REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
             with self.subTest(workflow=workflow):
-                self.assertIn("git show HEAD^1:.mellyn-allowlist.toml", text)
-                self.assertIn('--allowlist "$allowlist"', text)
+                self.assertIn("ci_guardrails.py", text)
                 self.assertIn("fetch-depth: 2", text)
 
 

@@ -10,93 +10,161 @@ on:
 permissions:
   contents: read
 
-# Third-party actions are pinned to full commit SHAs (tags can be moved; see the
-# tj-actions/changed-files compromise). Python tools are pinned to exact versions.
-# Bump both deliberately, e.g. with Dependabot or `pre-commit autoupdate --freeze`.
+# Security design:
+# - Third-party actions are pinned to full 40-char commit SHAs; Gitleaks is SHA-256 verified by scripts/ci_guardrails.py.
+# - Every Python tool/test install uses `--require-hashes --no-deps` against dedicated lockfiles under `deploy/`.
+# - Required baseline jobs (`secrets`, `sast-and-supply-chain`) evaluate `candidate/` using the scanners, rules,
+#   verifier scripts, and `.mellyn-allowlist.toml` checked out from `baseline/` (the target `main` commit), so a PR
+#   cannot weaken the rules or scripts that judge it. Pair with GitHub branch protection / rulesets requiring
+#   CODEOWNERS review on `.github/workflows/`.
+# - A separate `candidate-guardrails` job validates any proposed changes to Semgrep rules, Gitleaks config,
+#   verifier scripts, and scanner lockfiles before merge.
 
 jobs:
   secrets:
+    # Keep this name: the `main` ruleset requires a check with exactly this name.
     name: Secret scan (Gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout candidate tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: candidate
           fetch-depth: 0
           persist-credentials: false
 
-      # The Gitleaks CLI rather than gitleaks-action, so `# gitleaks:allow` comments and a .gitleaksignore added by
-      # the change under review are not honored. Pinned by version and SHA-256 of the release archive.
-      - name: Install pinned Gitleaks (checksum verified)
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-        run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gitleaks.tgz" \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum --check --strict
-          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      - name: Checkout baseline guardrails
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: baseline
+          sparse-checkout: |
+            .gitleaks.toml
+            scripts
+          persist-credentials: false
 
-      - name: Gitleaks (full history, suppressions ignored)
+      - name: Install pinned Gitleaks and scan candidate history with baseline config
+        env:
+          BASELINE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
-          # Gitleaks reads .gitleaksignore from --gitleaks-ignore-path AND from the scanned directory's root.
-          rm -f .gitleaksignore
-          mkdir -p "$RUNNER_TEMP/no-gitleaksignore"
-          "$RUNNER_TEMP/gitleaks" git . --config .gitleaks.toml --ignore-gitleaks-allow \
-            --gitleaks-ignore-path "$RUNNER_TEMP/no-gitleaksignore" --redact --no-banner --exit-code 1
+          if ! printf '%s' "$BASELINE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid baseline commit SHA '$BASELINE_SHA'; refusing to run."
+            exit 1
+          fi
+          helper="baseline/scripts/ci_guardrails.py"
+          if [ ! -f "$helper" ]; then helper="candidate/scripts/ci_guardrails.py"; fi
+          python3 "$helper" install-gitleaks --dest-dir "$RUNNER_TEMP/gitleaks-bin"
+          python3 "$helper" run-gitleaks \
+            --gitleaks-bin "$RUNNER_TEMP/gitleaks-bin/gitleaks" \
+            --target candidate \
+            --guardrails baseline \
+            --mode full
 
   sast-and-supply-chain:
+    # Keep this name: the `main` ruleset requires a check with exactly this name.
     name: SAST, lint, agent rules & dependency verification
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout candidate tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2 # the PR's base commit, for the allowlist
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Checkout baseline guardrails
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: baseline
+          sparse-checkout: |
+            .mellyn-allowlist.toml
+            .semgrep
+            deploy
+            pyproject.toml
+            scripts
           persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
-      - name: Install pinned security tooling
-        run: python -m pip install --disable-pip-version-check "semgrep==1.182.0" "ruff==0.17.1"
+      - name: Install hash-locked SAST & lint tooling
+        run: |
+          lock="baseline/deploy/requirements-ci-scanners.lock"
+          if [ ! -f "$lock" ]; then lock="candidate/deploy/requirements-ci-scanners.lock"; fi
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps -r "$lock"
 
-      - name: Verify dependencies (existence, age, pinning, lockfile hashes, non-registry sources)
+      - name: Run baseline dependency, agent-rule, and Semgrep gate against candidate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASELINE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          if ! printf '%s' "$BASELINE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid baseline commit SHA '$BASELINE_SHA'; refusing to run."
+            exit 1
+          fi
+          helper="baseline/scripts/ci_guardrails.py"
+          if [ ! -f "$helper" ]; then helper="candidate/scripts/ci_guardrails.py"; fi
+          python "$helper" run-suite \
+            --baseline baseline \
+            --candidate candidate \
+            --online \
+            --event-name "$EVENT_NAME" \
+            --run-semgrep \
+            --exclude-self-fixtures
+
+      # With --config, Ruff ignores every pyproject.toml/ruff.toml in the candidate (so a PR cannot add
+      # per-file-ignores for its own code) and resolves the config's relative paths from the working directory.
+      - name: Ruff (lint & format check on candidate, with the baseline configuration)
+        working-directory: candidate
+        run: |
+          ruff check --config ../baseline/pyproject.toml .
+          ruff format --check --config ../baseline/pyproject.toml .
+
+  candidate-guardrails:
+    name: Candidate guardrail & Semgrep fixture self-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install candidate hash-locked SAST & lint tooling
+        run: >
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps
+          -r candidate/deploy/requirements-ci-scanners.lock
+
+      - name: Test custom Semgrep rule fixtures
+        working-directory: candidate/.semgrep
+        run: semgrep --test --metrics=off .
+
+      - name: Validate candidate guardrails & Gitleaks config on pull requests
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          # Exemptions on a pull request come from its BASE commit (the merge commit's first parent), so the
-          # change under review cannot exempt its own dependencies. If HEAD is not a two-parent merge commit,
-          # no exemptions apply. On pushes the reviewed, merged file is used.
-          allowlist="$RUNNER_TEMP/mellyn-allowlist.toml"
-          rm -f "$allowlist"
-          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
-            if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]; then
-              git show HEAD^1:.mellyn-allowlist.toml > "$allowlist" 2>/dev/null || rm -f "$allowlist"
-            fi
-          elif [ -f .mellyn-allowlist.toml ]; then
-            cp .mellyn-allowlist.toml "$allowlist"
-          fi
-          python scripts/verify_dependencies.py --online --allowlist "$allowlist"
-
-      - name: Check agent rules files are in sync and free of hidden characters
-        run: python scripts/sync_agent_rules.py --check
-
-      - name: Ruff (lint, including bandit security rules)
-        run: ruff check .
-
-      - name: Test the custom Semgrep rules
-        working-directory: .semgrep # semgrep --test skips dot-directories when run from the root
-        run: semgrep --test --metrics=off .
-
-      - name: Replace Semgrep ignore files (the change under review must not be able to hide itself)
-        run: |
-          find . -name .semgrepignore -not -path './.git/*' -print -delete
-          printf '%s\n' 'node_modules/' '.venv/' 'venv/' 'vendor/' 'dist/' 'build/' '*.min.js' > .semgrepignore
-
-      - name: Semgrep scan with OWASP AI rules
-        run: >
-          semgrep scan --config .semgrep/owasp-ai-code-rules.yaml --exclude .semgrep
-          --disable-nosem --error --metrics=off
+          python candidate/scripts/ci_guardrails.py install-gitleaks --dest-dir "$RUNNER_TEMP/gitleaks-bin"
+          python candidate/scripts/ci_guardrails.py run-gitleaks \
+            --gitleaks-bin "$RUNNER_TEMP/gitleaks-bin/gitleaks" \
+            --target candidate \
+            --guardrails candidate \
+            --mode full
+          python candidate/scripts/ci_guardrails.py run-suite \
+            --baseline candidate \
+            --candidate candidate \
+            --use-candidate-guardrails \
+            --online \
+            --event-name "$EVENT_NAME" \
+            --run-semgrep \
+            --exclude-self-fixtures
 
   tests:
     name: Tests (Python ${{ matrix.python-version }})
@@ -113,15 +181,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # API test dependencies live in this job only: current FastAPI needs a newer opentelemetry-api than
-      # the Semgrep pin in the job above allows. Versions are at least a month old as a supply-chain cooldown;
-      # starlette is pinned too so the transitive dependency cannot float to a brand-new release.
-      - name: Install pinned API test dependencies
-        run: python -m pip install --disable-pip-version-check "fastapi==0.159.1" "starlette==1.9.0" "httpx==0.28.1"
+      # Hash-locked API test environment kept separate from deploy/requirements-ci-scanners.lock so
+      # FastAPI's opentelemetry-api range and Semgrep's opentelemetry-api~=1.37.0 pin stay isolated.
+      - name: Install hash-locked API test dependencies
+        run: >
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps
+          -r deploy/requirements-ci-tests.lock
 
       - name: Run tests
         env:
-          MELLYN_REQUIRE_API_TESTS: "1" # fail instead of skipping if the API test dependencies are missing
+          MELLYN_REQUIRE_API_TESTS: "1"
         run: python -m unittest discover -s tests -v
 
   container-and-egress:
