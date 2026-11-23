@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from mellyn.audit import AuditLogger
+from mellyn.audit import MAX_TAINT_ENTRY_CHARS, AuditLogger, format_taint_entry, hash_untrusted_identifier, redact_text
 from mellyn.egress import _CONTROL_CHARACTERS, EgressValidator, WorkspacePathGuard
 from mellyn.models import (
     ApprovalGrant,
@@ -41,6 +42,7 @@ MAX_GRANT_TTL_SECONDS = 86400
 MAX_GRANT_USES = 100
 DEFAULT_SESSION_TTL_SECONDS = 86400
 DEFAULT_MAX_SESSIONS = 10_000
+DEFAULT_MAX_TAINT_SAMPLE = 16
 
 
 class SessionLimitError(RuntimeError):
@@ -51,7 +53,10 @@ class SessionLimitError(RuntimeError):
 class _SessionState:
     created_at: datetime
     last_seen_at: datetime
-    taints: list[TaintSource] = field(default_factory=list)
+    tainted: bool = False
+    taint_count: int = 0
+    taint_sample: deque[TaintSource] = field(default_factory=deque)
+    taint_entries: deque[str] = field(default_factory=deque)
 
 
 class Authorizer:
@@ -84,6 +89,7 @@ class Authorizer:
         audit_logger: AuditLogger | None = None,
         session_ttl_seconds: int | None = DEFAULT_SESSION_TTL_SECONDS,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
+        max_taint_sample: int = DEFAULT_MAX_TAINT_SAMPLE,
     ) -> None:
         # session_ttl_seconds=None: sessions never expire (the stdio gateway's single session lives as long
         # as the process, so an idle client is not locked out after a day).
@@ -91,12 +97,15 @@ class Authorizer:
             raise ValueError("session_ttl_seconds must be positive or None.")
         if max_sessions <= 0:
             raise ValueError("max_sessions must be positive.")
+        if max_taint_sample <= 0:
+            raise ValueError("max_taint_sample must be positive.")
         self.policy = PolicyEngine(policy_config)
         self.egress = EgressValidator(self.policy.config.allowed_egress_domains)
         self.path_guard = WorkspacePathGuard(workspace_root, self.policy.config.protected_paths)
         self.audit = audit_logger or AuditLogger()
         self.session_ttl_seconds = session_ttl_seconds
         self.max_sessions = max_sessions
+        self.max_taint_sample = max_taint_sample
         # FastAPI runs sync handlers in a thread pool; one lock keeps taint and grant use atomic.
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionState] = {}
@@ -130,7 +139,12 @@ class Authorizer:
             # end other agents' active sessions just by opening new ones.
             if len(self._sessions) >= self.max_sessions:
                 raise SessionLimitError(f"Session limit ({self.max_sessions}) reached; try again later.")
-            self._sessions[session_id] = _SessionState(created_at=created, last_seen_at=created)
+            self._sessions[session_id] = _SessionState(
+                created_at=created,
+                last_seen_at=created,
+                taint_sample=deque(maxlen=self.max_taint_sample),
+                taint_entries=deque(maxlen=self.max_taint_sample),
+            )
         return session_id
 
     def has_session(self, session_id: str, *, now: datetime | None = None) -> bool:
@@ -138,14 +152,47 @@ class Authorizer:
             self._prune_sessions_locked(now or utc_now())
             return session_id in self._sessions
 
+    def _safe_origin_for_request(self, request: ToolCallRequest) -> str:
+        if request.mcp_server is None:
+            srv_part = "local"
+        elif self.policy.is_known_mcp_server(request.mcp_server):
+            srv_part = redact_text(request.mcp_server)[:64]
+        else:
+            srv_part = hash_untrusted_identifier("untrusted_srv", request.mcp_server)
+
+        if self.policy.is_known_tool(request.tool_name, request.mcp_server):
+            tool_part = redact_text(request.tool_name)[:64]
+        else:
+            tool_part = hash_untrusted_identifier("untrusted_tool", request.tool_name)
+        return f"{srv_part}:{tool_part}"
+
+    def _append_taint_locked(self, state: _SessionState, source: TaintSource, check_time: datetime) -> None:
+        state.last_seen_at = check_time
+        state.tainted = True
+        state.taint_count += 1
+        sanitized = TaintSource(
+            source_type=redact_text(source.source_type)[:64],
+            origin=redact_text(source.origin)[:MAX_TAINT_ENTRY_CHARS],
+            recorded_at=source.recorded_at,
+        )
+        state.taint_sample.append(sanitized)
+        state.taint_entries.append(format_taint_entry(sanitized))
+
     def mark_tainted(self, session_id: str, source: TaintSource, *, now: datetime | None = None) -> None:
-        """Record that untrusted external content has entered the session. Unknown sessions raise KeyError."""
+        """Record that untrusted external content has entered the session and emit a durable audit event."""
         check_time = now or utc_now()
         with self._lock:
             self._prune_sessions_locked(check_time)
             state = self._session(session_id)
-            state.last_seen_at = check_time
-            state.taints.append(source)
+            self._append_taint_locked(state, source, check_time)
+            taint_count = state.taint_count
+            taint_entries = tuple(state.taint_entries)
+        self.audit.record_taint(
+            session_id=session_id,
+            taint_count=taint_count,
+            taint_sources=taint_entries,
+            reason=f"Session tainted by '{taint_entries[-1]}'.",
+        )
 
     def record_tool_result_taint(self, request: ToolCallRequest, *, now: datetime | None = None) -> bool:
         """
@@ -153,29 +200,46 @@ class Authorizer:
 
         Used by `MCPGateway` (which calls `authorize(..., record_taint_on_allow=False)`) so failed
         or timed-out downstream requests do not taint the session with content that never arrived.
+        Emits a durable taint audit event so a session ending immediately still leaves JSONL evidence.
         """
         if not self.policy.brings_untrusted_content(request):
             return False
         check_time = now or utc_now()
-        origin = f"{request.mcp_server or 'local'}:{request.tool_name}"
+        origin = self._safe_origin_for_request(request)
         with self._lock:
             self._prune_sessions_locked(check_time)
             state = self._sessions.get(request.session_id)
             if state is None:
                 return False
-            state.last_seen_at = check_time
-            state.taints.append(TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time))
+            self._append_taint_locked(
+                state,
+                TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time),
+                check_time,
+            )
+            taint_count = state.taint_count
+            taint_entries = tuple(state.taint_entries)
+        self.audit.record_taint(
+            session_id=request.session_id,
+            taint_count=taint_count,
+            taint_sources=taint_entries,
+            reason=f"Session tainted by the result of '{origin}'.",
+        )
         return True
 
     def is_tainted(self, session_id: str) -> bool:
         with self._lock:
             state = self._sessions.get(session_id)
-            return bool(state and state.taints)
+            return bool(state and state.tainted)
+
+    def get_taint_count(self, session_id: str) -> int:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            return state.taint_count if state else 0
 
     def get_taint_sources(self, session_id: str) -> tuple[TaintSource, ...]:
         with self._lock:
             state = self._sessions.get(session_id)
-            return tuple(state.taints) if state else ()
+            return tuple(state.taint_sample) if state else ()
 
     def _session(self, session_id: str) -> _SessionState:
         state = self._sessions.get(session_id)
@@ -274,17 +338,35 @@ class Authorizer:
         # 0. Hard boundary: the session must have been issued by this authorizer
         if state is None:
             reason = "Unknown session ID; sessions must be created by the authorizer (fails closed after restart)."
-            return self._finalize(request, Decision.DENY, risk_tier, False, (), [reason])
+            return self._finalize(
+                request,
+                Decision.DENY,
+                risk_tier,
+                False,
+                (),
+                [reason],
+                taint_count=0,
+                session_known=False,
+            )
 
         state.last_seen_at = check_time
-        tainted = bool(state.taints)
-        taint_sources = tuple(state.taints)
+        tainted = state.tainted
+        taint_entries = tuple(state.taint_entries)
+        taint_count = state.taint_count
         reasons: list[str] = []
         policy_id: str | None = None
         grant_id: str | None = None
 
         def deny(reason: str) -> AuthorizationResult:
-            return self._finalize(request, Decision.DENY, risk_tier, tainted, taint_sources, [*reasons, reason])
+            return self._finalize(
+                request,
+                Decision.DENY,
+                risk_tier,
+                tainted,
+                taint_entries,
+                [*reasons, reason],
+                taint_count=taint_count,
+            )
 
         # 0b. Hard boundary: arguments must be a valid RFC 8259 JSON mapping
         if not isinstance(request.arguments, dict):
@@ -302,7 +384,7 @@ class Authorizer:
         # 1b. Hard boundary: MCP operation identity separation (tools/call vs resources/read)
         op_method = effective_mcp_method(request.tool_name, request.mcp_method)
         if request.mcp_method == "tools/call" and (request.tool_name == RESOURCE_READ_TOOL or "/" in request.tool_name):
-            return deny(f"Tool name '{request.tool_name}' is reserved and cannot be invoked via tools/call.")
+            return deny("Reserved MCP operation name cannot be invoked via tools/call.")
         if op_method == "resources/read" and request.tool_name != RESOURCE_READ_TOOL:
             return deny("resources/read requests must use the reserved resource-read operation identity.")
 
@@ -347,7 +429,14 @@ class Authorizer:
         if matched_rule and matched_rule.effect == Decision.DENY:
             reasons.append(f"Denied by scoped policy '{matched_rule.rule_id}': {matched_rule.description}")
             return self._finalize(
-                request, Decision.DENY, risk_tier, tainted, taint_sources, reasons, policy_id=matched_rule.rule_id
+                request,
+                Decision.DENY,
+                risk_tier,
+                tainted,
+                taint_entries,
+                reasons,
+                policy_id=matched_rule.rule_id,
+                taint_count=taint_count,
             )
 
         # 5. Base decision from risk tier + taint state + scoped allow
@@ -376,8 +465,14 @@ class Authorizer:
             # The result of this call will enter the agent's context: taint the session (the gateway defers
             # this to record_tool_result_taint, once it knows whether the server actually replied).
             if record_taint_on_allow and self.policy.brings_untrusted_content(request):
-                origin = f"{request.mcp_server or 'local'}:{request.tool_name}"
-                state.taints.append(TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time))
+                origin = self._safe_origin_for_request(request)
+                self._append_taint_locked(
+                    state,
+                    TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time),
+                    check_time,
+                )
+                taint_entries = tuple(state.taint_entries)
+                taint_count = state.taint_count
                 reasons.append(f"Session tainted by the result of '{origin}'.")
         elif grant_id is not None:
             grant_id = None
@@ -387,10 +482,11 @@ class Authorizer:
             decision,
             risk_tier,
             tainted,
-            taint_sources,
+            taint_entries,
             reasons,
             policy_id=policy_id,
             grant_id=grant_id,
+            taint_count=taint_count,
         )
 
     def _enforce_capability(self, capability: ToolCapability, arguments: dict[str, Any]) -> tuple[bool, list[str]]:
@@ -445,7 +541,8 @@ class Authorizer:
         """Path-like arguments of a tool with no capability binding, checked as writes (strictest)."""
         notes: list[str] = []
         for name, value in arguments.items():
-            if name.lower() not in UNBOUND_PATH_ARG_NAMES:
+            canonical_arg = name.lower()
+            if canonical_arg not in UNBOUND_PATH_ARG_NAMES:
                 continue
             values = value if isinstance(value, list | tuple) else [value]
             for item in values:
@@ -453,8 +550,8 @@ class Authorizer:
                     continue  # not a path string; a bound capability would reject it, a guess should not
                 ok, reason = self.path_guard.validate_path(item, is_write=True)
                 if not ok:
-                    return False, [f"Unbound tool argument '{name}': {reason}"]
-                notes.append(f"Unbound tool argument '{name}': {reason}")
+                    return False, [f"Unbound tool argument '{canonical_arg}': {reason}"]
+                notes.append(f"Unbound tool argument '{canonical_arg}': {reason}")
         return True, notes
 
     def _check_resource_uri(self, uri: object) -> tuple[bool, str]:
@@ -480,9 +577,9 @@ class Authorizer:
         if has_colon_port and (port is None or port <= 0):
             return False, "Resource URI specifies an empty or invalid port."
         if parsed.scheme.lower() != "file":
-            return True, f"Resource URI scheme '{parsed.scheme}' (non-file); risk tier decides."
+            return True, "Non-file resource URI scheme; risk tier decides."
         if port is not None or parsed.netloc.lower() not in ("", "localhost"):
-            return False, f"file:// URI on remote host '{parsed.netloc}' is denied."
+            return False, "file:// URI on remote host or with port is denied."
         try:
             local_path = url2pathname(parsed.path)
         except (OSError, ValueError):
@@ -564,12 +661,16 @@ class Authorizer:
         decision: Decision,
         risk_tier: RiskTier,
         tainted: bool,
-        taint_sources: tuple[TaintSource, ...],
+        taint_sources: tuple[TaintSource | str, ...],
         reasons: list[str],
         *,
         policy_id: str | None = None,
         grant_id: str | None = None,
+        taint_count: int = 0,
+        session_known: bool = True,
     ) -> AuthorizationResult:
+        server_known = self.policy.is_known_mcp_server(request.mcp_server)
+        tool_known = server_known and self.policy.is_known_tool(request.tool_name, request.mcp_server)
         event = self.audit.record(
             session_id=request.session_id,
             tool_name=request.tool_name,
@@ -582,6 +683,10 @@ class Authorizer:
             reasons=tuple(reasons),
             policy_id=policy_id,
             grant_id=grant_id,
+            taint_count=taint_count,
+            session_known=session_known,
+            tool_known=tool_known,
+            server_known=server_known,
         )
         return AuthorizationResult(
             decision=decision,

@@ -30,7 +30,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 import urllib.error
@@ -197,6 +200,7 @@ class LockedPackage(NamedTuple):
     version: str
     hashes: tuple[str, ...] = ()  # "sha256:<hex>" (PyPI) or "sha512-<base64>" (npm integrity)
     alias: str | None = None  # npm: the name it is installed under, when that differs from `name`
+    install_path: str | None = None  # lockfile occurrence path (e.g. "node_modules/a/node_modules/pkg")
 
 
 # pip options that change where packages come from. In a requirements file or lockfile they would let the
@@ -276,51 +280,58 @@ def _logical_lines(path: Path) -> list[str]:
     return lines
 
 
-def parse_requirements_txt(path: Path) -> list[str]:
-    """Extract requirement strings from a requirements file. Options are reported by requirements_txt_options."""
-    specs: list[str] = []
-    for line in _logical_lines(path):
-        if _option_name(line.split()[0]) in _EDITABLE_OPTIONS:
-            specs.append(line)  # reported as non-registry by parse_python_spec
-            continue
-        if line.startswith("-"):
-            continue
-        specs.append(line.split(" --hash", 1)[0].strip())
-    return specs
-
-
-def requirements_txt_options(path: Path, root: Path) -> tuple[list[Path], list[str]]:
+def read_requirements_txt(path: Path, root: Path) -> tuple[list[str], list[Path], list[str]]:
     """
-    Check a requirements file's option lines. Returns `(included files to verify too, issues)`.
+    Read a requirements file in a single pass, returning `(specs, included_files, option_issues)`.
 
     Index and find-links options are rejected (they redirect where packages come from). `-r`/`-c` includes
     are followed so the included file is verified as well, but only for local files inside the repository.
     """
+    specs: list[str] = []
     includes: list[Path] = []
     issues: list[str] = []
+    resolved_root = root.resolve()
     for line in _logical_lines(path):
-        if not line.startswith("-"):
-            continue
         opt = _option_name(line.split()[0])
-        if opt in _INDEX_OPTIONS:
-            if opt in ("-i", "--index-url") and _option_value(line) in _PYPI_INDEX_URLS:
-                continue
-            issues.append(f"[NON-REGISTRY SOURCE] '{opt}' in {path.name} changes the package index; not allowed.")
-        elif opt in _INCLUDE_OPTIONS:
-            target = _option_value(line)
-            if "://" in target:
-                issues.append(f"[NON-REGISTRY SOURCE] '{opt} {target}' in {path.name} includes a remote file.")
-                continue
-            included = (path.parent / target).resolve()
-            try:
-                included.relative_to(root.resolve())
-            except ValueError:
-                issues.append(f"[NON-REGISTRY SOURCE] '{opt} {target}' in {path.name} points outside the repository.")
-                continue
-            if not included.is_file():
-                issues.append(f"[UNPARSEABLE] '{opt} {target}' in {path.name}: included file does not exist.")
-                continue
-            includes.append(included)
+        if opt in _EDITABLE_OPTIONS:
+            specs.append(line)  # reported as non-registry by _check_python_specs / parse_python_spec
+            continue
+        if line.startswith("-"):
+            if opt in _INDEX_OPTIONS:
+                if opt in ("-i", "--index-url") and _option_value(line) in _PYPI_INDEX_URLS:
+                    continue
+                issues.append(f"[NON-REGISTRY SOURCE] '{opt}' in {path.name} changes the package index; not allowed.")
+            elif opt in _INCLUDE_OPTIONS:
+                target = _option_value(line)
+                if "://" in target:
+                    issues.append(f"[NON-REGISTRY SOURCE] '{opt} {target}' in {path.name} includes a remote file.")
+                    continue
+                included = (path.parent / target).resolve()
+                try:
+                    included.relative_to(resolved_root)
+                except ValueError:
+                    issues.append(
+                        f"[NON-REGISTRY SOURCE] '{opt} {target}' in {path.name} points outside the repository."
+                    )
+                    continue
+                if not included.is_file():
+                    issues.append(f"[UNPARSEABLE] '{opt} {target}' in {path.name}: included file does not exist.")
+                    continue
+                includes.append(included)
+            continue
+        specs.append(line.split(" --hash", 1)[0].strip())
+    return specs, includes, issues
+
+
+def parse_requirements_txt(path: Path) -> list[str]:
+    """Extract requirement strings from a requirements file."""
+    specs, _, _ = read_requirements_txt(path, path.parent)
+    return specs
+
+
+def requirements_txt_options(path: Path, root: Path) -> tuple[list[Path], list[str]]:
+    """Extract `(included files, option issues)` from a requirements file."""
+    _, includes, issues = read_requirements_txt(path, root)
     return includes, issues
 
 
@@ -429,7 +440,6 @@ def parse_package_lock_json(path: Path) -> tuple[list[LockedPackage], list[str]]
 
     locked: list[LockedPackage] = []
     issues: list[str] = []
-    seen: set[tuple[str, str]] = set()
     for pkg_path, meta in packages.items():
         if pkg_path == "" or not isinstance(meta, dict) or meta.get("link") is True:
             continue
@@ -441,18 +451,19 @@ def parse_package_lock_json(path: Path) -> tuple[list[LockedPackage], list[str]]
         version = meta.get("version")
         resolved = str(meta.get("resolved", ""))
         if resolved and not resolved.startswith(f"https://registry.npmjs.org/{real_name}/-/"):
-            issues.append(f"[NON-REGISTRY SOURCE] npm '{label}' in {path.name} resolves from '{resolved}'.")
+            issues.append(
+                f"[NON-REGISTRY SOURCE] npm '{label}' at '{pkg_path}' in {path.name} resolves from '{resolved}'."
+            )
             continue
         if not isinstance(version, str) or not NPM_EXACT_RE.match(version.strip()):
-            issues.append(f"[UNPINNED LOCK] npm '{label}' in {path.name} lacks an exact semver version.")
+            issues.append(
+                f"[UNPINNED LOCK] npm '{label}' at '{pkg_path}' in {path.name} lacks an exact semver version."
+            )
             continue
         integrity = meta.get("integrity")
         hashes = (integrity,) if isinstance(integrity, str) and integrity.startswith("sha512-") else ()
-        pair = (real_name, version.strip())
-        if pair not in seen:
-            seen.add(pair)
-            alias = installed_as if installed_as != real_name else None
-            locked.append(LockedPackage(real_name, version.strip(), hashes, alias))
+        alias = installed_as if installed_as != real_name else None
+        locked.append(LockedPackage(real_name, version.strip(), hashes, alias, pkg_path))
     return locked, issues
 
 
@@ -540,29 +551,49 @@ def npm_release_integrity(pkg_name: str, version: str, timeout: float) -> str | 
     return integrity if isinstance(integrity, str) else None
 
 
-def verify_locked_hashes(pkg: LockedPackage, ecosystem: str, timeout: float = 10.0) -> list[str]:
+def verify_locked_hashes(
+    pkg: LockedPackage,
+    ecosystem: str,
+    timeout: float = 10.0,
+    *,
+    _published_cache: dict[tuple[str, str, str], set[str] | None | Exception] | None = None,
+) -> list[str]:
     """
     Every hash a lockfile pins must be one the registry itself publishes for that exact release. Otherwise
     the lock can name a real, old package while installing a different artifact. Fails closed.
     """
-    label = f"{pkg.alias} (alias of {pkg.name})" if pkg.alias else pkg.name
+    base_label = f"{pkg.alias} (alias of {pkg.name})" if pkg.alias else pkg.name
+    loc = f" at '{pkg.install_path}'" if pkg.install_path else ""
+    label = f"{base_label}{loc}"
     if not pkg.hashes:
-        return [f"[MISSING HASH] {ecosystem} '{label}=={pkg.version}' has no artifact hash to verify."]
-    try:
-        if ecosystem == "pypi":
-            published = pypi_release_sha256s(pkg.name, pkg.version, timeout)
-        else:
-            integrity = npm_release_integrity(pkg.name, pkg.version, timeout)
-            published = {integrity} if integrity else None
-    except (OSError, ValueError, KeyError) as exc:
-        return [f"[UNVERIFIED] {ecosystem} '{label}=={pkg.version}' hashes: {exc} (failing closed)."]
+        return [f"[MISSING HASH] {ecosystem} '{base_label}=={pkg.version}'{loc} has no artifact hash to verify."]
+    norm_name = normalize_pypi_name(pkg.name) if ecosystem == "pypi" else pkg.name.lower()
+    cache_key = (ecosystem, norm_name, pkg.version)
+    if _published_cache is not None and cache_key in _published_cache:
+        cached = _published_cache[cache_key]
+        if isinstance(cached, Exception):
+            return [f"[UNVERIFIED] {ecosystem} '{base_label}=={pkg.version}'{loc} hashes: {cached} (failing closed)."]
+        published = cached
+    else:
+        try:
+            if ecosystem == "pypi":
+                published = pypi_release_sha256s(pkg.name, pkg.version, timeout)
+            else:
+                integrity = npm_release_integrity(pkg.name, pkg.version, timeout)
+                published = {integrity} if integrity else None
+        except (OSError, ValueError, KeyError) as exc:
+            if _published_cache is not None:
+                _published_cache[cache_key] = exc
+            return [f"[UNVERIFIED] {ecosystem} '{base_label}=={pkg.version}'{loc} hashes: {exc} (failing closed)."]
+        if _published_cache is not None:
+            _published_cache[cache_key] = published
     if not published:
         return [f"[MISSING VERSION] {ecosystem} package '{label}' has no published release '{pkg.version}'."]
     unknown = [h for h in pkg.hashes if h not in published]
     if unknown:
         return [
-            f"[HASH MISMATCH] {ecosystem} '{label}=={pkg.version}' pins {len(unknown)} hash(es) the registry does "
-            f"not publish for that release (first: {unknown[0][:23]}...)."
+            f"[HASH MISMATCH] {ecosystem} '{base_label}=={pkg.version}'{loc} pins {len(unknown)} hash(es) the registry "
+            f"does not publish for that release (first: {unknown[0][:23]}...)."
         ]
     return []
 
@@ -662,6 +693,109 @@ def _check_python_specs(
     return issues
 
 
+_IGNORED_DISCOVERY_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "__pycache__",
+        ".ruff_cache",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".tox",
+        ".nox",
+        "dist",
+        "build",
+        ".next",
+    }
+)
+# With git, its own ignore rules decide what is a repository file, so a tracked or unignored manifest is verified
+# wherever it lives (a committed `build/requirements.txt` or `packages/env/requirements.txt` is still installable).
+# Only vendored packages are skipped: their versions and hashes are verified through the lockfile.
+_GIT_MODE_SKIPPED_DIRS: frozenset[str] = frozenset({"node_modules"})
+
+
+class DiscoveredManifests(NamedTuple):
+    pyproject_toml: tuple[Path, ...] = ()
+    requirements_txt: tuple[Path, ...] = ()
+    requirements_lock: tuple[Path, ...] = ()
+    uv_lock: tuple[Path, ...] = ()
+    package_json: tuple[Path, ...] = ()
+    package_lock_json: tuple[Path, ...] = ()
+
+
+def _candidate_manifest_paths(root: Path) -> list[Path]:
+    """
+    Return repository files under root in deterministic relative-path order: tracked plus untracked-but-unignored
+    files from git when available, otherwise a directory walk that skips well-known tool and build directories.
+    """
+    git = shutil.which("git")
+    if git and (root / ".git").exists():
+        try:
+            proc = subprocess.run(  # noqa: S603 - fixed git argv against repository root
+                [git, "ls-files", "-co", "--exclude-standard", "-z"],
+                cwd=root,
+                capture_output=True,
+                check=True,
+            )
+            paths = [
+                root / rel
+                for rel in proc.stdout.decode("utf-8").split("\0")
+                if rel
+                and not any(part in _GIT_MODE_SKIPPED_DIRS for part in Path(rel).parts)
+                and (root / rel).is_file()
+            ]
+            return sorted(paths, key=lambda p: p.relative_to(root).as_posix())
+        except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
+            pass
+
+    walked: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _IGNORED_DISCOVERY_DIRS)
+        base = Path(dirpath)
+        for fname in sorted(filenames):
+            candidate = base / fname
+            if candidate.is_file():
+                walked.append(candidate)
+    return sorted(walked, key=lambda p: p.relative_to(root).as_posix())
+
+
+def discover_manifests(root: Path) -> DiscoveredManifests:
+    """Discover supported Python and npm manifests and lockfiles at any depth under root."""
+    pyproject: list[Path] = []
+    reqs_txt: list[Path] = []
+    reqs_lock: list[Path] = []
+    uv_locks: list[Path] = []
+    pkg_json: list[Path] = []
+    pkg_lock: list[Path] = []
+
+    for path in _candidate_manifest_paths(root):
+        name = path.name
+        if name == "pyproject.toml":
+            pyproject.append(path)
+        elif name.startswith("requirements") and name.endswith(".txt"):
+            reqs_txt.append(path)
+        elif name.startswith("requirements") and name.endswith(".lock"):
+            reqs_lock.append(path)
+        elif name == "uv.lock":
+            uv_locks.append(path)
+        elif name == "package.json":
+            pkg_json.append(path)
+        elif name == "package-lock.json":
+            pkg_lock.append(path)
+
+    return DiscoveredManifests(
+        pyproject_toml=tuple(pyproject),
+        requirements_txt=tuple(reqs_txt),
+        requirements_lock=tuple(reqs_lock),
+        uv_lock=tuple(uv_locks),
+        package_json=tuple(pkg_json),
+        package_lock_json=tuple(pkg_lock),
+    )
+
+
 def _check_locked_packages(
     locked: list[LockedPackage],
     ecosystem: str,
@@ -671,21 +805,27 @@ def _check_locked_packages(
     min_release_age_days: int,
 ) -> list[str]:
     issues: list[str] = []
+    registry_cache: dict[tuple[str, str], list[str]] = {}
+    published_cache: dict[tuple[str, str, str], set[str] | None | Exception] = {}
     for pkg in locked:
         name_issues = check_package_name_hygiene(pkg.name, ecosystem)
         issues.extend(name_issues)
         if online and not name_issues:
-            registry_issues = verify_registry(
-                pkg.name,
-                ecosystem,
-                min_age_days,
-                allow_new,
-                pinned_version=pkg.version,
-                min_release_age_days=min_release_age_days,
-            )
+            norm_name = normalize_pypi_name(pkg.name) if ecosystem == "pypi" else pkg.name.lower()
+            reg_key = (norm_name, pkg.version)
+            if reg_key not in registry_cache:
+                registry_cache[reg_key] = verify_registry(
+                    pkg.name,
+                    ecosystem,
+                    min_age_days,
+                    allow_new,
+                    pinned_version=pkg.version,
+                    min_release_age_days=min_release_age_days,
+                )
+            registry_issues = registry_cache[reg_key]
             issues.extend(registry_issues)
             if not registry_issues:
-                issues.extend(verify_locked_hashes(pkg, ecosystem))
+                issues.extend(verify_locked_hashes(pkg, ecosystem, _published_cache=published_cache))
     return issues
 
 
@@ -695,17 +835,23 @@ def verify_pyproject_toml(
     min_age_days: int = DEFAULT_MIN_AGE_DAYS,
     allow_new: frozenset[str] = _NO_EXEMPTIONS,
     min_release_age_days: int = DEFAULT_MIN_RELEASE_AGE_DAYS,
+    *,
+    root: Path | None = None,
 ) -> list[str]:
     if not path.exists():
         return []
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    source = path.relative_to(root).as_posix() if root and path.is_relative_to(root) else path.name
     project = data.get("project", {})
     specs = list(project.get("dependencies", []))
     for group in project.get("optional-dependencies", {}).values():
         specs.extend(group)
     for group in data.get("dependency-groups", {}).values():
         specs.extend(s for s in group if isinstance(s, str))
-    return _check_python_specs(specs, path.name, check_online, min_age_days, allow_new, min_release_age_days)
+    build_requires = data.get("build-system", {}).get("requires", [])
+    if isinstance(build_requires, list):
+        specs.extend(s for s in build_requires if isinstance(s, str))
+    return _check_python_specs(specs, source, check_online, min_age_days, allow_new, min_release_age_days)
 
 
 def verify_requirements_txt(
@@ -725,12 +871,9 @@ def verify_requirements_txt(
     if resolved in seen:
         return []
     seen.add(resolved)
-    includes, issues = requirements_txt_options(path, (root or path.parent))
-    issues.extend(
-        _check_python_specs(
-            parse_requirements_txt(path), path.name, check_online, min_age_days, allow_new, min_release_age_days
-        )
-    )
+    specs, includes, issues = read_requirements_txt(path, (root or path.parent))
+    source = path.relative_to(root).as_posix() if root and path.is_relative_to(root) else path.name
+    issues.extend(_check_python_specs(specs, source, check_online, min_age_days, allow_new, min_release_age_days))
     for included in includes:
         issues.extend(
             verify_requirements_txt(
@@ -809,18 +952,17 @@ def main(argv: list[str] | None = None) -> int:
         "min_release_age_days": args.min_release_age_days,
     }
 
+    manifests = discover_manifests(root)
     issues: list[str] = list(allowlist_issues)
-    issues.extend(verify_pyproject_toml(root / "pyproject.toml", **opts))
 
-    for req in sorted(root.glob("requirements*.txt")) + sorted((root / "backend").glob("requirements*.txt")):
-        issues.extend(verify_requirements_txt(req, **opts, root=root))
+    for pyproj in manifests.pyproject_toml:
+        issues.extend(verify_pyproject_toml(pyproj, **opts, root=root))
 
-    lock_files = (
-        sorted(root.glob("requirements*.lock"))
-        + sorted((root / "deploy").glob("requirements*.lock"))
-        + sorted((root / "backend").glob("requirements*.lock"))
-    )
-    for lock_path in lock_files:
+    seen_requirements: set[Path] = set()
+    for req in manifests.requirements_txt:
+        issues.extend(verify_requirements_txt(req, **opts, root=root, _seen=seen_requirements))
+
+    for lock_path in manifests.requirements_lock:
         locked_py, lock_issues = parse_requirements_lock(lock_path)
         issues.extend(lock_issues)
         issues.extend(
@@ -829,8 +971,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-    uv_lock = root / "uv.lock"
-    if uv_lock.exists():
+    for uv_lock in manifests.uv_lock:
         locked_uv, uv_issues = parse_uv_lock(uv_lock)
         issues.extend(uv_issues)
         issues.extend(
@@ -839,18 +980,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-    issues.extend(verify_package_json(root / "package.json", **opts))
-    issues.extend(verify_package_json(root / "frontend" / "package.json", **opts))
+    for pkg_json in manifests.package_json:
+        issues.extend(verify_package_json(pkg_json, **opts))
 
-    for npm_lock in (root / "package-lock.json", root / "frontend" / "package-lock.json"):
-        if npm_lock.exists():
-            locked_npm, npm_lock_issues = parse_package_lock_json(npm_lock)
-            issues.extend(npm_lock_issues)
-            issues.extend(
-                _check_locked_packages(
-                    locked_npm, "npm", args.online, args.min_age_days, allow_new, args.min_release_age_days
-                )
+    for npm_lock in manifests.package_lock_json:
+        locked_npm, npm_lock_issues = parse_package_lock_json(npm_lock)
+        issues.extend(npm_lock_issues)
+        issues.extend(
+            _check_locked_packages(
+                locked_npm, "npm", args.online, args.min_age_days, allow_new, args.min_release_age_days
             )
+        )
 
     if issues:
         print("OWASP AI Dependency Verification FAILED:")

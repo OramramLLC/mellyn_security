@@ -27,6 +27,19 @@ CANONICAL = Path(".agent/rules/owasp-secure-ai-coding.md")
 GENERATED = (Path(".cursorrules"), Path(".github/copilot-instructions.md"))
 CLAUDE_MD = Path("CLAUDE.md")
 CLAUDE_IMPORT = f"@{CANONICAL.as_posix()}"
+SELF_POLICY_SOURCE = Path("config/mellyn-policy.example.toml")
+SELF_POLICY_TARGET = Path("config/mellyn-self-policy.toml")
+SELF_PROTECTED_PATHS: tuple[str, ...] = (
+    "backend/mellyn/",
+    "scripts/",
+    "tests/",
+    "config/",
+    "deploy/",
+    "Dockerfile",
+    ".dockerignore",
+    "pyproject.toml",
+    "docs/THREAT_MODEL.md",
+)
 # Other instruction files agents may read; scanned for hidden characters if present.
 EXTRA_SCANNED = (Path("AGENTS.md"), Path("GEMINI.md"), Path(".windsurfrules"), Path(".clinerules"))
 # Directories of instruction files (any depth), scanned for hidden characters.
@@ -35,11 +48,22 @@ EXTRA_SCANNED_GLOBS = (".agent/rules/**/*.md", ".cursor/rules/**/*.mdc", ".githu
 HEADER = (
     "<!-- GENERATED FILE — DO NOT EDIT. Source: {src}\n     Regenerate with: python scripts/sync_agent_rules.py -->\n\n"
 )
+SELF_POLICY_HEADER = (
+    "# GENERATED FILE — DO NOT EDIT. Source: config/mellyn-policy.example.toml\n"
+    "# Regenerate with: python scripts/sync_agent_rules.py\n"
+    "# Mellyn Security — Policy for agents working on THIS repository (Mellyn Security itself)\n"
+    "# Loaded strictly and fail-closed by `mellyn.policy_loader.load_policy_file()`.\n"
+)
 
 
 def read_text(path: Path) -> str:
-    """Read with newlines normalized, so Windows CRLF checkouts do not register as drift."""
-    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    """
+    Read with CRLF normalized to LF, so Windows CRLF checkouts do not register as drift.
+
+    Decoded from bytes on purpose: text mode's universal newlines would also turn a lone CR into LF, hiding the
+    carriage-return overwrite trick (`visible text\\rhidden instruction`) from hidden_characters().
+    """
+    return path.read_bytes().decode("utf-8").replace("\r\n", "\n")
 
 
 def strip_frontmatter(text: str) -> str:
@@ -53,6 +77,21 @@ def strip_frontmatter(text: str) -> str:
 def render_generated(root: Path) -> str:
     body = strip_frontmatter(read_text(root / CANONICAL))
     return HEADER.format(src=CANONICAL.as_posix()) + body
+
+
+def render_self_policy(root: Path) -> str:
+    source_text = read_text(root / SELF_POLICY_SOURCE)
+    lines = source_text.split("\n")
+    idx = 0
+    while idx < len(lines) and lines[idx].startswith("#"):
+        idx += 1
+    body = "\n".join(lines[idx:])
+    target_block = "\nprotected_paths = []\n"
+    if body.count(target_block) != 1:
+        raise ValueError(f"{SELF_POLICY_SOURCE.as_posix()} must contain exactly one 'protected_paths = []' line")
+    rendered_paths = "".join(f'    "{entry}",\n' for entry in SELF_PROTECTED_PATHS)
+    replacement = f"\nprotected_paths = [\n{rendered_paths}]\n"
+    return SELF_POLICY_HEADER + body.replace(target_block, replacement, 1)
 
 
 # Non-Cf invisible fillers, joiners, and variation selectors used in hidden-prompt smuggling.
@@ -77,7 +116,7 @@ _EXTRA_INVISIBLE_CODEPOINTS: frozenset[int] = frozenset(
 def _is_hidden_codepoint(char: str) -> bool:
     cp = ord(char)
     cat = unicodedata.category(char)
-    if cat == "Cf":
+    if cat in ("Cf", "Zl", "Zp"):
         return True
     if cat == "Cc" and char != "\t":
         return True
@@ -117,9 +156,10 @@ def _legitimate_emoji_join(line: str, col: int) -> bool:
 
 
 def hidden_characters(text: str) -> list[tuple[int, int, str]]:
-    """Return (line, column, codepoint) for invisible format/bidi/tag/variation-selector/filler characters."""
+    """Return (line, column, codepoint) for invisible format/bidi/tag/variation-selector/filler/control characters."""
     found: list[tuple[int, int, str]] = []
-    for line_no, line in enumerate(text.splitlines(), 1):
+    normalized = text.replace("\r\n", "\n")
+    for line_no, line in enumerate(normalized.split("\n"), 1):
         for index, char in enumerate(line):
             if _is_hidden_codepoint(char) and not _legitimate_emoji_join(line, index):
                 found.append((line_no, index + 1, f"U+{ord(char):04X}"))
@@ -165,6 +205,21 @@ def main(argv: list[str] | None = None) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(expected, encoding="utf-8", newline="\n")
             print(f"Regenerated {rel.as_posix()}")
+
+    if has_canonical and (root / SELF_POLICY_SOURCE).is_file():
+        expected_policy = render_self_policy(root)
+        policy_path = root / SELF_POLICY_TARGET
+        current_policy = read_text(policy_path) if policy_path.exists() else None
+        if current_policy != expected_policy:
+            if args.check:
+                problems.append(
+                    f"[DRIFT] {SELF_POLICY_TARGET.as_posix()} differs from {SELF_POLICY_SOURCE.as_posix()}; "
+                    "run sync_agent_rules.py"
+                )
+            else:
+                policy_path.parent.mkdir(parents=True, exist_ok=True)
+                policy_path.write_text(expected_policy, encoding="utf-8", newline="\n")
+                print(f"Regenerated {SELF_POLICY_TARGET.as_posix()}")
 
     claude = root / CLAUDE_MD
     if has_canonical and (not claude.exists() or CLAUDE_IMPORT not in read_text(claude).splitlines()):

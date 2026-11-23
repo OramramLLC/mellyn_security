@@ -458,7 +458,8 @@ class TestGatewayEndToEnd(unittest.TestCase):
             self.assertEqual(replies[4]["error"]["code"], MELLYN_POLICY_DENIED)  # its own config is protected
             self.assertEqual(replies[5]["result"], {})
             audit = (workspace / "audit.jsonl").read_text(encoding="utf-8")
-            self.assertEqual(len(audit.splitlines()), 2)
+            events = [json.loads(line) for line in audit.splitlines()]
+            self.assertEqual([e["event_type"] for e in events], ["taint", "authorization", "taint", "authorization"])
             self.assertNotIn("aud_forged", audit)  # the server's stderr cannot write into the audit log
             self.assertIn("aud_forged", proc.stderr)
 

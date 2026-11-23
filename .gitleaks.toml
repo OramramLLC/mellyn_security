@@ -40,10 +40,9 @@ regex = '''lsv2_(?:pt|sk)_[a-f0-9]{32}_[a-f0-9]{8,16}'''
 keywords = ["lsv2_"]
 tags = ["key", "langsmith", "llm"]
 
-# Allowlist by VALUE, not by file. .env.example and test fixtures are still scanned,
-# because they are exactly where real keys get pasted by accident. A finding is
+# Allowlist by VALUE, not by file. .env.example, .gitleaks.toml, and test fixtures are still
+# scanned because they are exactly where real keys get pasted by accident. A finding is
 # ignored only if the matched secret contains an obvious placeholder word.
 [allowlist]
-description = "Obvious placeholders and this config file's own regexes"
-paths = ['''(?:^|/)\.gitleaks\.toml$''']
+description = "Obvious value placeholders only (no file-path exemptions)"
 stopwords = ["example", "placeholder", "replace_with", "changeme", "dummy", "fake", "redacted", "xxxxxxxx"]

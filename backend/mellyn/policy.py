@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from mellyn.models import Decision, RiskTier, ToolCallRequest
+from mellyn.models import Decision, RiskTier, ToolCallRequest, canonical_json_value
 
 DEFAULT_TOOL_RISK_TIERS: dict[str, RiskTier] = {
     # Low-risk: single-file read-only or pure metadata inside workspace
@@ -219,9 +218,9 @@ def _has_inline_eval_flag(prog: str, rest: tuple[str, ...]) -> str | None:
     same command are caught too.
     """
     if _PYTHON_PROG_RE.fullmatch(prog):
-        for letter, cluster in _short_option_clusters(rest, "WXQm", frozenset({"--check-hash-based-pycs"})):
+        for letter, _cluster in _short_option_clusters(rest, "WXQm", frozenset({"--check-hash-based-pycs"})):
             if letter == "c":
-                return f"Inline Python code evaluation ('-c' in '{cluster}') via '{prog}' is denied."
+                return "Inline Python code evaluation ('-c') is denied."
             if letter == "m":
                 return None  # `-m module`: everything after belongs to the module
     elif prog in _NODE_RUNTIMES:
@@ -230,33 +229,33 @@ def _has_inline_eval_flag(prog: str, rest: tuple[str, ...]) -> str | None:
             return "Inline JavaScript evaluation ('deno eval') is denied."
         for arg in rest:
             if arg in ("-e", "--eval", "-p", "--print") or arg.startswith(("--eval=", "--print=")):
-                return f"Inline JavaScript evaluation ('{arg}') via '{prog}' is denied."
+                return "Inline JavaScript evaluation flag is denied."
             if arg.startswith("-") and not arg.startswith("--") and any(c in "ep" for c in arg[1:]):
-                return f"Inline JavaScript evaluation ('{arg}') via '{prog}' is denied."
+                return "Inline JavaScript evaluation flag is denied."
             if "data:" in arg:
-                return f"Loading code from a data: URL ('{arg}') via '{prog}' is denied."
+                return "Loading code from a data: URL is denied."
     elif prog == "perl":
         for letter, cluster in _short_option_clusters(rest, "IMmixdDC0", frozenset()):
             if letter in "eE":
-                return f"Inline Perl evaluation ('-{letter}' in '{cluster}') is denied."
+                return f"Inline Perl evaluation ('-{letter}') is denied."
             if letter in "Mm":
                 value = cluster.split(letter, 1)[1]
                 if value and not re.fullmatch(r"-?[A-Za-z0-9_:]+(=[A-Za-z0-9_,:]*)?", value):
-                    return f"Perl module option '{cluster}' contains code, which is denied."
+                    return "Perl module option contains inline code, which is denied."
     elif prog == "ruby":
-        for letter, cluster in _short_option_clusters(rest, "IrCEKxi0FW", frozenset()):
+        for letter, _cluster in _short_option_clusters(rest, "IrCEKxi0FW", frozenset()):
             if letter == "e":
-                return f"Inline Ruby evaluation ('-e' in '{cluster}') is denied."
+                return "Inline Ruby evaluation ('-e') is denied."
     elif prog == "php":
-        for letter, cluster in _short_option_clusters(rest, "cdfz", frozenset()):
+        for letter, _cluster in _short_option_clusters(rest, "cdfz", frozenset()):
             if letter in "rRBE":
-                return f"Inline PHP evaluation ('-{letter}' in '{cluster}') is denied."
+                return f"Inline PHP evaluation ('-{letter}') is denied."
         if "--run" in rest:
             return "Inline PHP evaluation ('--run') is denied."
     elif prog in _LUA_RUNTIMES:
-        for letter, cluster in _short_option_clusters(rest, "l", frozenset()):
+        for letter, _cluster in _short_option_clusters(rest, "l", frozenset()):
             if letter == "e":
-                return f"Inline Lua evaluation ('-e' in '{cluster}') via '{prog}' is denied."
+                return "Inline Lua evaluation ('-e') is denied."
     elif prog == "find":
         for arg in rest:
             if arg in _FIND_EXEC_FLAGS:
@@ -266,9 +265,9 @@ def _has_inline_eval_flag(prog: str, rest: tuple[str, ...]) -> str | None:
         while i < len(rest):
             arg = rest[i]
             if arg == "-c" or arg.startswith("-c") or arg == "--config-env" or arg.startswith("--config-env="):
-                return f"Inline git configuration override ('{arg}') is denied."
+                return "Inline git configuration override is denied."
             if arg.startswith("--exec-path="):
-                return f"Overriding git's helper directory ('{arg}') is denied."
+                return "Overriding git's helper directory is denied."
             if arg in ("-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"):
                 i += 2  # these take the next argument as their value
                 continue
@@ -291,38 +290,11 @@ def validate_argv(arguments: Mapping[str, Any], *, argv_key: str = "argv") -> tu
     eval_reason = _has_inline_eval_flag(prog, tuple(argv[1:]))
     if eval_reason is not None:
         return False, eval_reason
-    return True, f"Program '{prog}' with {len(argv) - 1} argument(s)."
+    return True, f"Shell argv validated ({len(argv) - 1} argument(s))."
 
 
-def normalize_arg_value(value: Any) -> Any:
-    """
-    Recursively normalize JSON-compatible values with explicit scalar type tags.
-
-    Isomorphic to `canonical_json`:
-      - `True` -> `("bool", True)` vs `1` -> `("int", 1)` (never confuses booleans with integers)
-      - `1` -> `("int", 1)` vs `1.0` -> `("float", 1.0)`
-      - `["a", "b"]` == `("a", "b")` at any nesting depth, including inside nested dicts
-      - Rejects NaN, Infinity, and arbitrary non-JSON Python objects.
-    """
-    if value is None:
-        return ("null", None)
-    if isinstance(value, bool):
-        return ("bool", value)
-    if isinstance(value, int):
-        return ("int", value)
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("Non-finite float (NaN or Infinity) is not permitted in policy values.")
-        return ("float", value)
-    if isinstance(value, str):
-        return ("str", value)
-    if isinstance(value, list | tuple):
-        return ("array", tuple(normalize_arg_value(v) for v in value))
-    if isinstance(value, Mapping):
-        if not all(isinstance(k, str) for k in value):
-            raise ValueError("Mapping keys in policy/tool arguments must be strings.")
-        return ("object", tuple(sorted((k, normalize_arg_value(v)) for k, v in value.items())))
-    raise TypeError(f"Unsupported non-JSON value type '{type(value).__name__}'.")
+# Alias to the single strict canonical JSON value normalizer in models.py.
+normalize_arg_value = canonical_json_value
 
 
 @dataclass(frozen=True)
@@ -353,6 +325,7 @@ class ScopedRule:
     allow_when_tainted: bool = False
     description: str = ""
     mcp_server: str | None = None
+    _compiled_arg_equals: Mapping[str, frozenset[str]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.effect == Decision.ALLOW and self.programs:
@@ -360,10 +333,10 @@ class ScopedRule:
                 f"Rule '{self.rule_id}': ALLOW rules cannot use 'programs' (it would allow any arguments); "
                 "list the exact argv under 'arg_equals' instead."
             )
-        # Validate that every rule literal is strict JSON-compatible at construction time
-        for allowed_values in self.arg_equals.values():
-            for val in allowed_values:
-                normalize_arg_value(val)
+        compiled: dict[str, frozenset[str]] = {}
+        for key, allowed_values in self.arg_equals.items():
+            compiled[key] = frozenset(canonical_json_value(val) for val in allowed_values)
+        object.__setattr__(self, "_compiled_arg_equals", compiled)
 
     def matches(self, request: ToolCallRequest, *, argv_key: str = "argv") -> bool:
         if self.tool_name != request.tool_name:
@@ -371,14 +344,14 @@ class ScopedRule:
         if self.mcp_server != request.mcp_server and not (self.effect == Decision.DENY and self.mcp_server is None):
             return False
         args = request.arguments
-        for key, allowed_values in self.arg_equals.items():
+        for key, allowed_canonical in self._compiled_arg_equals.items():
             if key not in args:
                 return False
             try:
-                actual_norm = normalize_arg_value(args[key])
+                actual_norm = canonical_json_value(args[key])
             except (TypeError, ValueError):
                 return False
-            if not any(actual_norm == normalize_arg_value(v) for v in allowed_values):
+            if actual_norm not in allowed_canonical:
                 return False
         if self.programs:
             argv = args.get(argv_key)
@@ -483,6 +456,50 @@ class PolicyEngine:
 
     def __init__(self, config: PolicyConfig | None = None) -> None:
         self.config = config or PolicyConfig()
+        configured_servers: set[str] = set(self.config.allowed_mcp_servers or ())
+        configured_servers.update(self.config.trusted_mcp_servers)
+        configured_servers.update(self.config.server_presets)
+        configured_servers.update(self.config.pinned_tool_hashes)
+        for key in (*self.config.tool_risk_tiers, *self.config.tool_capabilities):
+            if "/" in key:
+                srv, _, _ = key.partition("/")
+                if srv:
+                    configured_servers.add(srv)
+        for rule in self.config.scoped_rules:
+            if rule.mcp_server:
+                configured_servers.add(rule.mcp_server)
+        self._known_servers: frozenset[str] = frozenset(configured_servers)
+
+        known_tools: set[str] = {
+            "resources/read",
+            *DEFAULT_TOOL_RISK_TIERS,
+            *DEFAULT_TOOL_CAPABILITIES,
+            *DEFAULT_UNTRUSTED_CONTENT_TOOLS,
+            *SHELL_TOOL_NAMES,
+        }
+        for preset_tools in MCP_CAPABILITY_PRESETS.values():
+            known_tools.update(preset_tools)
+        for key in (*self.config.tool_risk_tiers, *self.config.tool_capabilities):
+            if "/" in key and not key.endswith("/resources/read"):
+                _, _, tname = key.partition("/")
+                known_tools.add(tname)
+            else:
+                known_tools.add(key)
+        for rule in self.config.scoped_rules:
+            known_tools.add(rule.tool_name)
+        self._known_tools: frozenset[str] = frozenset(known_tools)
+
+    def is_known_mcp_server(self, mcp_server: str | None) -> bool:
+        """True when `mcp_server` is None (local) or declared in policy configuration."""
+        return mcp_server is None or mcp_server in self._known_servers
+
+    def is_known_tool(self, tool_name: str, mcp_server: str | None = None) -> bool:
+        """True when `tool_name` is a built-in, preset, or policy-configured tool identifier."""
+        if tool_key(tool_name, mcp_server) in self.config.tool_risk_tiers:
+            return True
+        if tool_key(tool_name, mcp_server) in self.config.tool_capabilities:
+            return True
+        return tool_name in self._known_tools
 
     def classify_risk(self, tool_name: str, mcp_server: str | None = None) -> RiskTier:
         """
@@ -509,7 +526,7 @@ class PolicyEngine:
             return True, "Local/non-MCP tool call."
         if self.config.allowed_mcp_servers and mcp_server in self.config.allowed_mcp_servers:
             return True, f"MCP server '{mcp_server}' is allowlisted."
-        return False, f"MCP server '{mcp_server}' is not in the approved MCP server allowlist."
+        return False, "MCP server is not in the approved MCP server allowlist."
 
     def brings_untrusted_content(self, request: ToolCallRequest) -> bool:
         """True when the call's result will put outside content into the agent's context."""

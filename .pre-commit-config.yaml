@@ -42,14 +42,14 @@ repos:
         entry: python scripts/verify_dependencies.py
         language: python
         pass_filenames: false
-        files: ^(pyproject\.toml|requirements.*\.(txt|lock)|(backend|deploy)/requirements.*\.(txt|lock)|uv\.lock|package(-lock)?\.json|frontend/package(-lock)?\.json|\.mellyn-allowlist\.toml|scripts/verify_dependencies\.py)$
+        files: (^|/)(pyproject\.toml|requirements.*\.(txt|lock)|uv\.lock|package(-lock)?\.json|\.mellyn-allowlist\.toml|scripts/verify_dependencies\.py)$
 
       - id: agent-rules-sync
         name: Agent rules files in sync, no hidden characters
         entry: python scripts/sync_agent_rules.py --check
         language: python
         pass_filenames: false
-        files: ^(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|\.agent/.*|\.github/copilot-instructions\.md|scripts/sync_agent_rules\.py)$
+        files: ^(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|\.clinerules|\.agent/.*|\.cursor/rules/.*|\.github/(copilot-instructions\.md|instructions/.*)|config/mellyn-(policy\.example|self-policy)\.toml|scripts/sync_agent_rules\.py)$
 
       - id: unit-tests
         name: Unit tests
