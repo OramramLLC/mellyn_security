@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 # Secret file patterns that must NEVER be read or written by an agent tool.
 SENSITIVE_FILENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\.env(?:\..+)?$", re.IGNORECASE),
+    re.compile(r"^\.env(?:\..*)?$", re.IGNORECASE),
     re.compile(r"\.(?:pem|key|p12|pfx|jks|kdbx)$", re.IGNORECASE),
     re.compile(r"^credentials\.json$", re.IGNORECASE),
     re.compile(r"^id_(?:rsa|ed25519|ecdsa|dsa)$", re.IGNORECASE),
@@ -186,11 +186,15 @@ class WorkspacePathGuard:
                 return False, f"Access to sensitive directory '{part.lower()}' is denied."
 
         filename = rel_path.name
+        stripped_name = filename.rstrip(" .")
         if filename.lower() != ".env.example":
             for pattern in SENSITIVE_FILENAME_PATTERNS:
-                if pattern.search(filename):
+                if pattern.search(filename) or (stripped_name and pattern.search(stripped_name)):
                     return False, "Access to sensitive file is denied."
-        if rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS:
+        if (
+            rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS
+            or rel_posix.rstrip(" .").casefold() in SENSITIVE_RELATIVE_PATHS
+        ):
             return False, "Access to sensitive file is denied."
 
         if is_write and self.is_protected(rel_posix):

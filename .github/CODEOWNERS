@@ -4,6 +4,7 @@
 
 # Canonical AI steering rules & generated assistant configs
 /.agent/                    @OramramLLC
+/AGENTS.md                  @OramramLLC
 /CLAUDE.md                  @OramramLLC
 /.cursorrules               @OramramLLC
 /.github/copilot-instructions.md @OramramLLC
@@ -27,4 +28,5 @@
 /Dockerfile                 @OramramLLC
 /.dockerignore              @OramramLLC
 /backend/mellyn/          @OramramLLC
+/src/                       @OramramLLC
 /tests/                     @OramramLLC

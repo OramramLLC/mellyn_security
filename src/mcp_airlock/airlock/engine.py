@@ -15,6 +15,7 @@ Strict DAG & Invariants:
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -41,9 +42,9 @@ from mcp_airlock.core.normalize import (
     normalize_str,
     sha256_exact,
 )
-from mcp_airlock.core.schemas import Verdict
+from mcp_airlock.core.schemas import RedactionRecord, Verdict
 from mcp_airlock.egress.guards import WorkspacePathGuard
-from mcp_airlock.egress.scanner import scan_payload
+from mcp_airlock.egress.scanner import EgressScanResult, scan_payload
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _URI_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
@@ -183,6 +184,11 @@ def verify_tools_list(tools: Sequence[ToolDefinition], policy: AirlockPolicy) ->
     )
 
 
+def _has_trailing_space_or_dot_segment(normalized_posix: str) -> bool:
+    """Return True if any non-dot component ends in whitespace or '.' (Win32 strips these on open)."""
+    return any(part not in ("", ".", "..") and part != part.rstrip(" .") for part in normalized_posix.split("/"))
+
+
 def _check_lexical_path_containment(
     raw_path: str,
     *,
@@ -195,10 +201,16 @@ def _check_lexical_path_containment(
     """
     if not raw_path.strip():
         return False, "Empty path argument is forbidden."
+    if raw_path != raw_path.strip():
+        return False, "Path argument must not have leading or trailing whitespace."
     if _CONTROL_CHARS_RE.search(raw_path) or has_invisible_unicode(raw_path):
         return False, "Path argument contains control or invisible Unicode characters."
+    if normalize_str(raw_path) != raw_path:
+        return False, "Path argument is not in Unicode NFKC normal form."
 
-    normalized_raw = normalize_str(raw_path).replace("\\", "/")
+    normalized_raw = raw_path.replace("\\", "/")
+    if _has_trailing_space_or_dot_segment(normalized_raw):
+        return False, "Path component must not end with a space or trailing dot."
     if normalized_raw.startswith("~"):
         return False, "Home-directory tilde paths are forbidden."
 
@@ -210,13 +222,22 @@ def _check_lexical_path_containment(
         if parsed.netloc.casefold() not in ("", "localhost"):
             return False, "Remote file:// authority is forbidden."
         normalized_raw = unquote(parsed.path)
+        if normalized_raw != normalized_raw.strip():
+            return False, "Decoded file: URI path must not have leading or trailing whitespace."
         if _CONTROL_CHARS_RE.search(normalized_raw) or has_invisible_unicode(normalized_raw):
             return False, "Decoded file: URI path contains control or invisible Unicode characters."
+        if normalize_str(normalized_raw) != normalized_raw:
+            return False, "Decoded file: URI path is not in Unicode NFKC normal form."
         # Strip leading slash before Windows drive letters (`file:///C:/...`)
         if _WINDOWS_DRIVE_URI_PATH_RE.match(normalized_raw):
             normalized_raw = normalized_raw[1:]
         if not normalized_raw:
             return False, "file: URI has no path."
+        normalized_raw = normalized_raw.replace("\\", "/")
+        if _has_trailing_space_or_dot_segment(normalized_raw):
+            return False, "Decoded file: URI path component must not end with a space or trailing dot."
+        if normalized_raw.startswith("~"):
+            return False, "Home-directory tilde paths are forbidden."
 
     candidate = Path(normalized_raw)
     matched_any_root = False
@@ -245,20 +266,25 @@ def _check_lexical_path_containment(
 
 
 def _gather_path_candidates(
-    arguments: JsonObject, explicit_keys: frozenset[str]
+    arguments: JsonObject,
+    explicit_keys: frozenset[str],
+    exempt_keys: frozenset[str] = frozenset(),
 ) -> tuple[list[tuple[str, str, bool]], str | None]:
     """
     Walk every argument at every depth and return `(location, value, explicit)` for each string to path-check,
     plus an error message if an explicitly declared path argument has the wrong type.
+
+    `exempt_keys` (a rule's `non_path_arg_names`) opt a key out of the name-based path heuristic only; a `file:`
+    URI under an exempt key is still checked.
     """
     found: list[tuple[str, str, bool]] = []
 
     def visit(value: JsonValue, location: str, key: str) -> str | None:
         explicit = key in explicit_keys
         if isinstance(value, str):
-            if explicit or _is_path_like_key(key):
+            if explicit or (key not in exempt_keys and _is_path_like_key(key)):
                 found.append((location, value, explicit))
-            elif _uri_scheme(normalize_str(value)) == "file":
+            elif _uri_scheme(normalize_str(value).strip()) == "file":
                 found.append((location, value, True))
             return None
         if isinstance(value, list):
@@ -296,7 +322,8 @@ def _evaluate_path_rules(
 ) -> tuple[bool, str]:
     roots = tool_rule.allowed_path_roots if (tool_rule and tool_rule.allowed_path_roots) else policy.workspace_roots
     explicit_keys = frozenset(tool_rule.path_arg_names) if tool_rule is not None else frozenset()
-    candidates, error = _gather_path_candidates(arguments, explicit_keys)
+    exempt_keys = frozenset(tool_rule.non_path_arg_names) if tool_rule is not None else frozenset()
+    candidates, error = _gather_path_candidates(arguments, explicit_keys, exempt_keys)
     if error is not None:
         return False, error
     if not candidates:
@@ -306,7 +333,7 @@ def _evaluate_path_rules(
 
     block_guardrails = tool_rule.block_guardrail_paths if tool_rule is not None else True
     for location, raw_value, explicit in candidates:
-        if not explicit:
+        if not explicit and raw_value == raw_value.strip():
             # A path-like key holding a non-file URI (`uri: https://...`) is not a filesystem path.
             scheme = _uri_scheme(normalize_str(raw_value).replace("\\", "/"))
             if scheme is not None and scheme != "file":
@@ -359,6 +386,61 @@ def _evaluate_regex_rules(arguments: JsonObject, *, tool_rule: ToolPolicyRule | 
         if re.search(deny_pattern, val) is not None or re.search(deny_pattern, norm_val) is not None:
             return False, f"Argument '{key}' matched blocked regex constraint."
     return True, "Regex rules satisfied."
+
+
+MAX_RPC_ID_CHARS = 128
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _rpc_id_problem(rpc_id: int | str | None) -> str | None:
+    """
+    Bound the JSON-RPC `id` so it cannot carry bulk data: strings up to `MAX_RPC_ID_CHARS`, integers within
+    signed 64-bit. Returns a reason string when the id is out of bounds.
+    """
+    if isinstance(rpc_id, str) and len(rpc_id) > MAX_RPC_ID_CHARS:
+        return f"JSON-RPC id is longer than {MAX_RPC_ID_CHARS} characters."
+    if isinstance(rpc_id, int) and not _INT64_MIN <= rpc_id <= _INT64_MAX:
+        return "JSON-RPC integer id is outside the signed 64-bit range."
+    return None
+
+
+def _scan_rpc_id(request_id: int | str | None, policy: AirlockPolicy) -> EgressScanResult | None:
+    """
+    Scan string JSON-RPC `id` fields so canary/secret/blocked data cannot ride on the envelope ID.
+
+    The high-entropy detector is switched off here (an infinite threshold never matches): clients legitimately
+    use random string ids such as `secrets.token_urlsafe(16)`, which it would flag. Size is bounded separately
+    by `_rpc_id_problem`, and canaries, known secret formats and blocked patterns are still detected.
+    """
+    if not isinstance(request_id, str):
+        return None
+    result = scan_payload(
+        request_id,
+        canary_tokens=policy.canary_tokens,
+        blocked_patterns=policy.blocked_patterns,
+        entropy_threshold=math.inf,
+        min_entropy_length=policy.min_entropy_length,
+    )
+    remapped = [
+        RedactionRecord(
+            kind=rec.kind,
+            rule_id=rec.rule_id,
+            field_path="$.id" if rec.field_path == "$" else rec.field_path,
+            match_sha256=rec.match_sha256,
+        )
+        for rec in result.findings
+    ]
+    return EgressScanResult(
+        artifact_sha256=result.artifact_sha256,
+        clean=result.clean,
+        canary_matched=result.canary_matched,
+        secret_matched=result.secret_matched,
+        high_entropy_matched=result.high_entropy_matched,
+        blocked_pattern_matched=result.blocked_pattern_matched,
+        findings=remapped,
+        redacted_payload=result.redacted_payload,
+    )
 
 
 def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdict:
@@ -418,6 +500,16 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
             artifact_sha256=artifact_sha256,
         )
 
+    id_problem = _rpc_id_problem(request.id)
+    if id_problem is not None:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.invalid_request_id",
+            reason=id_problem,
+            artifact_sha256=artifact_sha256,
+        )
+
     try:
         canonical_json_bytes(raw_req)  # rejects keys that collide after NFKC normalization
     except (TypeError, ValueError) as exc:
@@ -436,15 +528,17 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
+    id_scan = _scan_rpc_id(request.id, policy)
+    all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
 
-    if scan.canary_matched:
+    if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
         return Verdict(
             verdict_allow=False,
             severity="AAD_FIRE",
             rule_id="egress.canary_exfiltration",
-            reason="Planted canary token detected in tool call arguments.",
+            reason="Planted canary token detected in tool call request.",
             artifact_sha256=artifact_sha256,
-            redactions=scan.findings,
+            redactions=all_findings,
             redacted_payload=scan.redacted_payload,
         )
 
@@ -455,7 +549,7 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
             rule_id=rule_id,
             reason=reason,
             artifact_sha256=artifact_sha256,
-            redactions=scan.findings,
+            redactions=all_findings,
             redacted_payload=scan.redacted_payload,
         )
 
@@ -481,10 +575,16 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
             "Tool call arguments contain invisible Unicode format/tag characters (smuggling channel).",
         )
 
-    if not scan.clean:
+    if isinstance(request.id, str) and has_invisible_unicode(request.id):
+        return _block(
+            "airlock.invisible_unicode_in_request_id",
+            "JSON-RPC request id contains invisible Unicode format/tag characters.",
+        )
+
+    if not scan.clean or (id_scan is not None and not id_scan.clean):
         return _block(
             "egress.secret_or_blocked_pattern",
-            "Egress scanner detected secret material or blocked pattern in tool call arguments.",
+            "Egress scanner detected secret material or blocked pattern in tool call request.",
         )
 
     return Verdict(
@@ -525,8 +625,18 @@ def evaluate_tool_response(
             artifact_sha256=artifact_sha256,
         )
 
+    id_problem = _rpc_id_problem(response.id)
+    if id_problem is not None:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.invalid_response_id",
+            reason=id_problem,
+            artifact_sha256=artifact_sha256,
+        )
+
     try:
-        canonical_json_bytes(raw_resp)  # the scanner hashes canonically; surface collisions as a verdict
+        canonical_json_bytes(raw_resp)  # reject keys that collide after NFKC normalization
     except (TypeError, ValueError) as exc:
         return Verdict(
             verdict_allow=False,
@@ -548,26 +658,39 @@ def evaluate_tool_response(
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
+    id_scan = _scan_rpc_id(response.id, policy)
+    all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
 
-    if scan.canary_matched:
+    if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
         return Verdict(
             verdict_allow=False,
             severity="AAD_FIRE",
             rule_id="egress.response_canary_detected",
             reason="Planted canary token detected in inbound tool response.",
             artifact_sha256=artifact_sha256,
-            redactions=scan.findings,
+            redactions=all_findings,
             redacted_payload=scan.redacted_payload,
         )
 
-    if not scan.clean:
+    if has_invisible_unicode(payload) or (isinstance(response.id, str) and has_invisible_unicode(response.id)):
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.invisible_unicode_in_response",
+            reason="Inbound tool response contains invisible Unicode format/tag characters (smuggling channel).",
+            artifact_sha256=artifact_sha256,
+            redactions=all_findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    if not scan.clean or (id_scan is not None and not id_scan.clean):
         return Verdict(
             verdict_allow=False,
             severity="BLOCK",
             rule_id="egress.response_secret_or_blocked",
             reason="Egress scanner detected secret material or blocked pattern in inbound tool response.",
             artifact_sha256=artifact_sha256,
-            redactions=scan.findings,
+            redactions=all_findings,
             redacted_payload=scan.redacted_payload,
         )
 

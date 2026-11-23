@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from mcp_airlock.core.audit import AuditLedger, verify_ledger
-from mcp_airlock.core.normalize import JsonObject, sha256_canonical
+from mcp_airlock.core.normalize import JsonObject, sha256_exact
 from mcp_airlock.core.schemas import GENESIS_PREV_HASH, ZoneEvent
 
 
@@ -144,7 +144,7 @@ class TestRedactBeforeDisk(unittest.TestCase):
             "tool": "http_post",
             "payload": f"{canary} / {openai_secret} / {aws_secret} / {bearer_token}",
         }
-        expected_raw_hash = sha256_canonical(raw_artifact)
+        expected_raw_hash = sha256_exact(raw_artifact)
 
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "audit.jsonl"

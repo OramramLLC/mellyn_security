@@ -31,6 +31,7 @@ from mcp_airlock.core.normalize import (
     has_invisible_unicode,
     normalize_str,
     sha256_canonical,
+    sha256_exact,
 )
 from mcp_airlock.core.schemas import (
     GENESIS_PREV_HASH,
@@ -375,8 +376,12 @@ class AuditLedger:
     Append-only, redacted, hash-chained JSONL ledger (`audit.jsonl`).
 
     Verifies existing ledger integrity on open (fail-closed) and resumes chaining from the last verified entry.
-    Appends hold an exclusive lock on `<ledger>.lock`; if another writer appended since our last write, the ledger
-    is re-verified (including that our own last entry is still present) before chaining onto the new tail.
+    Appends hold an exclusive lock on `<ledger>.lock`. Before each append the writer checks, in constant time, that
+    the file size and the last line it wrote are unchanged; if not (another writer appended, or the file was
+    truncated or edited near the tail), the whole ledger is re-verified, including that our own last entry is still
+    present, before chaining onto the new tail. A same-size edit to an OLDER entry is not re-checked on every write
+    (that would mean hashing the whole file each time); it is caught by `verify_ledger`, on the next open, or by an
+    external anchor.
 
     Pass `anchor` (a `(seq, entry_hash)` stored outside the file, e.g. the `head` from the previous run) to detect
     tail truncation or a full rewrite, which the hash chain alone cannot see.
@@ -398,12 +403,25 @@ class AuditLedger:
         self._next_seq = 0
         self._prev_hash = GENESIS_PREV_HASH
         self._known_size = 0
+        self._known_tail = b""
 
         with _exclusive_lock(self._lock_path):
-            size = self.path.stat().st_size if self.path.exists() else 0
-            if size > 0 or anchor is not None:
+            raw = self.path.read_bytes() if self.path.exists() else b""
+            if raw or anchor is not None:
                 self._adopt_verified_tail(anchor=anchor)
-            self._known_size = size
+            self._known_size = len(raw)
+            self._known_tail = raw[raw.rfind(b"\n", 0, len(raw) - 1) + 1 :] if raw else b""
+
+    def _file_unchanged_since_last_write(self) -> bool:
+        """Constant-time check: same size, and the last line we know of is still at the end of the file."""
+        size = self.path.stat().st_size if self.path.exists() else 0
+        if size != self._known_size:
+            return False
+        if not self._known_tail:
+            return True
+        with self.path.open("rb") as fh:
+            fh.seek(size - len(self._known_tail))
+            return fh.read(len(self._known_tail)) == self._known_tail
 
     @property
     def next_seq(self) -> int:
@@ -440,7 +458,7 @@ class AuditLedger:
         elif isinstance(raw_artifact, bytes):
             computed_artifact_sha = hashlib.sha256(raw_artifact).hexdigest()
         else:
-            computed_artifact_sha = sha256_canonical(raw_artifact)
+            computed_artifact_sha = sha256_exact(raw_artifact)
 
         safe_event = _sanitize_event(
             event,
@@ -456,11 +474,11 @@ class AuditLedger:
         canonical_event = ZoneEvent.model_validate(canonical_event_obj)
 
         with _exclusive_lock(self._lock_path):
-            size = self.path.stat().st_size if self.path.exists() else 0
-            if size != self._known_size:
+            if not self._file_unchanged_since_last_write():
                 # Another writer appended (or someone edited the file) since our last write: re-verify, require
                 # our own last entry to still be there, and chain onto the verified tail.
                 self._adopt_verified_tail(anchor=self.head)
+            size_before = self.path.stat().st_size if self.path.exists() else 0
 
             seq = self._next_seq
             prev_hash = self._prev_hash
@@ -480,12 +498,14 @@ class AuditLedger:
                 if canary in line_text or (norm_canary and _canary_present(line_text, norm_canary.casefold())):
                     raise RuntimeError("Audit redaction invariant violated: canary value survived sanitization.")
 
+            payload_line = line_bytes + b"\n"
             with self.path.open("ab") as fh:
-                fh.write(line_bytes + b"\n")
+                fh.write(payload_line)
                 fh.flush()
                 os.fsync(fh.fileno())
-                self._known_size = fh.tell()
+            self._known_size = size_before + len(payload_line)
+            self._known_tail = payload_line
+            self._next_seq = seq + 1
+            self._prev_hash = entry_hash
 
-        self._next_seq = seq + 1
-        self._prev_hash = entry_hash
         return entry

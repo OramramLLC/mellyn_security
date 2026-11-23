@@ -31,6 +31,7 @@ SELF_POLICY_SOURCE = Path("config/mellyn-policy.example.toml")
 SELF_POLICY_TARGET = Path("config/mellyn-self-policy.toml")
 SELF_PROTECTED_PATHS: tuple[str, ...] = (
     "backend/mellyn/",
+    "src/",
     "scripts/",
     "tests/",
     "config/",

@@ -241,11 +241,21 @@ class ToolPolicyRule(_StrictAirlockModel):
     # When set, any top-level argument not listed here (or in `path_arg_names`) is denied.
     allowed_arg_names: list[str] | None = None
     path_arg_names: list[str] = Field(default_factory=list)
+    # Keys the engine would otherwise treat as paths by name (e.g. a translation `target`); `file:` URIs under
+    # these keys are still checked.
+    non_path_arg_names: list[str] = Field(default_factory=list)
     allowed_path_roots: list[str] = Field(default_factory=list)
     # On by default: guardrail paths (`.git/`, `.github/`, `AGENTS.md`, ...) are denied unless a rule opts out.
     block_guardrail_paths: bool = True
     arg_regex_rules: dict[str, str] = Field(default_factory=dict)
     arg_deny_regex_rules: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _path_and_non_path_names_are_disjoint(self) -> ToolPolicyRule:
+        overlap = sorted(set(self.path_arg_names) & set(self.non_path_arg_names))
+        if overlap:
+            raise ValueError(f"Arguments cannot be in both path_arg_names and non_path_arg_names: {overlap}")
+        return self
 
     @model_validator(mode="after")
     def _compile_regexes(self) -> ToolPolicyRule:

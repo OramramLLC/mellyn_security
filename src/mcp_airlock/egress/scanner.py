@@ -4,7 +4,7 @@ high-entropy secret candidates, and policy-defined blocked patterns.
 
 Architectural invariants:
   - Imports ONLY from `mcp_airlock.core` (+ stdlib / pydantic).
-  - Always computes `artifact_sha256` on the unredacted payload first via `sha256_canonical()`.
+  - Always computes `artifact_sha256` on the unredacted payload first via `sha256_exact()`.
   - Returns structured `RedactionRecord` hashes and `redacted_payload`; never leaks raw matches.
 """
 
@@ -18,7 +18,7 @@ from urllib.parse import unquote
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mcp_airlock.core.normalize import JsonValue, normalize_str, sha256_canonical
+from mcp_airlock.core.normalize import JsonValue, normalize_str, sha256_exact
 from mcp_airlock.core.schemas import RedactionRecord
 
 KNOWN_SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -242,39 +242,44 @@ def _scan_single_string(
                 )
             else:
                 sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
-            continue
 
         norm_candidate = normalize_str(sanitized)
-        norm_matches = list(pattern.finditer(norm_candidate)) if norm_candidate != sanitized else []
-        if norm_matches:
-            secret_hit = True
-            for match in norm_matches:
-                matched_val = match.group(1) if match.lastindex else match.group(0)
-                findings.append(
-                    RedactionRecord(
-                        kind="secret",
-                        rule_id=rule_id,
-                        field_path=field_path,
-                        match_sha256=_hash_match(matched_val),
+        if norm_candidate != sanitized:
+            norm_matches = [
+                m
+                for m in pattern.finditer(norm_candidate)
+                if (m.group(1) if m.lastindex else m.group(0)) != "[REDACTED_SECRET]"
+            ]
+            if norm_matches:
+                secret_hit = True
+                for match in norm_matches:
+                    matched_val = match.group(1) if match.lastindex else match.group(0)
+                    findings.append(
+                        RedactionRecord(
+                            kind="secret",
+                            rule_id=rule_id,
+                            field_path=field_path,
+                            match_sha256=_hash_match(matched_val),
+                        )
                     )
-                )
-            if rule_id == "url-userinfo-password":
-                sanitized = pattern.sub(
-                    lambda m: m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED_SECRET]@",
-                    norm_candidate,
-                )
-            else:
-                sanitized = pattern.sub("[REDACTED_SECRET]", norm_candidate)
+                if rule_id == "url-userinfo-password":
+                    sanitized = pattern.sub(
+                        lambda m: (
+                            m.group(0)
+                            if m.group(1) == "[REDACTED_SECRET]"
+                            else m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED_SECRET]@"
+                        ),
+                        norm_candidate,
+                    )
+                else:
+                    sanitized = pattern.sub("[REDACTED_SECRET]", norm_candidate)
 
     # 3. Blocked regex patterns from policy (checked against normalized form too)
     for rule_id, blk_pattern in blocked_regexes:
         raw_matches = list(blk_pattern.finditer(sanitized))
-        norm_candidate = normalize_str(sanitized)
-        norm_matches = list(blk_pattern.finditer(norm_candidate))
-        if raw_matches or norm_matches:
+        if raw_matches:
             blocked_hit = True
-            target_matches = raw_matches or norm_matches
-            for m in target_matches:
+            for m in raw_matches:
                 findings.append(
                     RedactionRecord(
                         kind="blocked_pattern",
@@ -283,10 +288,26 @@ def _scan_single_string(
                         match_sha256=_hash_match(m.group(0)),
                     )
                 )
-            if raw_matches:
-                sanitized = blk_pattern.sub("[REDACTED_BLOCKED]", sanitized)
-            else:
-                sanitized = blk_pattern.sub("[REDACTED_BLOCKED]", norm_candidate)
+            sanitized = blk_pattern.sub("[REDACTED_BLOCKED]", sanitized)
+
+        norm_candidate = normalize_str(sanitized)
+        if norm_candidate != sanitized:
+            norm_matches = [m for m in blk_pattern.finditer(norm_candidate) if m.group(0) != "[REDACTED_BLOCKED]"]
+            if norm_matches:
+                blocked_hit = True
+                for m in norm_matches:
+                    findings.append(
+                        RedactionRecord(
+                            kind="blocked_pattern",
+                            rule_id=rule_id,
+                            field_path=field_path,
+                            match_sha256=_hash_match(m.group(0)),
+                        )
+                    )
+                sanitized = blk_pattern.sub(
+                    lambda m: m.group(0) if m.group(0) == "[REDACTED_BLOCKED]" else "[REDACTED_BLOCKED]",
+                    norm_candidate,
+                )
 
     # 4. Deterministic high-entropy secret candidates (contextual + standalone)
     def _redact_contextual(m: re.Match[str]) -> str:
@@ -429,7 +450,7 @@ def scan_payload(
     Compute `artifact_sha256` on `payload` first, then scan recursively for planted canaries,
     known API/bearer secrets, high-entropy strings, and blocked patterns.
     """
-    artifact_sha256 = sha256_canonical(payload)
+    artifact_sha256 = sha256_exact(payload)
     findings: list[RedactionRecord] = []
     clean_canaries = tuple(t for t in canary_tokens if t)
     compiled_blocked = _compile_blocked_patterns(blocked_patterns)

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcp_airlock.core.normalize import JsonObject, sha256_canonical
+from mcp_airlock.core.normalize import JsonObject, sha256_exact
 from mcp_airlock.egress.guards import EgressValidator, WorkspacePathGuard
 from mcp_airlock.egress.scanner import scan_payload, scan_text, shannon_entropy
 
@@ -26,7 +26,7 @@ class TestEgressScanner(unittest.TestCase):
                 res = scan_payload(payload, canary_tokens=(canary,))
                 self.assertFalse(res.clean)
                 self.assertTrue(res.canary_matched)
-                self.assertEqual(res.artifact_sha256, sha256_canonical(payload))
+                self.assertEqual(res.artifact_sha256, sha256_exact(payload))
                 self.assertNotIn(canary, str(res.redacted_payload))
                 self.assertNotIn(canary, str([f.model_dump() for f in res.findings]))
                 self.assertTrue(any(f.kind == "canary" for f in res.findings))
