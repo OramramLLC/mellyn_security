@@ -25,6 +25,10 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import sync_agent_rules as sar  # noqa: E402
 
+# An example EXTRA protected path. It must not be a required entry, or the tests would write it twice (PR #13 made
+# "src/" required, which broke the original choice of "src/" here).
+EXTRA_PATH = "docs/extra-protected.md"
+
 
 class TestSelfPolicyExtraProtectedPaths(unittest.TestCase):
     def setUp(self) -> None:
@@ -47,24 +51,27 @@ class TestSelfPolicyExtraProtectedPaths(unittest.TestCase):
     def _paths_on_disk(self) -> list[str]:
         return list(tomllib.loads(self.policy.read_text(encoding="utf-8"))["protected_paths"])
 
+    def test_example_extra_path_is_not_required(self) -> None:
+        self.assertNotIn(EXTRA_PATH, sar.SELF_PROTECTED_PATHS)
+
     def test_extra_path_anywhere_in_the_list_passes(self) -> None:
         required = sar.SELF_PROTECTED_PATHS
-        self._write_paths((*required, "src/"))
+        self._write_paths((*required, EXTRA_PATH))
         self.assertEqual(self._check(), 0)
-        self._write_paths((required[0], "src/", *required[1:]))  # extra entry in the middle, as a PR may add it
+        self._write_paths((required[0], EXTRA_PATH, *required[1:]))  # extra entry in the middle, as a PR may add it
         self.assertEqual(self._check(), 0)
 
     def test_missing_required_path_is_drift_and_regeneration_restores_it(self) -> None:
         required = sar.SELF_PROTECTED_PATHS
-        self._write_paths((*required[1:], "src/"))
+        self._write_paths((*required[1:], EXTRA_PATH))
         self.assertEqual(self._check(), 1)
         with mock.patch("builtins.print"):
             self.assertEqual(sar.main(["--root", str(self.root)]), 0)
-        self.assertEqual(self._paths_on_disk(), [*required, "src/"])  # required restored, extra kept
+        self.assertEqual(self._paths_on_disk(), [*required, EXTRA_PATH])  # required restored, extra kept
         self.assertEqual(self._check(), 0)
 
     def test_other_edits_are_still_drift(self) -> None:
-        self._write_paths((*sar.SELF_PROTECTED_PATHS, "src/"))
+        self._write_paths((*sar.SELF_PROTECTED_PATHS, EXTRA_PATH))
         self.policy.write_text(self.policy.read_text(encoding="utf-8") + "\n# manual edit\n", encoding="utf-8")
         self.assertEqual(self._check(), 1)
 
