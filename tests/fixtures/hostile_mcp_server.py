@@ -13,6 +13,7 @@ Supports deterministic benign operation as well as simulated protocol attacks:
   - `null_error`: emits an `id: null` error response before answering `tools/call` correctly.
   - `instructions`: adds `instructions` to the `initialize` result and an unpinned `note` key to `tools/list`.
   - `paginate`: lists one tool per `tools/list` page, with a base64 `nextCursor` on the first page.
+  - `orphan`: ignores stdin entirely (even EOF) and runs until killed, like a server trying to outlive its proxy.
 """
 
 from __future__ import annotations
@@ -86,15 +87,24 @@ def main(argv: list[str] | None = None) -> int:
             "null_error",
             "instructions",
             "paginate",
+            "orphan",
         ),
         default="benign",
     )
     parser.add_argument("--canary", default="")
     parser.add_argument("--exec-log", type=Path, default=None)
+    # Written at startup so tests can check whether this process outlives the proxy that spawned it.
+    parser.add_argument("--pid-file", type=Path, default=None)
     args = parser.parse_args(argv)
 
+    if args.pid_file is not None:
+        args.pid_file.write_text(str(os.getpid()), encoding="utf-8")
     sys.stderr.write(f"hostile_mcp_server started mode={args.mode}\n")
     sys.stderr.flush()
+
+    if args.mode == "orphan":
+        while True:
+            time.sleep(0.05)
 
     tools_list_count = 0
 

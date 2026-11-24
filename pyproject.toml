@@ -26,6 +26,12 @@ dev = [
     "ruff>=0.8.0",
 ]
 
+[project.scripts]
+mellyn-airlock = "mcp_airlock.airlock.proxy:main"
+mellyn-pin = "mcp_airlock.airlock.pin_cli:main"
+mellyn-ir = "mcp_airlock.ir_lab.reconstruct:main"
+mellyn-bench = "mcp_airlock.egress.bench:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

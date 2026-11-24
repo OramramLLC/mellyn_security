@@ -395,11 +395,14 @@ _INT64_MAX = 2**63 - 1
 
 def rpc_id_problem(rpc_id: int | str | None) -> str | None:
     """
-    Bound the JSON-RPC `id` so it cannot carry bulk data: strings up to `MAX_RPC_ID_CHARS`, integers within
+    Bound the JSON-RPC `id` so it cannot carry bulk data: strings up to `MAX_RPC_ID_CHARS` without control
+    characters (an id lands in audit records and reports, where a newline could forge lines), integers within
     signed 64-bit. Returns a reason string when the id is out of bounds.
     """
     if isinstance(rpc_id, str) and len(rpc_id) > MAX_RPC_ID_CHARS:
         return f"JSON-RPC id is longer than {MAX_RPC_ID_CHARS} characters."
+    if isinstance(rpc_id, str) and _CONTROL_CHARS_RE.search(rpc_id):
+        return "JSON-RPC id contains control characters."
     if isinstance(rpc_id, int) and not _INT64_MIN <= rpc_id <= _INT64_MAX:
         return "JSON-RPC integer id is outside the signed 64-bit range."
     return None
