@@ -18,7 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mcp_airlock.core.audit import LedgerAnchor, redact_core_secrets
 from mcp_airlock.core.normalize import is_invisible_codepoint
-from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, AuditLedgerEntry, Severity, Zone
+from mcp_airlock.core.schemas import (
+    AAD_CONTAINMENT_CONFIRMED_RULE_ID,
+    SESSION_STARTED_RULE_ID,
+    AuditLedgerEntry,
+    Severity,
+    Zone,
+)
 from mcp_airlock.ir_lab.verify_chain import ChainVerificationReport, read_and_verify_chain
 
 _MD_UNSAFE_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
@@ -132,6 +138,8 @@ class SessionTimeline(BaseModel):
     block_precursors: list[TimelineEvent] = Field(default_factory=list)
     terminal_event: TerminalTrigger | None = None
     events: list[TimelineEvent] = Field(default_factory=list)
+    # From the session's `airlock.session_started` event; None for ledgers written before sessions recorded it.
+    enforcement_mode: Literal["enforce", "observe"] | None = None
 
 
 class IncidentReport(BaseModel):
@@ -142,6 +150,7 @@ class IncidentReport(BaseModel):
     status: Literal[
         "CLEAN",
         "BLOCKED_ACTIVITY",
+        "OBSERVED_VIOLATIONS",
         "AAD_CONTAINED",
         "AAD_TRIGGERED_UNCONFIRMED",
         "INTEGRITY_COMPROMISED",
@@ -151,6 +160,8 @@ class IncidentReport(BaseModel):
     session_count: int = Field(ge=0)
     total_events: int = Field(ge=0)
     unconfirmed_aad_triggers: int = Field(default=0, ge=0)
+    observed_aad_count: int = Field(default=0, ge=0)
+    observed_block_count: int = Field(default=0, ge=0)
     sessions: list[SessionTimeline] = Field(default_factory=list)
     terminal_event: TerminalTrigger | None = None
 
@@ -189,6 +200,8 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
             session_count=0,
             total_events=0,
             unconfirmed_aad_triggers=0,
+            observed_aad_count=0,
+            observed_block_count=0,
             sessions=[],
             terminal_event=None,
         )
@@ -201,7 +214,9 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
 
     sessions: list[SessionTimeline] = []
     all_aad_triggers: list[TerminalTrigger] = []
-    saw_block = False
+    saw_enforced_block = False
+    observed_aad_count = 0
+    observed_block_count = 0
 
     for sid, sid_entries in grouped.items():
         zones_traversed: list[Zone] = []
@@ -211,11 +226,19 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         aad_triggers: list[TerminalTrigger] = []
         aad_index_by_id: dict[str, int] = {}
         prev_zone: Zone | None = None
+        session_mode: Literal["enforce", "observe"] | None = None
 
         for entry in sid_entries:
             ev = entry.event
             reason_code = map_reason_code(ev.rule_id)
             safe_reason = redact_core_secrets(ev.reason)
+            is_observed = ev.metadata.get("enforcement_mode") == "observe"
+            if ev.rule_id == SESSION_STARTED_RULE_ID:
+                started_mode = ev.metadata.get("enforcement_mode")
+                if started_mode == "observe":
+                    session_mode = "observe"
+                elif started_mode == "enforce":
+                    session_mode = "enforce"
             t_ev = TimelineEvent(
                 seq=entry.seq,
                 timestamp_utc=ev.timestamp_utc,
@@ -240,27 +263,33 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
             prev_zone = ev.zone
 
             if ev.severity == "BLOCK":
-                saw_block = True
+                if is_observed:
+                    observed_block_count += 1
+                else:
+                    saw_enforced_block = True
                 block_precursors.append(t_ev)
             elif ev.severity == "AAD_FIRE":
-                trigger = TerminalTrigger(
-                    seq=entry.seq,
-                    timestamp_utc=ev.timestamp_utc,
-                    session_id=sid,
-                    zone=ev.zone,
-                    action=ev.action,
-                    rule_id=ev.rule_id,
-                    reason_code=reason_code,
-                    rpc_id=ev.request_id,
-                    tool_name=ev.tool_name,
-                    artifact_sha256=ev.artifact_sha256,
-                    redacted_summary=safe_reason,
-                    trigger_event_id=ev.event_id,
-                    containment_confirmed=False,
-                    containment_seq=None,
-                )
-                aad_index_by_id[ev.event_id] = len(aad_triggers)
-                aad_triggers.append(trigger)
+                if is_observed:
+                    observed_aad_count += 1
+                else:
+                    trigger = TerminalTrigger(
+                        seq=entry.seq,
+                        timestamp_utc=ev.timestamp_utc,
+                        session_id=sid,
+                        zone=ev.zone,
+                        action=ev.action,
+                        rule_id=ev.rule_id,
+                        reason_code=reason_code,
+                        rpc_id=ev.request_id,
+                        tool_name=ev.tool_name,
+                        artifact_sha256=ev.artifact_sha256,
+                        redacted_summary=safe_reason,
+                        trigger_event_id=ev.event_id,
+                        containment_confirmed=False,
+                        containment_seq=None,
+                    )
+                    aad_index_by_id[ev.event_id] = len(aad_triggers)
+                    aad_triggers.append(trigger)
             elif ev.rule_id == AAD_CONTAINMENT_CONFIRMED_RULE_ID:
                 ref_id = ev.metadata.get("trigger_event_id")
                 if isinstance(ref_id, str) and ref_id in aad_index_by_id:
@@ -286,6 +315,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
                 block_precursors=block_precursors,
                 terminal_event=session_terminal,
                 events=events,
+                enforcement_mode=session_mode,
             )
         )
 
@@ -295,13 +325,21 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         unconfirmed_triggers[-1] if unconfirmed_triggers else (all_aad_triggers[-1] if all_aad_triggers else None)
     )
 
-    status: Literal["CLEAN", "BLOCKED_ACTIVITY", "AAD_CONTAINED", "AAD_TRIGGERED_UNCONFIRMED"]
+    status: Literal[
+        "CLEAN",
+        "BLOCKED_ACTIVITY",
+        "OBSERVED_VIOLATIONS",
+        "AAD_CONTAINED",
+        "AAD_TRIGGERED_UNCONFIRMED",
+    ]
     if unconfirmed_count > 0:
         status = "AAD_TRIGGERED_UNCONFIRMED"
     elif all_aad_triggers:
         status = "AAD_CONTAINED"
-    elif saw_block:
+    elif saw_enforced_block:
         status = "BLOCKED_ACTIVITY"
+    elif observed_aad_count > 0 or observed_block_count > 0:
+        status = "OBSERVED_VIOLATIONS"
     else:
         status = "CLEAN"
 
@@ -312,6 +350,8 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         session_count=len(sessions),
         total_events=len(entries),
         unconfirmed_aad_triggers=unconfirmed_count,
+        observed_aad_count=observed_aad_count,
+        observed_block_count=observed_block_count,
         sessions=sessions,
         terminal_event=global_terminal,
     )
@@ -354,6 +394,11 @@ def render_markdown(report: IncidentReport) -> str:
         )
     elif report.status == "AAD_CONTAINED":
         lines.append("- **Containment**: CONFIRMED (matching post-reap completion receipt attests direct child exit)")
+    if report.status == "OBSERVED_VIOLATIONS" or report.observed_aad_count > 0 or report.observed_block_count > 0:
+        lines.append(
+            f"- **Observed Violations (observe mode)**: `observed_aad_count={report.observed_aad_count}`, "
+            f"`observed_block_count={report.observed_block_count}`"
+        )
 
     if report.terminal_event is not None:
         term = report.terminal_event
@@ -380,6 +425,7 @@ def render_markdown(report: IncidentReport) -> str:
                 f"## Session {_code(sess.session_id)} ({sess.event_count} events)",
                 f"- **Zones Traversed**: {_md(zones_str)}",
                 f"- **Zone Transitions**: {_md(trans_str)}",
+                f"- **Mode**: {sess.enforcement_mode or 'unknown (no session_start record)'}",
                 f"- **BLOCK Precursors**: {len(sess.block_precursors)}",
                 "",
                 "| Seq | Time (UTC) | Zone | Action | Severity | Reason Code | RPC ID | Tool |",

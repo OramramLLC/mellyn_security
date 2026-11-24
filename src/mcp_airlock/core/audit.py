@@ -11,6 +11,9 @@ Invariants enforced (per AGENTS.md):
 
 from __future__ import annotations
 
+import base64
+import binascii
+import functools
 import hashlib
 import json
 import os
@@ -18,6 +21,7 @@ import re
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import unquote
@@ -60,6 +64,10 @@ CORE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 # The lookbehind makes a scheme start only at a token boundary, keeping the scan linear on long words.
 _URL_USERINFO_SECRET_RE = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)")
+_CANARY_SEP_RE = re.compile(r"[\s._:/\\|-]+")
+_HEX_CANDIDATE_RE = re.compile(r"[0-9A-Fa-f]{16,}")
+_DELIMITED_HEX_CANDIDATE_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:\-\s]+){7,}[0-9A-Fa-f]{2}")
+_B64_CANDIDATE_RE = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
 
 
 def _compile_obfuscated_canary_regex(token: str) -> re.Pattern[str]:
@@ -75,10 +83,162 @@ def _compile_obfuscated_canary_regex(token: str) -> re.Pattern[str]:
     return re.compile(gap.join(escaped_chars), re.IGNORECASE)
 
 
-def _canary_present(text: str, folded_canary: str) -> bool:
-    """True if the canary appears after invisible stripping + NFKC, ignoring case, directly or percent-decoded."""
+@dataclass(frozen=True)
+class _CanarySignature:
+    norm_canary: str
+    folded: str
+    obfuscated_re: re.Pattern[str]
+    reversed_folded: str | None
+    hex_lower: str | None
+    delimited_hex_re: re.Pattern[str] | None
+    b64_slices: tuple[str, ...]
+    skeleton: str | None
+
+
+@functools.lru_cache(maxsize=256)
+def _canary_signature(norm_canary: str) -> _CanarySignature:
+    folded = norm_canary.casefold()
+    raw_bytes = norm_canary.encode("utf-8")
+    hex_lower = raw_bytes.hex() if len(raw_bytes) >= 6 else None
+    delimited_hex_re = (
+        re.compile(r"[:\-\s]+".join(f"{b:02x}" for b in raw_bytes), re.IGNORECASE) if len(norm_canary) >= 8 else None
+    )
+    slices: list[str] = []
+    seen_slices: set[str] = set()
+    for enc_fn in (base64.b64encode, base64.urlsafe_b64encode):
+        for offset in (0, 1, 2):
+            padded = (b"\x00" * offset) + raw_bytes
+            unpadded = enc_fn(padded).decode("ascii").rstrip("=")
+            lead = 0 if offset == 0 else (2 if offset == 1 else 3)
+            trail = 0 if (len(padded) % 3 == 0) else 1
+            end = len(unpadded) - trail if trail else len(unpadded)
+            inv = unpadded[lead:end]
+            if len(inv) >= 12 and inv not in seen_slices:
+                seen_slices.add(inv)
+                slices.append(inv)
+    skel = _CANARY_SEP_RE.sub("", norm_canary).casefold()
+    skeleton = skel if (len(norm_canary) >= 8 and len(skel) >= 8) else None
+    return _CanarySignature(
+        norm_canary=norm_canary,
+        folded=folded,
+        obfuscated_re=_compile_obfuscated_canary_regex(norm_canary),
+        reversed_folded=norm_canary[::-1].casefold() if len(norm_canary) >= 8 else None,
+        hex_lower=hex_lower,
+        delimited_hex_re=delimited_hex_re,
+        b64_slices=tuple(slices),
+        skeleton=skeleton,
+    )
+
+
+def _match_plain_forms(norm: str, sig: _CanarySignature) -> bool:
+    norm_folded = norm.casefold()
+    if sig.folded in norm_folded:
+        return True
+    if sig.reversed_folded is not None and sig.reversed_folded in norm_folded:
+        return True
+    if sig.skeleton is not None and sig.skeleton in _CANARY_SEP_RE.sub("", norm).casefold():
+        return True
+    return False
+
+
+def _canary_present_plain(text: str, sig: _CanarySignature) -> bool:
+    """Plaintext, reversed, separator-stripped, and single/double percent-decoded match without candidate decoding."""
     norm = normalize_str(text)
-    return folded_canary in norm.casefold() or folded_canary in normalize_str(unquote(norm)).casefold()
+    if _match_plain_forms(norm, sig):
+        return True
+    if "%" in norm:
+        u1 = normalize_str(unquote(norm))
+        if _match_plain_forms(u1, sig):
+            return True
+        if "%" in u1:
+            u2 = normalize_str(unquote(u1))
+            if _match_plain_forms(u2, sig):
+                return True
+    return False
+
+
+def canary_present(text: str, canary: str) -> bool:
+    """
+    Deterministic check for raw, NFKC/invisible-obfuscated, percent-encoded (1x/2x), reversed,
+    punctuation/whitespace-interleaved, hex (contiguous/delimited), and Base64/Base64url (all 3 byte
+    alignments) canary forms inside `text`.
+    """
+    norm_canary = normalize_str(canary)
+    if not norm_canary:
+        return False
+    sig = _canary_signature(norm_canary)
+    norm = normalize_str(text)
+    if _canary_present_plain(norm, sig):
+        return True
+    norm_folded = norm.casefold()
+    if sig.hex_lower is not None and sig.hex_lower in norm_folded:
+        return True
+    if sig.delimited_hex_re is not None and sig.delimited_hex_re.search(norm) is not None:
+        return True
+    if any(sl in norm for sl in sig.b64_slices):
+        return True
+
+    for m in _HEX_CANDIDATE_RE.finditer(norm):
+        tok = m.group(0)
+        candidates = (tok,) if len(tok) % 2 == 0 else (tok[:-1], tok[1:])
+        for cand in candidates:
+            try:
+                decoded = bytes.fromhex(cand).decode("utf-8", errors="ignore")
+            except ValueError:
+                continue
+            if decoded and _canary_present_plain(decoded, sig):
+                return True
+
+    for m in _DELIMITED_HEX_CANDIDATE_RE.finditer(norm):
+        compact = re.sub(r"[:\-\s]+", "", m.group(0))
+        if len(compact) % 2 != 0:
+            compact = compact[:-1]
+        try:
+            decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
+        except ValueError:
+            continue
+        if decoded and _canary_present_plain(decoded, sig):
+            return True
+
+    for m in _B64_CANDIDATE_RE.finditer(norm):
+        core = m.group(0).rstrip("=").replace("-", "+").replace("_", "/")
+        for offset in (0, 1, 2, 3):
+            shifted = core[offset:]
+            if len(shifted) < 12:
+                continue
+            rem = len(shifted) % 4
+            if rem == 1:
+                shifted = shifted[:-1]
+            elif rem:
+                shifted = shifted + ("=" * (4 - rem))
+            try:
+                decoded = base64.b64decode(shifted, validate=False).decode("utf-8", errors="ignore")
+            except (binascii.Error, ValueError):
+                continue
+            if decoded and _canary_present_plain(decoded, sig):
+                return True
+
+    return False
+
+
+def redact_canary_in_text(text: str, canary: str) -> tuple[str, bool]:
+    """
+    Detect and redact any plain, obfuscated, reversed, interleaved, percent-encoded, hex, or Base64
+    representation of `canary` inside `text`. Returns `(sanitized, matched)`.
+    """
+    if not canary:
+        return text, False
+    norm_canary = normalize_str(canary)
+    matched = (canary in text) or (bool(norm_canary) and canary_present(text, canary))
+    if not matched:
+        return text, False
+    sanitized = text.replace(canary, "[REDACTED_CANARY]")
+    if norm_canary:
+        sanitized = _canary_signature(norm_canary).obfuscated_re.sub("[REDACTED_CANARY]", sanitized)
+        if canary in sanitized or canary_present(sanitized, canary):
+            # Encoded, homoglyphed, reversed, or interleaved residue cannot be excised cleanly in place.
+            sanitized = "[REDACTED_CANARY]"
+    return sanitized, True
 
 
 def redact_core_secrets(
@@ -87,18 +247,13 @@ def redact_core_secrets(
     canary_tokens: tuple[str, ...] = (),
     extra_redactor: Callable[[str], str] | None = None,
 ) -> str:
-    """Redact canary tokens (any case, tag-obfuscated, NFKC-homoglyphed, percent-encoded), URL passwords, secrets."""
+    """
+    Redact canary tokens (raw, tag-obfuscated, NFKC, percent-encoded, hex, Base64, reversed, interleaved),
+    URL passwords, and known credential patterns.
+    """
     sanitized = text
     for canary in canary_tokens:
-        if not canary:
-            continue
-        sanitized = sanitized.replace(canary, "[REDACTED_CANARY]")
-        norm_canary = normalize_str(canary)
-        if norm_canary:
-            sanitized = _compile_obfuscated_canary_regex(norm_canary).sub("[REDACTED_CANARY]", sanitized)
-            if _canary_present(sanitized, norm_canary.casefold()):
-                # Homoglyph or percent-encoded residue cannot be cut out in place; redact the whole string.
-                sanitized = "[REDACTED_CANARY]"
+        sanitized, _ = redact_canary_in_text(sanitized, canary)
 
     sanitized = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", sanitized)
     for pattern in CORE_SECRET_PATTERNS:
@@ -504,8 +659,7 @@ class AuditLedger:
 
             # Hard defense-in-depth invariant: refuse to flush if any canary form survived sanitization.
             for canary in self.canary_tokens:
-                norm_canary = normalize_str(canary)
-                if canary in line_text or (norm_canary and _canary_present(line_text, norm_canary.casefold())):
+                if canary in line_text or canary_present(line_text, canary):
                     raise RuntimeError("Audit redaction invariant violated: canary value survived sanitization.")
 
             payload_line = line_bytes + b"\n"

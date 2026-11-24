@@ -14,10 +14,10 @@ import hashlib
 import math
 import re
 from collections.abc import Sequence
-from urllib.parse import unquote
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mcp_airlock.core.audit import redact_canary_in_text
 from mcp_airlock.core.normalize import JsonValue, normalize_str, sha256_exact
 from mcp_airlock.core.schemas import RedactionRecord
 
@@ -142,27 +142,6 @@ def _is_high_entropy_candidate(token: str, *, threshold: float, min_length: int,
     return shannon_entropy(token) >= threshold
 
 
-def _compile_obfuscated_canary_regex(token: str) -> re.Pattern[str]:
-    norm_token = normalize_str(token)
-    if not norm_token:
-        return re.compile(re.escape(token))
-    gap = (
-        r"[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u2060\u2800"
-        r"\u3164\ufeff\uffa0\ufe00-\ufe0f\U000e0000-\U000e007f\U000e0100-\U000e01ef]*"
-    )
-    return re.compile(gap.join(re.escape(ch) for ch in norm_token), re.IGNORECASE)
-
-
-def _canary_present(text: str, folded_canary: str) -> bool:
-    """
-    True if the canary appears in `text` after invisible stripping + NFKC, ignoring case, either directly or
-    after percent-decoding. Splitting a canary across separate fields is NOT detected (a known limit of
-    per-string scanning); planted canaries should be long random tokens so partial leaks are still unique.
-    """
-    norm = normalize_str(text)
-    return folded_canary in norm.casefold() or folded_canary in normalize_str(unquote(norm)).casefold()
-
-
 class EgressScanResult(BaseModel):
     """Structured redacted output from `egress.scanner`."""
 
@@ -194,16 +173,13 @@ def _scan_single_string(
     entropy_hit = False
     blocked_hit = False
 
-    # 1. Planted canary tokens (raw, any letter case, tag/ZWSP-obfuscated, NFKC homoglyphs, percent-encoded)
+    # 1. Planted canary tokens (raw, case, tags/ZWSP, NFKC, percent-encoded, hex, Base64, reversed, interleaved)
     for idx, canary in enumerate(canary_tokens):
         if not canary:
             continue
         rule_id = f"canary-{idx}"
-        norm_canary = normalize_str(canary)
-        matched_raw = canary in sanitized
-        matched_norm = bool(norm_canary) and _canary_present(sanitized, norm_canary.casefold())
-
-        if matched_raw or matched_norm:
+        sanitized, matched = redact_canary_in_text(sanitized, canary)
+        if matched:
             canary_hit = True
             findings.append(
                 RedactionRecord(
@@ -213,12 +189,6 @@ def _scan_single_string(
                     match_sha256=_hash_match(canary),
                 )
             )
-            sanitized = sanitized.replace(canary, "[REDACTED_CANARY]")
-            if norm_canary:
-                sanitized = _compile_obfuscated_canary_regex(norm_canary).sub("[REDACTED_CANARY]", sanitized)
-                if _canary_present(sanitized, norm_canary.casefold()):
-                    # Homoglyph or percent-encoded residue cannot be cut out in place; redact the whole string.
-                    sanitized = "[REDACTED_CANARY]"
 
     # 2. Known credential & API secret regexes (raw + NFKC/invisible-stripped obfuscation)
     for rule_id, pattern in KNOWN_SECRET_RULES:

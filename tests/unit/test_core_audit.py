@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
 import unittest
@@ -169,6 +170,40 @@ class TestRedactBeforeDisk(unittest.TestCase):
                 self.assertNotIn(raw_sensitive, disk_text)
             self.assertIn("[REDACTED_CANARY]", disk_text)
             self.assertIn("[REDACTED_SECRET]", disk_text)
+            self.assertTrue(verify_ledger(log_path).valid)
+
+    def test_redacts_and_blocks_encoded_reversed_and_interleaved_canaries_before_disk(self) -> None:
+        canary = "MEL_CANARY_9981_SECRET"
+        raw = canary.encode("utf-8")
+        encoded_forms = (
+            raw.hex(),
+            raw.hex().upper(),
+            ":".join(f"{b:02x}" for b in raw),
+            base64.b64encode(raw).decode("ascii"),
+            base64.b64encode(b"p" + raw).decode("ascii"),
+            base64.urlsafe_b64encode(raw).decode("ascii"),
+            canary[::-1],
+            canary.replace("_", "%255F"),
+            ".".join(canary),
+            "-".join(canary),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "audit.jsonl"
+            ledger = AuditLedger(log_path, canary_tokens=(canary,))
+            event = _make_event(
+                0,
+                verdict_allow=False,
+                severity="AAD_FIRE",
+                reason=f"Blocked hex {encoded_forms[0]}",
+                metadata={f"v{i}": form for i, form in enumerate(encoded_forms)},
+            )
+            entry = ledger.record(event, raw_artifact={"leaks": list(encoded_forms)})
+            self.assertEqual(entry.event.reason, "[REDACTED_CANARY]")
+            disk_text = log_path.read_text(encoding="utf-8")
+            for form in encoded_forms:
+                self.assertNotIn(form, disk_text)
+                self.assertNotIn(form.casefold(), disk_text.casefold())
+            self.assertIn("[REDACTED_CANARY]", disk_text)
             self.assertTrue(verify_ledger(log_path).valid)
 
 
