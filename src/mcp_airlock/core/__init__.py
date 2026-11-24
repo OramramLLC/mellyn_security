@@ -1,6 +1,14 @@
 """Mellyn core primitives: Unicode/JSON canonicalization, strict wire schemas, and tamper-evident audit ledger."""
 
-from mcp_airlock.core.audit import AuditLedger, LedgerAnchor, redact_core_secrets, verify_ledger, verify_ledger_bytes
+from mcp_airlock.core.audit import (
+    AuditLedger,
+    LedgerAnchor,
+    canary_present,
+    redact_canary_in_text,
+    redact_core_secrets,
+    verify_ledger,
+    verify_ledger_bytes,
+)
 from mcp_airlock.core.normalize import (
     JsonObject,
     JsonScalar,
@@ -18,6 +26,7 @@ from mcp_airlock.core.normalize import (
 from mcp_airlock.core.schemas import (
     AAD_CONTAINMENT_CONFIRMED_RULE_ID,
     GENESIS_PREV_HASH,
+    SESSION_STARTED_RULE_ID,
     AuditLedgerEntry,
     LedgerVerification,
     RedactionKind,
@@ -30,6 +39,7 @@ from mcp_airlock.core.schemas import (
 
 __all__ = [
     "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
+    "SESSION_STARTED_RULE_ID",
     "AuditLedger",
     "AuditLedgerEntry",
     "GENESIS_PREV_HASH",
@@ -45,11 +55,13 @@ __all__ = [
     "Zone",
     "ZoneEvent",
     "canonical_json_bytes",
+    "canary_present",
     "exact_json_bytes",
     "has_invisible_unicode",
     "is_invisible_codepoint",
     "normalize_str",
     "normalize_value",
+    "redact_canary_in_text",
     "redact_core_secrets",
     "sha256_canonical",
     "sha256_exact",

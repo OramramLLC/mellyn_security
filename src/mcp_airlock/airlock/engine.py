@@ -358,6 +358,42 @@ def _evaluate_argument_names(arguments: JsonObject, *, tool_rule: ToolPolicyRule
     return True, "All arguments declared."
 
 
+def _check_allow_regex_str(val: str, *, label: str, allow_pattern: str) -> str | None:
+    if has_invisible_unicode(val):
+        return f"Argument '{label}' contains invisible Unicode characters."
+    # The exact value is what gets forwarded, so the allow-rule must match the exact value. Rejecting
+    # non-NFKC input stops compatibility characters (e.g. full-width letters) matching after normalization.
+    if normalize_str(val) != val:
+        return f"Argument '{label}' is not in Unicode NFKC normal form."
+    if re.fullmatch(allow_pattern, val) is None:
+        return f"Argument '{label}' failed required regex constraint."
+    return None
+
+
+def _find_deny_regex_hit(node: JsonValue, *, location: str, deny_pattern: str) -> str | None:
+    if isinstance(node, str):
+        norm_val = normalize_str(node)
+        if re.search(deny_pattern, node) is not None or re.search(deny_pattern, norm_val) is not None:
+            return f"Argument '{location}' matched blocked regex constraint."
+        return None
+    if isinstance(node, list):
+        for idx, item in enumerate(node):
+            hit = _find_deny_regex_hit(item, location=f"{location}[{idx}]", deny_pattern=deny_pattern)
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(node, dict):
+        for child_key, child_val in node.items():
+            norm_key = normalize_str(child_key)
+            if re.search(deny_pattern, child_key) is not None or re.search(deny_pattern, norm_key) is not None:
+                return f"Argument '{location}.{child_key}' key matched blocked regex constraint."
+            hit = _find_deny_regex_hit(child_val, location=f"{location}.{child_key}", deny_pattern=deny_pattern)
+            if hit is not None:
+                return hit
+        return None
+    return None
+
+
 def _evaluate_regex_rules(arguments: JsonObject, *, tool_rule: ToolPolicyRule | None) -> tuple[bool, str]:
     if tool_rule is None:
         return True, "No regex rules configured."
@@ -365,26 +401,31 @@ def _evaluate_regex_rules(arguments: JsonObject, *, tool_rule: ToolPolicyRule | 
         if key not in arguments:
             return False, f"Missing required argument '{key}' for regex policy rule."
         val = arguments[key]
-        if not isinstance(val, str):
-            return False, f"Argument '{key}' must be a string for regex policy validation."
-        if has_invisible_unicode(val):
-            return False, f"Argument '{key}' contains invisible Unicode characters."
-        # The exact value is what gets forwarded, so the allow-rule must match the exact value. Rejecting
-        # non-NFKC input stops compatibility characters (e.g. full-width letters) matching after normalization.
-        if normalize_str(val) != val:
-            return False, f"Argument '{key}' is not in Unicode NFKC normal form."
-        if re.fullmatch(allow_pattern, val) is None:
-            return False, f"Argument '{key}' failed required regex constraint."
+        if isinstance(val, str):
+            err = _check_allow_regex_str(val, label=key, allow_pattern=allow_pattern)
+            if err is not None:
+                return False, err
+        elif isinstance(val, list):
+            if not val:
+                return False, f"Argument '{key}' list cannot be empty for regex policy validation."
+            for idx, item in enumerate(val):
+                if not isinstance(item, str):
+                    return False, f"Argument '{key}[{idx}]' must be a string for regex policy validation."
+                err = _check_allow_regex_str(item, label=f"{key}[{idx}]", allow_pattern=allow_pattern)
+                if err is not None:
+                    return False, err
+        else:
+            return False, f"Argument '{key}' must be a string or list of strings for regex policy validation."
 
     for key, deny_pattern in tool_rule.arg_deny_regex_rules.items():
         if key not in arguments:
             continue
         val = arguments[key]
-        if not isinstance(val, str):
-            return False, f"Argument '{key}' must be a string for deny regex inspection."
-        norm_val = normalize_str(val)
-        if re.search(deny_pattern, val) is not None or re.search(deny_pattern, norm_val) is not None:
-            return False, f"Argument '{key}' matched blocked regex constraint."
+        if not isinstance(val, str | list | dict):
+            return False, f"Argument '{key}' must be a string, list, or object for deny regex inspection."
+        hit = _find_deny_regex_hit(val, location=key, deny_pattern=deny_pattern)
+        if hit is not None:
+            return False, hit
     return True, "Regex rules satisfied."
 
 
@@ -614,11 +655,44 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
     )
 
 
+_RESOURCE_BLOB_PLACEHOLDER = "[RESOURCE_BLOB]"
+
+
+def _split_resource_blobs(payload: JsonValue, policy: AirlockPolicy) -> tuple[JsonValue, list[EgressScanResult]]:
+    """
+    For a `resources/read` result, scan each `contents[i].blob` (base64 binary) as an opaque token and blank it out
+    of the main scan. Binary data always looks high-entropy, so the entropy detector would block every image or
+    archive; canaries (including base64-decoded forms), known secret formats and blocked patterns are still checked.
+    """
+    if not isinstance(payload, dict):
+        return payload, []
+    contents = payload.get("contents")
+    if not isinstance(contents, list):
+        return payload, []
+    blob_scans: list[EgressScanResult] = []
+    scanned_contents: list[JsonValue] = []
+    for idx, item in enumerate(contents):
+        if isinstance(item, dict) and isinstance(item.get("blob"), str):
+            blob = cast(str, item["blob"])
+            blob_scans.append(scan_opaque_token(blob, policy, field_path=f"$.contents[{idx}].blob"))
+            scanned_contents.append({**item, "blob": _RESOURCE_BLOB_PLACEHOLDER})
+        else:
+            scanned_contents.append(item)
+    return {**payload, "contents": scanned_contents}, blob_scans
+
+
 def evaluate_tool_response(
     response: JsonRpcSuccessResponse | JsonRpcErrorResponse,
     policy: AirlockPolicy,
+    *,
+    resource_read: bool = False,
 ) -> Verdict:
-    """Scan inbound downstream tool outputs through `egress.scanner` (canary -> `AAD_FIRE`, secrets -> `BLOCK`)."""
+    """
+    Scan inbound downstream tool outputs through `egress.scanner` (canary -> `AAD_FIRE`, secrets -> `BLOCK`).
+
+    With `resource_read=True` (a `resources/read` response), `contents[].blob` values are scanned without the
+    high-entropy detector; see `_split_resource_blobs`.
+    """
     raw_resp: JsonObject = cast(JsonObject, response.model_dump(mode="json"))
     try:
         raw_bytes = exact_json_bytes(raw_resp)
@@ -668,17 +742,28 @@ def evaluate_tool_response(
         if isinstance(response, JsonRpcSuccessResponse)
         else cast(JsonObject, response.error.model_dump(mode="json"))
     )
+    scan_target, blob_scans = (
+        _split_resource_blobs(payload, policy)
+        if (resource_read and isinstance(response, JsonRpcSuccessResponse))
+        else (payload, [])
+    )
     scan = scan_payload(
-        payload,
+        scan_target,
         canary_tokens=policy.canary_tokens,
         blocked_patterns=policy.blocked_patterns,
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
     id_scan = scan_rpc_id(response.id, policy)
-    all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
+    all_findings = [
+        *(id_scan.findings if id_scan is not None else ()),
+        *scan.findings,
+        *(finding for blob_scan in blob_scans for finding in blob_scan.findings),
+    ]
+    blob_canary = any(blob_scan.canary_matched for blob_scan in blob_scans)
+    blob_dirty = any(not blob_scan.clean for blob_scan in blob_scans)
 
-    if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
+    if scan.canary_matched or blob_canary or (id_scan is not None and id_scan.canary_matched):
         return Verdict(
             verdict_allow=False,
             severity="AAD_FIRE",
@@ -700,7 +785,7 @@ def evaluate_tool_response(
             redacted_payload=scan.redacted_payload,
         )
 
-    if not scan.clean or (id_scan is not None and not id_scan.clean):
+    if not scan.clean or blob_dirty or (id_scan is not None and not id_scan.clean):
         return Verdict(
             verdict_allow=False,
             severity="BLOCK",
@@ -716,6 +801,152 @@ def evaluate_tool_response(
         severity="ALLOW",
         rule_id="airlock.response_allowed",
         reason="Inbound tool response cleared egress scanning.",
+        artifact_sha256=artifact_sha256,
+        redacted_payload=scan.redacted_payload,
+    )
+
+
+def evaluate_resource_read(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdict:
+    """
+    Pure fail-closed evaluation of an outbound MCP `resources/read` request:
+      1. Computes `artifact_sha256` and payload cap over exact wire bytes before content scanning.
+      2. Scans `params` and `id` through `egress.scanner` (canary -> `AAD_FIRE`).
+      3. Enforces `policy.allow_resources_read` and workspace confinement on `params.uri` (`file://` or relative).
+    """
+    raw_req: JsonObject = cast(JsonObject, request.model_dump(mode="json"))
+    try:
+        raw_bytes = exact_json_bytes(raw_req)
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.request_canonicalization_error",
+            reason=f"Request is not strict JSON: {exc}",
+            artifact_sha256=_safe_artifact_sha256(raw_req),
+        )
+    artifact_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    if request.method != "resources/read":
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.unsupported_method",
+            reason=f"Expected method 'resources/read', got '{request.method}'.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    if len(raw_bytes) > policy.max_payload_bytes:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.payload_too_large",
+            reason=f"Request size {len(raw_bytes)} exceeds limit of {policy.max_payload_bytes} bytes.",
+            artifact_sha256=artifact_sha256,
+        )
+
+    id_problem = rpc_id_problem(request.id)
+    if id_problem is not None:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.invalid_request_id",
+            reason=id_problem,
+            artifact_sha256=artifact_sha256,
+        )
+
+    try:
+        canonical_json_bytes(raw_req)
+    except (TypeError, ValueError) as exc:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id="airlock.request_canonicalization_error",
+            reason=f"Request failed canonical normalization: {exc}",
+            artifact_sha256=artifact_sha256,
+        )
+
+    scan = scan_payload(
+        request.params,
+        canary_tokens=policy.canary_tokens,
+        blocked_patterns=policy.blocked_patterns,
+        entropy_threshold=policy.entropy_threshold,
+        min_entropy_length=policy.min_entropy_length,
+    )
+    id_scan = scan_rpc_id(request.id, policy)
+    all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
+
+    if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
+        return Verdict(
+            verdict_allow=False,
+            severity="AAD_FIRE",
+            rule_id="egress.canary_exfiltration",
+            reason="Planted canary token detected in resources/read request.",
+            artifact_sha256=artifact_sha256,
+            redactions=all_findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    def _block(rule_id: str, reason: str) -> Verdict:
+        return Verdict(
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id=rule_id,
+            reason=reason,
+            artifact_sha256=artifact_sha256,
+            redactions=all_findings,
+            redacted_payload=scan.redacted_payload,
+        )
+
+    if not policy.allow_resources_read:
+        return _block(
+            "airlock.method_not_allowed",
+            "JSON-RPC method 'resources/read' is disabled (allow_resources_read = false).",
+        )
+
+    uri = request.params.get("uri")
+    if not isinstance(uri, str) or not uri.strip():
+        return _block(
+            "airlock.invalid_resource_uri",
+            "resources/read requires a non-empty string 'uri' parameter.",
+        )
+
+    if not policy.workspace_roots:
+        return _block(
+            "airlock.path_boundary_violation",
+            "resources/read denied without configured workspace_roots (fail-closed).",
+        )
+
+    path_ok, path_reason = _check_lexical_path_containment(
+        uri,
+        roots=policy.workspace_roots,
+        block_guardrail_paths=True,
+    )
+    if not path_ok:
+        return _block("airlock.path_boundary_violation", f"Resource URI blocked: {path_reason}")
+
+    if has_invisible_unicode(request.params):
+        return _block(
+            "airlock.invisible_unicode_in_arguments",
+            "resources/read parameters contain invisible Unicode format/tag characters.",
+        )
+
+    if isinstance(request.id, str) and has_invisible_unicode(request.id):
+        return _block(
+            "airlock.invisible_unicode_in_request_id",
+            "JSON-RPC request id contains invisible Unicode format/tag characters.",
+        )
+
+    if not scan.clean or (id_scan is not None and not id_scan.clean):
+        return _block(
+            "egress.secret_or_blocked_pattern",
+            "Egress scanner detected secret material or blocked pattern in resources/read request.",
+        )
+
+    return Verdict(
+        verdict_allow=True,
+        severity="ALLOW",
+        rule_id="airlock.resource_read_allowed",
+        reason="resources/read URI satisfied workspace confinement and egress checks.",
         artifact_sha256=artifact_sha256,
         redacted_payload=scan.redacted_payload,
     )

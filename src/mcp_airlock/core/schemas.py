@@ -23,6 +23,8 @@ type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_patter
 
 GENESIS_PREV_HASH = "0" * 64
 AAD_CONTAINMENT_CONFIRMED_RULE_ID = "airlock.aad_containment_confirmed"
+# First event of every proxy session; its metadata records `enforcement_mode` and the operator flags.
+SESSION_STARTED_RULE_ID = "airlock.session_started"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 

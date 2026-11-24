@@ -43,13 +43,14 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, Protocol, TextIO, cast
+from typing import BinaryIO, Literal, Protocol, TextIO, cast
 
 from pydantic import ValidationError
 
 from mcp_airlock.airlock.engine import (
     MAX_OPAQUE_TOKEN_CHARS,
     compute_instructions_pin,
+    evaluate_resource_read,
     evaluate_tool_call,
     evaluate_tool_response,
     rpc_id_problem,
@@ -69,7 +70,14 @@ from mcp_airlock.airlock.models import (
 )
 from mcp_airlock.core.audit import AuditLedger, redact_core_secrets
 from mcp_airlock.core.normalize import JsonObject, JsonValue, exact_json_bytes, has_invisible_unicode, strip_invisible
-from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, RedactionRecord, Severity, ZoneEvent
+from mcp_airlock.core.schemas import (
+    AAD_CONTAINMENT_CONFIRMED_RULE_ID,
+    SESSION_STARTED_RULE_ID,
+    RedactionRecord,
+    Severity,
+    Verdict,
+    ZoneEvent,
+)
 from mcp_airlock.egress.scanner import scan_payload
 
 AAD_EXIT_CODE = 78
@@ -93,10 +101,27 @@ MAX_STDERR_LINE_BYTES = 4096
 MAX_EXPIRED_ID_TOMBSTONES = 4096
 # `nextCursor` values the server returned on verified `tools/list` pages; only these may be sent back as `cursor`.
 MAX_ISSUED_CURSORS = 256
+MAX_RECORDED_REDACTED_PAYLOAD_BYTES = 16_384
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 _ALLOWED_CLIENT_REQUEST_METHODS: frozenset[str] = frozenset({"initialize", "ping", "tools/list"})
 _ALLOWED_CLIENT_NOTIFICATIONS: frozenset[str] = frozenset({"notifications/initialized", "notifications/cancelled"})
+_HARD_ENFORCED_CALL_RULES: frozenset[str] = frozenset(
+    {
+        "airlock.request_canonicalization_error",
+        "airlock.unsupported_method",
+        "airlock.invalid_tool_call_params",
+        "airlock.payload_too_large",
+        "airlock.invalid_request_id",
+    }
+)
+_HARD_ENFORCED_RESPONSE_RULES: frozenset[str] = frozenset(
+    {
+        "airlock.response_canonicalization_error",
+        "airlock.response_too_large",
+        "airlock.invalid_response_id",
+    }
+)
 _STDERR_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -104,6 +129,7 @@ _POSIX_DEFAULT_ENV_KEYS: tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "TMPDIR", 
 _WIN32_DEFAULT_ENV_KEYS: tuple[str, ...] = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
 
 type RpcId = int | str
+type EnforcementMode = Literal["enforce", "observe"]
 
 
 class AsyncByteReader(Protocol):
@@ -462,6 +488,9 @@ class AirlockProxy:
         aad_on_malformed_server_frame: bool = False,
         session_id: str | None = None,
         client_write_timeout_seconds: float = DEFAULT_CLIENT_WRITE_TIMEOUT_SECONDS,
+        mode: EnforcementMode = "enforce",
+        record_redacted_payloads: bool = False,
+        opaque_policy_errors: bool = False,
     ) -> None:
         if not command:
             raise ValueError("AirlockProxy requires a non-empty command.")
@@ -471,6 +500,11 @@ class AirlockProxy:
             raise ValueError("client_write_timeout_seconds must be a finite positive number.")
         if session_id is not None and not session_id.strip():
             raise ValueError("session_id cannot be blank.")
+        if mode not in ("enforce", "observe"):
+            raise ValueError(f"Unsupported enforcement mode: {mode!r}")
+        if mode == "observe" and not policy.allow_observe_mode:
+            # Observe mode forwards every violation; it needs the reviewed policy's consent, not just a launch flag.
+            raise ValueError("Observe mode requires `allow_observe_mode = true` in the AirlockPolicy.")
 
         self._command = tuple(command)
         self._policy = policy
@@ -485,6 +519,9 @@ class AirlockProxy:
         self._err_stream: TextIO = sys.stderr if err_stream is None else err_stream
         self._aad_on_malformed_server_frame = aad_on_malformed_server_frame
         self._session_id = session_id if session_id is not None else f"sess-{secrets.token_hex(8)}"
+        self._mode: EnforcementMode = mode
+        self._record_redacted_payloads = bool(record_redacted_payloads)
+        self._opaque_policy_errors = bool(opaque_policy_errors)
 
         max_client_frame = max(
             [
@@ -541,6 +578,32 @@ class AirlockProxy:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def mode(self) -> EnforcementMode:
+        return self._mode
+
+    def _observe_metadata(self, extra: JsonObject | None = None, *, would_terminate: bool = False) -> JsonObject:
+        meta: JsonObject = {
+            "enforcement_mode": "observe",
+            "would_block": True,
+            "would_terminate": would_terminate,
+        }
+        if extra:
+            meta.update(extra)
+        return meta
+
+    def _with_redacted_payload(self, metadata: JsonObject | None, payload: JsonValue) -> JsonObject | None:
+        if not self._record_redacted_payloads or payload is None:
+            return metadata
+        encoded = exact_json_bytes(payload)
+        merged: JsonObject = dict(metadata) if metadata else {}
+        if len(encoded) <= MAX_RECORDED_REDACTED_PAYLOAD_BYTES:
+            merged["redacted_payload"] = payload
+        else:
+            merged["redacted_payload"] = "[TRUNCATED_REDACTED_PAYLOAD]"
+            merged["redacted_payload_bytes"] = len(encoded)
+        return merged
 
     def _log_err(self, message: str) -> None:
         """Write sanitized diagnostic text strictly to `err_stream` (never `stdout`)."""
@@ -629,7 +692,12 @@ class AirlockProxy:
         data: JsonObject | None = None,
         allow_during_aad: bool = False,
     ) -> None:
-        frame = _jsonrpc_error_bytes(rpc_id, code, message, data=data)
+        wire_message = message
+        wire_data = data
+        if self._opaque_policy_errors and self._mode == "enforce" and code == JSONRPC_POLICY_VIOLATION:
+            wire_message = "Policy violation: request denied."
+            wire_data = None
+        frame = _jsonrpc_error_bytes(rpc_id, code, wire_message, data=wire_data)
         await self._write_client_bytes(frame, allow_during_aad=allow_during_aad)
 
     async def _write_downstream_bytes(self, payload: bytes) -> bool:
@@ -946,6 +1014,225 @@ class AirlockProxy:
 
         await self._handle_client_request(msg, wire_bytes=wire_bytes, wire_sha=wire_sha)
 
+    async def _handle_verdicted_client_call(
+        self,
+        msg: JsonRpcRequest,
+        *,
+        action: str,
+        verdict: Verdict,
+        tool_name: str | None = None,
+        require_verified_tool: bool = False,
+    ) -> bool:
+        """
+        Apply an engine `Verdict` for `tools/call` or `resources/read`.
+        Returns True if the request should be forwarded to downstream, False if blocked/contained.
+        """
+        if verdict.rule_id in _HARD_ENFORCED_CALL_RULES:
+            self._record_event(
+                action=action,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id=verdict.rule_id,
+                reason=verdict.reason,
+                artifact_sha256=verdict.artifact_sha256,
+                tool_name=tool_name,
+                request_id=msg.id,
+                redactions=verdict.redactions,
+            )
+            await self._emit_client_error(
+                rpc_id=msg.id,
+                code=JSONRPC_POLICY_VIOLATION,
+                message=f"Policy violation ({verdict.rule_id}): {verdict.reason}",
+                data={"rule_id": verdict.rule_id},
+            )
+            return False
+
+        if verdict.severity == "AAD_FIRE":
+            if self._mode == "observe":
+                self._record_event(
+                    action=action,
+                    verdict_allow=False,
+                    severity="AAD_FIRE",
+                    rule_id=verdict.rule_id,
+                    reason=verdict.reason,
+                    artifact_sha256=verdict.artifact_sha256,
+                    tool_name=tool_name,
+                    request_id=msg.id,
+                    redactions=verdict.redactions,
+                    metadata=self._with_redacted_payload(
+                        self._observe_metadata(would_terminate=True), verdict.redacted_payload
+                    ),
+                )
+                return True
+            await self._trigger_aad(
+                action=action,
+                rule_id=verdict.rule_id,
+                reason=verdict.reason,
+                artifact_sha256=verdict.artifact_sha256,
+                rpc_id=msg.id,
+                tool_name=tool_name,
+                redactions=verdict.redactions,
+                metadata=self._with_redacted_payload(None, verdict.redacted_payload),
+            )
+            return False
+
+        if not verdict.verdict_allow:
+            if self._mode == "observe":
+                self._record_event(
+                    action=action,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id=verdict.rule_id,
+                    reason=verdict.reason,
+                    artifact_sha256=verdict.artifact_sha256,
+                    tool_name=tool_name,
+                    request_id=msg.id,
+                    redactions=verdict.redactions,
+                    metadata=self._with_redacted_payload(self._observe_metadata(), verdict.redacted_payload),
+                )
+                return True
+            self._record_event(
+                action=action,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id=verdict.rule_id,
+                reason=verdict.reason,
+                artifact_sha256=verdict.artifact_sha256,
+                tool_name=tool_name,
+                request_id=msg.id,
+                redactions=verdict.redactions,
+                metadata=self._with_redacted_payload(None, verdict.redacted_payload),
+            )
+            await self._emit_client_error(
+                rpc_id=msg.id,
+                code=JSONRPC_POLICY_VIOLATION,
+                message=f"Policy violation ({verdict.rule_id}): {verdict.reason}",
+                data={"rule_id": verdict.rule_id},
+            )
+            return False
+
+        if require_verified_tool and (self._verified_tool_names is None or tool_name not in self._verified_tool_names):
+            not_verified_reason = (
+                "No tools/list response has passed AgBOM pin verification in this session yet."
+                if self._verified_tool_names is None
+                else f"Tool '{tool_name}' was not in the verified tools/list manifest."
+            )
+            if self._mode == "observe":
+                self._record_event(
+                    action=action,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.tool_not_verified",
+                    reason=not_verified_reason,
+                    artifact_sha256=verdict.artifact_sha256,
+                    tool_name=tool_name,
+                    request_id=msg.id,
+                    metadata=self._with_redacted_payload(self._observe_metadata(), verdict.redacted_payload),
+                )
+                return True
+            self._record_event(
+                action=action,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.tool_not_verified",
+                reason=not_verified_reason,
+                artifact_sha256=verdict.artifact_sha256,
+                tool_name=tool_name,
+                request_id=msg.id,
+            )
+            await self._emit_client_error(
+                rpc_id=msg.id,
+                code=JSONRPC_POLICY_VIOLATION,
+                message=f"Policy violation (airlock.tool_not_verified): {not_verified_reason}",
+                data={"rule_id": "airlock.tool_not_verified"},
+            )
+            return False
+
+        self._record_event(
+            action=action,
+            verdict_allow=True,
+            severity="INFO",
+            rule_id=verdict.rule_id,
+            reason=verdict.reason,
+            artifact_sha256=verdict.artifact_sha256,
+            tool_name=tool_name,
+            request_id=msg.id,
+            metadata=self._with_redacted_payload(None, verdict.redacted_payload),
+        )
+        return True
+
+    async def _handle_server_violation(
+        self,
+        *,
+        action: str,
+        severity: Literal["BLOCK", "AAD_FIRE"],
+        rule_id: str,
+        reason: str,
+        artifact_sha256: str,
+        rpc_id: RpcId,
+        tool_name: str | None = None,
+        redactions: Sequence[RedactionRecord] = (),
+        redacted_payload: JsonValue = None,
+        already_observed: bool = False,
+    ) -> bool:
+        """
+        Apply a downstream response policy/scanner/AgBOM verdict.
+        Returns True when the response was blocked or triggered AAD containment (`enforce` mode),
+        or False in `observe` mode after recording the violation once so execution may continue.
+        """
+        if self._mode == "observe":
+            if not already_observed:
+                self._record_event(
+                    action=action,
+                    verdict_allow=False,
+                    severity=severity,
+                    rule_id=rule_id,
+                    reason=reason,
+                    artifact_sha256=artifact_sha256,
+                    tool_name=tool_name,
+                    request_id=rpc_id,
+                    redactions=redactions,
+                    metadata=self._with_redacted_payload(
+                        self._observe_metadata(would_terminate=(severity == "AAD_FIRE")),
+                        redacted_payload,
+                    ),
+                )
+            return False
+
+        meta = self._with_redacted_payload(None, redacted_payload)
+        if severity == "AAD_FIRE":
+            await self._trigger_aad(
+                action=action,
+                rule_id=rule_id,
+                reason=reason,
+                artifact_sha256=artifact_sha256,
+                rpc_id=rpc_id,
+                tool_name=tool_name,
+                redactions=redactions,
+                metadata=meta,
+            )
+            return True
+
+        self._record_event(
+            action=action,
+            verdict_allow=False,
+            severity="BLOCK",
+            rule_id=rule_id,
+            reason=reason,
+            artifact_sha256=artifact_sha256,
+            tool_name=tool_name,
+            request_id=rpc_id,
+            redactions=redactions,
+            metadata=meta,
+        )
+        await self._emit_client_error(
+            rpc_id=rpc_id,
+            code=JSONRPC_POLICY_VIOLATION,
+            message=f"Policy violation ({rule_id}): {reason}",
+            data={"rule_id": rule_id},
+        )
+        return True
+
     async def _handle_client_notification(
         self,
         msg: JsonRpcNotification,
@@ -964,6 +1251,18 @@ class AirlockProxy:
             )
             return
         if msg.method not in _ALLOWED_CLIENT_NOTIFICATIONS:
+            if self._mode == "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.notification_not_allowed",
+                    reason=f"Client notification method '{msg.method}' is not allowlisted.",
+                    artifact_sha256=wire_sha,
+                    metadata=self._observe_metadata(),
+                )
+                await self._write_downstream_bytes(wire_bytes)
+                return
             self._record_event(
                 action=msg.method,
                 verdict_allow=False,
@@ -975,6 +1274,19 @@ class AirlockProxy:
             return
         ok, is_aad, reason, findings = await self._scan_outbound_envelope(params=msg.params, request_id=None)
         if is_aad:
+            if self._mode == "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="AAD_FIRE",
+                    rule_id="egress.canary_exfiltration",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    redactions=findings,
+                    metadata=self._observe_metadata(would_terminate=True),
+                )
+                await self._write_downstream_bytes(wire_bytes)
+                return
             await self._trigger_aad(
                 action=msg.method,
                 rule_id="egress.canary_exfiltration",
@@ -984,6 +1296,19 @@ class AirlockProxy:
             )
             return
         if not ok:
+            if self._mode == "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.outbound_notification_blocked",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    redactions=findings,
+                    metadata=self._observe_metadata(),
+                )
+                await self._write_downstream_bytes(wire_bytes)
+                return
             self._record_event(
                 action=msg.method,
                 verdict_allow=False,
@@ -1068,73 +1393,15 @@ class AirlockProxy:
             raw_name = msg.params.get("name")
             tool_name = raw_name if isinstance(raw_name, str) else None
             verdict = evaluate_tool_call(msg, self._policy)
-            if verdict.severity == "AAD_FIRE":
-                await self._trigger_aad(
-                    action="tools/call",
-                    rule_id=verdict.rule_id,
-                    reason=verdict.reason,
-                    artifact_sha256=verdict.artifact_sha256,
-                    rpc_id=msg.id,
-                    tool_name=tool_name,
-                    redactions=verdict.redactions,
-                )
-                return
-            if not verdict.verdict_allow:
-                self._record_event(
-                    action="tools/call",
-                    verdict_allow=False,
-                    severity="BLOCK",
-                    rule_id=verdict.rule_id,
-                    reason=verdict.reason,
-                    artifact_sha256=verdict.artifact_sha256,
-                    tool_name=tool_name,
-                    request_id=msg.id,
-                    redactions=verdict.redactions,
-                )
-                await self._emit_client_error(
-                    rpc_id=msg.id,
-                    code=JSONRPC_POLICY_VIOLATION,
-                    message=f"Policy violation ({verdict.rule_id}): {verdict.reason}",
-                    data={"rule_id": verdict.rule_id},
-                )
-                return
-
-            # The AgBOM pins only protect the session if the tool was actually listed and verified: refuse calls
-            # before any verified tools/list, and calls to tools the verified listing did not include.
-            if self._verified_tool_names is None or tool_name not in self._verified_tool_names:
-                not_verified_reason = (
-                    "No tools/list response has passed AgBOM pin verification in this session yet."
-                    if self._verified_tool_names is None
-                    else f"Tool '{tool_name}' was not in the verified tools/list manifest."
-                )
-                self._record_event(
-                    action="tools/call",
-                    verdict_allow=False,
-                    severity="BLOCK",
-                    rule_id="airlock.tool_not_verified",
-                    reason=not_verified_reason,
-                    artifact_sha256=verdict.artifact_sha256,
-                    tool_name=tool_name,
-                    request_id=msg.id,
-                )
-                await self._emit_client_error(
-                    rpc_id=msg.id,
-                    code=JSONRPC_POLICY_VIOLATION,
-                    message=f"Policy violation (airlock.tool_not_verified): {not_verified_reason}",
-                    data={"rule_id": "airlock.tool_not_verified"},
-                )
-                return
-
-            self._record_event(
+            should_forward = await self._handle_verdicted_client_call(
+                msg,
                 action="tools/call",
-                verdict_allow=True,
-                severity="INFO",
-                rule_id=verdict.rule_id,
-                reason=verdict.reason,
-                artifact_sha256=verdict.artifact_sha256,
+                verdict=verdict,
                 tool_name=tool_name,
-                request_id=msg.id,
+                require_verified_tool=True,
             )
+            if not should_forward:
+                return
             self._add_in_flight(
                 InFlightRequest(
                     rpc_id=msg.id,
@@ -1152,21 +1419,31 @@ class AirlockProxy:
                 )
             return
 
-        if msg.method not in _ALLOWED_CLIENT_REQUEST_METHODS:
-            self._record_event(
-                action=msg.method,
-                verdict_allow=False,
-                severity="BLOCK",
-                rule_id="airlock.method_not_allowed",
-                reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
-                artifact_sha256=wire_sha,
-                request_id=msg.id,
+        if msg.method == "resources/read" and self._policy.allow_resources_read:
+            verdict = evaluate_resource_read(msg, self._policy)
+            should_forward = await self._handle_verdicted_client_call(
+                msg,
+                action="resources/read",
+                verdict=verdict,
+                tool_name=None,
+                require_verified_tool=False,
             )
-            await self._emit_client_error(
-                rpc_id=msg.id,
-                code=JSONRPC_POLICY_VIOLATION,
-                message=f"Policy violation: method '{msg.method}' is not permitted.",
+            if not should_forward:
+                return
+            self._add_in_flight(
+                InFlightRequest(
+                    rpc_id=msg.id,
+                    method="resources/read",
+                    started_monotonic=time.monotonic(),
+                )
             )
+            if not await self._write_downstream_bytes(wire_bytes):
+                self._pop_in_flight(msg.id)
+                await self._emit_client_error(
+                    rpc_id=msg.id,
+                    code=JSONRPC_POLICY_VIOLATION,
+                    message="Downstream server stdin is closed.",
+                )
             return
 
         if len(wire_bytes) - 1 > self._policy.max_payload_bytes:
@@ -1186,6 +1463,41 @@ class AirlockProxy:
             )
             return
 
+        allowed_methods = (
+            _ALLOWED_CLIENT_REQUEST_METHODS | {"resources/list", "resources/read"}
+            if self._policy.allow_resources_read
+            else _ALLOWED_CLIENT_REQUEST_METHODS
+        )
+        observed_violation = False
+        if msg.method not in allowed_methods:
+            if self._mode != "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.method_not_allowed",
+                    reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                )
+                await self._emit_client_error(
+                    rpc_id=msg.id,
+                    code=JSONRPC_POLICY_VIOLATION,
+                    message=f"Policy violation: method '{msg.method}' is not permitted.",
+                )
+                return
+            self._record_event(
+                action=msg.method,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.method_not_allowed",
+                reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
+                artifact_sha256=wire_sha,
+                request_id=msg.id,
+                metadata=self._observe_metadata(),
+            )
+            observed_violation = True
+
         scan_params = msg.params
         paginated = False
         if msg.method == "tools/list" and "cursor" in msg.params:
@@ -1193,62 +1505,104 @@ class AirlockProxy:
             # page. Anything else would be a free-form channel out of the airlock.
             cursor = msg.params["cursor"]
             if not isinstance(cursor, str) or cursor not in self._issued_cursors:
-                self._record_event(
-                    action=msg.method,
-                    verdict_allow=False,
-                    severity="BLOCK",
-                    rule_id="airlock.unknown_cursor",
-                    reason="tools/list cursor was not issued by the server on a verified page.",
-                    artifact_sha256=wire_sha,
-                    request_id=msg.id,
-                )
-                await self._emit_client_error(
-                    rpc_id=msg.id,
-                    code=JSONRPC_POLICY_VIOLATION,
-                    message="Policy violation: unknown tools/list cursor.",
-                )
-                return
+                if self._mode != "observe":
+                    self._record_event(
+                        action=msg.method,
+                        verdict_allow=False,
+                        severity="BLOCK",
+                        rule_id="airlock.unknown_cursor",
+                        reason="tools/list cursor was not issued by the server on a verified page.",
+                        artifact_sha256=wire_sha,
+                        request_id=msg.id,
+                    )
+                    await self._emit_client_error(
+                        rpc_id=msg.id,
+                        code=JSONRPC_POLICY_VIOLATION,
+                        message="Policy violation: unknown tools/list cursor.",
+                    )
+                    return
+                if not observed_violation:
+                    self._record_event(
+                        action=msg.method,
+                        verdict_allow=False,
+                        severity="BLOCK",
+                        rule_id="airlock.unknown_cursor",
+                        reason="tools/list cursor was not issued by the server on a verified page.",
+                        artifact_sha256=wire_sha,
+                        request_id=msg.id,
+                        metadata=self._observe_metadata(),
+                    )
+                    observed_violation = True
             scan_params = {key: value for key, value in msg.params.items() if key != "cursor"}
             paginated = True
 
         ok, is_aad, reason, findings = await self._scan_outbound_envelope(params=scan_params, request_id=msg.id)
         if is_aad:
-            await self._trigger_aad(
-                action=msg.method,
-                rule_id="egress.canary_exfiltration",
-                reason=reason,
-                artifact_sha256=wire_sha,
-                rpc_id=msg.id,
-                redactions=findings,
-            )
-            return
-        if not ok:
+            if self._mode != "observe":
+                await self._trigger_aad(
+                    action=msg.method,
+                    rule_id="egress.canary_exfiltration",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    rpc_id=msg.id,
+                    redactions=findings,
+                )
+                return
+            if not observed_violation:
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="AAD_FIRE",
+                    rule_id="egress.canary_exfiltration",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                    redactions=findings,
+                    metadata=self._observe_metadata(would_terminate=True),
+                )
+                observed_violation = True
+        elif not ok:
+            if self._mode != "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.outbound_request_blocked",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                    redactions=findings,
+                )
+                await self._emit_client_error(
+                    rpc_id=msg.id,
+                    code=JSONRPC_POLICY_VIOLATION,
+                    message=f"Policy violation: {reason}",
+                )
+                return
+            if not observed_violation:
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.outbound_request_blocked",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                    redactions=findings,
+                    metadata=self._observe_metadata(),
+                )
+                observed_violation = True
+
+        if not observed_violation:
             self._record_event(
                 action=msg.method,
-                verdict_allow=False,
-                severity="BLOCK",
-                rule_id="airlock.outbound_request_blocked",
-                reason=reason,
+                verdict_allow=True,
+                severity="INFO",
+                rule_id="airlock.request_allowed",
+                reason=f"Forwarded allowlisted MCP request '{msg.method}'.",
                 artifact_sha256=wire_sha,
                 request_id=msg.id,
-                redactions=findings,
             )
-            await self._emit_client_error(
-                rpc_id=msg.id,
-                code=JSONRPC_POLICY_VIOLATION,
-                message=f"Policy violation: {reason}",
-            )
-            return
-
-        self._record_event(
-            action=msg.method,
-            verdict_allow=True,
-            severity="INFO",
-            rule_id="airlock.request_allowed",
-            reason=f"Forwarded allowlisted MCP request '{msg.method}'.",
-            artifact_sha256=wire_sha,
-            request_id=msg.id,
-        )
         self._add_in_flight(
             InFlightRequest(rpc_id=msg.id, method=msg.method, started_monotonic=time.monotonic(), paginated=paginated)
         )
@@ -1379,22 +1733,9 @@ class AirlockProxy:
         if in_flight is None:
             return
 
-        resp_verdict = evaluate_tool_response(msg, self._policy)
-        if resp_verdict.severity == "AAD_FIRE":
-            await self._trigger_aad(
-                action=in_flight.method,
-                rule_id=resp_verdict.rule_id,
-                reason=resp_verdict.reason,
-                artifact_sha256=resp_verdict.artifact_sha256,
-                rpc_id=msg.id,
-                tool_name=in_flight.tool_name,
-                redactions=resp_verdict.redactions,
-            )
-            return
-
-        # Enforce size cap before AgBOM manifest parsing on tools/list; check AgBOM BEFORE general invisible block
-        # so invisible Unicode tag injection inside tool definitions fires AAD_FIRE as required.
-        if resp_verdict.rule_id == "airlock.response_too_large":
+        resp_verdict = evaluate_tool_response(msg, self._policy, resource_read=in_flight.method == "resources/read")
+        # Enforce size/ID/canonicalization safety invariants unconditionally, even in observe mode.
+        if resp_verdict.rule_id in _HARD_ENFORCED_RESPONSE_RULES:
             self._record_event(
                 action=in_flight.method,
                 verdict_allow=False,
@@ -1413,6 +1754,23 @@ class AirlockProxy:
                 data={"rule_id": resp_verdict.rule_id},
             )
             return
+
+        observed_violation = False
+        if resp_verdict.severity == "AAD_FIRE":
+            if await self._handle_server_violation(
+                action=in_flight.method,
+                severity="AAD_FIRE",
+                rule_id=resp_verdict.rule_id,
+                reason=resp_verdict.reason,
+                artifact_sha256=resp_verdict.artifact_sha256,
+                rpc_id=msg.id,
+                tool_name=in_flight.tool_name,
+                redactions=resp_verdict.redactions,
+                redacted_payload=resp_verdict.redacted_payload,
+                already_observed=observed_violation,
+            ):
+                return
+            observed_violation = True
 
         forward_msg: JsonRpcSuccessResponse | JsonRpcErrorResponse = msg
         verified_names: set[str] | None = None
@@ -1429,15 +1787,19 @@ class AirlockProxy:
             pin = self._policy.instructions_sha256
             pin_matches = isinstance(instructions, str) and compute_instructions_pin(instructions) == pin
             if pin is not None and not pin_matches:
-                await self._trigger_aad(
+                if await self._handle_server_violation(
                     action="initialize",
+                    severity="AAD_FIRE",
                     rule_id="airlock.instructions_pin_mismatch",
                     reason="Server initialize instructions do not match the pinned instructions_sha256 (rug pull).",
                     artifact_sha256=resp_verdict.artifact_sha256,
                     rpc_id=msg.id,
-                )
-                return
-            if pin is None:
+                    redacted_payload=resp_verdict.redacted_payload,
+                    already_observed=observed_violation,
+                ):
+                    return
+                observed_violation = True
+            elif pin is None and self._mode == "enforce":
                 stripped: JsonObject = {k: v for k, v in msg.result.items() if k != "instructions"}
                 forward_msg = JsonRpcSuccessResponse(jsonrpc="2.0", id=msg.id, result=stripped)
                 resp_verdict = evaluate_tool_response(forward_msg, self._policy)
@@ -1452,117 +1814,87 @@ class AirlockProxy:
                 )
 
         if in_flight.method == "tools/list" and isinstance(msg, JsonRpcSuccessResponse):
+            parsed_tools: list[ToolDefinition] | None = None
             try:
-                tool_defs = _parse_tools_list_result(msg.result)
+                parsed_tools = _parse_tools_list_result(msg.result)
             except (ValueError, ValidationError) as exc:
-                await self._trigger_aad(
+                if await self._handle_server_violation(
                     action="tools/list",
+                    severity="AAD_FIRE",
                     rule_id="airlock.invalid_tools_list_manifest",
                     reason=f"Invalid tools/list manifest from downstream server: {exc}",
                     artifact_sha256=resp_verdict.artifact_sha256,
                     rpc_id=msg.id,
-                )
-                return
-
-            pin_verdict = verify_tools_list(tool_defs, self._policy)
-            if pin_verdict.severity == "AAD_FIRE":
-                await self._trigger_aad(
-                    action="tools/list",
-                    rule_id=pin_verdict.rule_id,
-                    reason=pin_verdict.reason,
-                    artifact_sha256=pin_verdict.artifact_sha256,
-                    rpc_id=msg.id,
-                )
-                return
-            if not pin_verdict.verdict_allow:
-                self._record_event(
-                    action="tools/list",
-                    verdict_allow=False,
-                    severity="BLOCK",
-                    rule_id=pin_verdict.rule_id,
-                    reason=pin_verdict.reason,
-                    artifact_sha256=pin_verdict.artifact_sha256,
-                    request_id=msg.id,
-                )
-                await self._emit_client_error(
-                    rpc_id=msg.id,
-                    code=JSONRPC_POLICY_VIOLATION,
-                    message=f"Policy violation ({pin_verdict.rule_id}): {pin_verdict.reason}",
-                    data={"rule_id": pin_verdict.rule_id},
-                )
-                return
-
-            # Forward only what was verified: the pinned tool definitions plus a checked `nextCursor`. Any other key
-            # in the result is free text the model could read, so it is dropped.
-            raw_result = cast(JsonObject, msg.result)  # `_parse_tools_list_result` accepted it as an object
-            tools_wire: list[JsonValue] = [tool.wire_dict() for tool in tool_defs]
-            rebuilt: JsonObject = {"tools": tools_wire}
-            next_cursor = raw_result.get("nextCursor")
-            if next_cursor is not None:
-                cursor_ok, cursor_aad, cursor_reason, cursor_findings = self._check_next_cursor(next_cursor)
-                if cursor_aad:
-                    await self._trigger_aad(
-                        action="tools/list",
-                        rule_id="egress.response_canary_detected",
-                        reason=cursor_reason,
-                        artifact_sha256=resp_verdict.artifact_sha256,
-                        rpc_id=msg.id,
-                        redactions=cursor_findings,
-                    )
+                    redacted_payload=resp_verdict.redacted_payload,
+                    already_observed=observed_violation,
+                ):
                     return
-                if not cursor_ok:
+                observed_violation = True
+
+            if parsed_tools is not None:
+                pin_verdict = verify_tools_list(parsed_tools, self._policy)
+                if pin_verdict.severity == "AAD_FIRE" or not pin_verdict.verdict_allow:
+                    sev: Literal["BLOCK", "AAD_FIRE"] = "AAD_FIRE" if pin_verdict.severity == "AAD_FIRE" else "BLOCK"
+                    if await self._handle_server_violation(
+                        action="tools/list",
+                        severity=sev,
+                        rule_id=pin_verdict.rule_id,
+                        reason=pin_verdict.reason,
+                        artifact_sha256=pin_verdict.artifact_sha256,
+                        rpc_id=msg.id,
+                        redacted_payload=pin_verdict.redacted_payload,
+                        already_observed=observed_violation,
+                    ):
+                        return
+                    observed_violation = True
+
+                # Forward verified (or observed) tools plus nextCursor; extra unpinned keys are dropped in enforce.
+                raw_result = cast(JsonObject, msg.result)  # `_parse_tools_list_result` accepted it as an object
+                tools_wire: list[JsonValue] = [tool.wire_dict() for tool in parsed_tools]
+                rebuilt: JsonObject = {"tools": tools_wire}
+                next_cursor = raw_result.get("nextCursor")
+                if next_cursor is not None:
+                    cursor_ok, cursor_aad, cursor_reason, cursor_findings = self._check_next_cursor(next_cursor)
+                    if cursor_aad or not cursor_ok:
+                        cursor_sev: Literal["BLOCK", "AAD_FIRE"] = "AAD_FIRE" if cursor_aad else "BLOCK"
+                        cursor_rule = "egress.response_canary_detected" if cursor_aad else "airlock.invalid_next_cursor"
+                        if await self._handle_server_violation(
+                            action="tools/list",
+                            severity=cursor_sev,
+                            rule_id=cursor_rule,
+                            reason=cursor_reason,
+                            artifact_sha256=resp_verdict.artifact_sha256,
+                            rpc_id=msg.id,
+                            redactions=cursor_findings,
+                            redacted_payload=resp_verdict.redacted_payload,
+                            already_observed=observed_violation,
+                        ):
+                            return
+                        observed_violation = True
+                    if isinstance(next_cursor, str):
+                        rebuilt["nextCursor"] = next_cursor
+                        issued_cursor = next_cursor
+                dropped_keys = [key for key in raw_result if key not in ("tools", "nextCursor")]
+                if dropped_keys:
                     self._record_event(
                         action="tools/list",
-                        verdict_allow=False,
-                        severity="BLOCK",
-                        rule_id="airlock.invalid_next_cursor",
-                        reason=cursor_reason,
+                        verdict_allow=True,
+                        severity="WARN",
+                        rule_id="airlock.tools_list_extra_keys_stripped",
+                        reason="Unpinned keys in the tools/list result were removed before forwarding.",
                         artifact_sha256=resp_verdict.artifact_sha256,
                         request_id=msg.id,
-                        redactions=cursor_findings,
+                        metadata={"dropped_key_count": len(dropped_keys)},
                     )
-                    await self._emit_client_error(
-                        rpc_id=msg.id,
-                        code=JSONRPC_POLICY_VIOLATION,
-                        message=f"Policy violation (airlock.invalid_next_cursor): {cursor_reason}",
-                        data={"rule_id": "airlock.invalid_next_cursor"},
-                    )
-                    return
-                rebuilt["nextCursor"] = next_cursor
-                issued_cursor = cast(str, next_cursor)
-            dropped_keys = [key for key in raw_result if key not in ("tools", "nextCursor")]
-            if dropped_keys:
-                self._record_event(
-                    action="tools/list",
-                    verdict_allow=True,
-                    severity="WARN",
-                    rule_id="airlock.tools_list_extra_keys_stripped",
-                    reason="Unpinned keys in the tools/list result were removed before forwarding.",
-                    artifact_sha256=resp_verdict.artifact_sha256,
-                    request_id=msg.id,
-                    metadata={"dropped_key_count": len(dropped_keys)},
+                forward_msg = JsonRpcSuccessResponse(jsonrpc="2.0", id=msg.id, result=rebuilt)
+                # Re-scan what will actually be forwarded. The cursor was checked above without the entropy detector
+                # (it is a legitimately random token), so it is left out of this scan.
+                resp_verdict = evaluate_tool_response(
+                    JsonRpcSuccessResponse(jsonrpc="2.0", id=msg.id, result={"tools": tools_wire}), self._policy
                 )
-            forward_msg = JsonRpcSuccessResponse(jsonrpc="2.0", id=msg.id, result=rebuilt)
-            # Re-scan what will actually be forwarded. The cursor was checked above without the entropy detector
-            # (it is a legitimately random token), so it is left out of this scan.
-            resp_verdict = evaluate_tool_response(
-                JsonRpcSuccessResponse(jsonrpc="2.0", id=msg.id, result={"tools": tools_wire}), self._policy
-            )
-            verified_names = {tool.name for tool in tool_defs}
+                verified_names = {tool.name for tool in parsed_tools}
 
-        if resp_verdict.severity == "AAD_FIRE":
-            await self._trigger_aad(
-                action=in_flight.method,
-                rule_id=resp_verdict.rule_id,
-                reason=resp_verdict.reason,
-                artifact_sha256=resp_verdict.artifact_sha256,
-                rpc_id=msg.id,
-                tool_name=in_flight.tool_name,
-                redactions=resp_verdict.redactions,
-            )
-            return
-
-        if not resp_verdict.verdict_allow:
+        if resp_verdict.rule_id in _HARD_ENFORCED_RESPONSE_RULES:
             self._record_event(
                 action=in_flight.method,
                 verdict_allow=False,
@@ -1581,6 +1913,23 @@ class AirlockProxy:
                 data={"rule_id": resp_verdict.rule_id},
             )
             return
+
+        if resp_verdict.severity == "AAD_FIRE" or not resp_verdict.verdict_allow:
+            final_sev: Literal["BLOCK", "AAD_FIRE"] = "AAD_FIRE" if resp_verdict.severity == "AAD_FIRE" else "BLOCK"
+            if await self._handle_server_violation(
+                action=in_flight.method,
+                severity=final_sev,
+                rule_id=resp_verdict.rule_id,
+                reason=resp_verdict.reason,
+                artifact_sha256=resp_verdict.artifact_sha256,
+                rpc_id=msg.id,
+                tool_name=in_flight.tool_name,
+                redactions=resp_verdict.redactions,
+                redacted_payload=resp_verdict.redacted_payload,
+                already_observed=observed_violation,
+            ):
+                return
+            observed_violation = True
 
         wire_resp_body = exact_json_bytes(cast(JsonObject, forward_msg.model_dump(mode="json")))
         if len(wire_resp_body) > self._policy.max_payload_bytes:
@@ -1609,22 +1958,26 @@ class AirlockProxy:
             )
             return
 
-        receipt_sha256 = hashlib.sha256(wire_resp_body).hexdigest()
-        self._record_event(
-            action=in_flight.method,
-            verdict_allow=True,
-            severity="INFO",
-            rule_id="airlock.response_allowed",
-            reason=f"Verified and forwarded downstream response for '{in_flight.method}'.",
-            artifact_sha256=receipt_sha256,
-            tool_name=in_flight.tool_name,
-            request_id=msg.id,
-        )
+        if not observed_violation:
+            receipt_sha256 = hashlib.sha256(wire_resp_body).hexdigest()
+            self._record_event(
+                action=in_flight.method,
+                verdict_allow=True,
+                severity="INFO",
+                rule_id="airlock.response_allowed",
+                reason=f"Verified and forwarded downstream response for '{in_flight.method}'.",
+                artifact_sha256=receipt_sha256,
+                tool_name=in_flight.tool_name,
+                request_id=msg.id,
+                metadata=self._with_redacted_payload(None, resp_verdict.redacted_payload),
+            )
         if verified_names is not None:
             # A fresh listing replaces the verified set (a tool the server stopped listing can no longer be
-            # called); a later page of a paginated listing adds to it.
+            # called) and resets prior-cycle cursors; a later page of a paginated listing adds to it.
             base = self._verified_tool_names if (in_flight.paginated and self._verified_tool_names) else set()
             self._verified_tool_names = base | verified_names
+            if not in_flight.paginated:
+                self._issued_cursors.clear()
         if issued_cursor is not None:
             _remember(self._issued_cursors, issued_cursor, MAX_ISSUED_CURSORS)
         await self._write_client_bytes(wire_resp_body + b"\n")
@@ -1753,6 +2106,32 @@ class AirlockProxy:
 
     async def run(self) -> int:
         """Spawn the isolated downstream MCP server, proxy frames until EOF or AAD kill, and return exit code."""
+        # Every session's first record states how it was run, so a quiet observe-mode session cannot pass for an
+        # enforced one. Written before the downstream exists: if the ledger cannot record this, nothing is started.
+        self._record_event(
+            action="airlock/session_start",
+            verdict_allow=True,
+            severity="WARN" if self._mode == "observe" else "INFO",
+            rule_id=SESSION_STARTED_RULE_ID,
+            reason=(
+                "Session started in OBSERVE mode: policy violations are recorded but forwarded, and AAD does not "
+                "terminate the downstream."
+                if self._mode == "observe"
+                else "Session started in enforce mode."
+            ),
+            artifact_sha256=_EMPTY_SHA256,
+            metadata={
+                "enforcement_mode": self._mode,
+                "policy_id": self._policy.policy_id,
+                "record_redacted_payloads": self._record_redacted_payloads,
+                "opaque_policy_errors": self._opaque_policy_errors,
+            },
+        )
+        if self._mode == "observe":
+            self._log_err(
+                "[airlock WARNING] OBSERVE MODE: policy violations are forwarded to the downstream and AAD does not "
+                "kill it. Use only in an isolated red-team sandbox with throwaway canaries."
+            )
         child_env = build_minimal_subprocess_env(allowed_keys=self._allowed_env_keys, extra_env=self._extra_env)
         cwd_str = str(self._cwd) if self._cwd is not None else None
         self._proc, self._job = await spawn_contained_subprocess(self._command, env=child_env, cwd=cwd_str)
@@ -2039,6 +2418,9 @@ async def _run_cli_async(
     allowed_env_keys: Sequence[str] | None,
     aad_on_malformed_server_frame: bool,
     session_id: str | None,
+    mode: EnforcementMode,
+    record_redacted_payloads: bool,
+    opaque_policy_errors: bool,
 ) -> int:
     loop = asyncio.get_running_loop()
     client_reader = BoundedStdinReader(sys.stdin.buffer, loop=loop)
@@ -2054,6 +2436,9 @@ async def _run_cli_async(
         err_stream=sys.stderr,
         aad_on_malformed_server_frame=aad_on_malformed_server_frame,
         session_id=session_id,
+        mode=mode,
+        record_redacted_payloads=record_redacted_payloads,
+        opaque_policy_errors=opaque_policy_errors,
     )
     if sys.platform != "win32":
         # A client usually stops a server with SIGTERM (or SIGHUP/SIGINT). Run the normal shutdown so the downstream
@@ -2110,6 +2495,26 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Optional session identifier attached to every AuditLedger ZoneEvent.",
     )
     parser.add_argument(
+        "--mode",
+        choices=("enforce", "observe"),
+        default="enforce",
+        help="Airlock mode: 'enforce' (default fail-closed) or 'observe' (red-team telemetry pass-through).",
+    )
+    parser.add_argument(
+        "--record-redacted-payloads",
+        action="store_true",
+        help=(
+            "Record request/response payloads (up to 16 KiB each, secrets and canaries redacted) in AuditLedger "
+            "metadata, for ALLOWED traffic too and in both modes. File contents and personal data in tool results "
+            "will be stored in the audit log."
+        ),
+    )
+    parser.add_argument(
+        "--opaque-policy-errors",
+        action="store_true",
+        help="Suppress rule_id and detailed policy reasons on -32000 client error frames in enforce mode.",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Downstream MCP server command to spawn (prefix with '--').",
@@ -2138,6 +2543,12 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, UnicodeDecodeError, ValueError, ValidationError) as exc:
         sys.stderr.write(f"mellyn-airlock: failed to load TOML policy '{args.policy}': {exc}\n")
         return 2
+    if args.mode == "observe" and not policy.allow_observe_mode:
+        sys.stderr.write(
+            "mellyn-airlock: --mode observe requires `allow_observe_mode = true` in the policy "
+            f"'{args.policy}'; refusing to run with enforcement off.\n"
+        )
+        return 2
 
     try:
         ledger = AuditLedger(args.audit_log, canary_tokens=tuple(policy.canary_tokens))
@@ -2156,6 +2567,9 @@ def main(argv: list[str] | None = None) -> int:
                 allowed_env_keys=allowed_env,
                 aad_on_malformed_server_frame=bool(args.aad_on_malformed_server_frame),
                 session_id=args.session_id,
+                mode=cast(EnforcementMode, args.mode),
+                record_redacted_payloads=bool(args.record_redacted_payloads),
+                opaque_policy_errors=bool(args.opaque_policy_errors),
             )
         )
     except KeyboardInterrupt:
@@ -2179,12 +2593,14 @@ __all__ = [
     "JSONRPC_REQUEST_TIMEOUT",
     "MAX_EXPIRED_ID_TOMBSTONES",
     "MAX_ISSUED_CURSORS",
+    "MAX_RECORDED_REDACTED_PAYLOAD_BYTES",
     "MAX_STDERR_LINE_BYTES",
     "AirlockProxy",
     "AsyncByteReader",
     "BoundedLineReader",
     "BoundedStdinReader",
     "ClientWriter",
+    "EnforcementMode",
     "InFlightRequest",
     "RpcId",
     "build_minimal_subprocess_env",

@@ -10,6 +10,7 @@ Strict DAG invariant: imports ONLY from `mcp_airlock.core` and `mcp_airlock.egre
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import statistics
@@ -179,6 +180,41 @@ def build_benchmark_corpus() -> tuple[BenchmarkSample, ...]:
             sample_id="canary-dict-key",
             category="canary",
             payload={BENCH_CANARY: "value"},
+            expect_clean=False,
+            expect_canary=True,
+        ),
+        BenchmarkSample(
+            sample_id="canary-hex-lower",
+            category="canary",
+            payload={"out": BENCH_CANARY.encode("utf-8").hex()},
+            expect_clean=False,
+            expect_canary=True,
+        ),
+        BenchmarkSample(
+            sample_id="canary-base64-std",
+            category="canary",
+            payload={"out": base64.b64encode(BENCH_CANARY.encode("utf-8")).decode("ascii")},
+            expect_clean=False,
+            expect_canary=True,
+        ),
+        BenchmarkSample(
+            sample_id="canary-base64-offset",
+            category="canary",
+            payload={"out": base64.b64encode(b"x" + BENCH_CANARY.encode("utf-8") + b"y").decode("ascii")},
+            expect_clean=False,
+            expect_canary=True,
+        ),
+        BenchmarkSample(
+            sample_id="canary-reversed",
+            category="canary",
+            payload={"out": BENCH_CANARY[::-1]},
+            expect_clean=False,
+            expect_canary=True,
+        ),
+        BenchmarkSample(
+            sample_id="canary-dot-interleaved",
+            category="canary",
+            payload={"out": ".".join(BENCH_CANARY)},
             expect_clean=False,
             expect_canary=True,
         ),

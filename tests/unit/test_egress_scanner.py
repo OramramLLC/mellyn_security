@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
 
+from mcp_airlock.airlock.engine import evaluate_tool_call
+from mcp_airlock.airlock.models import AirlockPolicy, JsonRpcRequest
 from mcp_airlock.core.normalize import JsonObject, sha256_exact
 from mcp_airlock.egress.guards import EgressValidator, WorkspacePathGuard
 from mcp_airlock.egress.scanner import scan_payload, scan_text, shannon_entropy
@@ -77,6 +80,90 @@ class TestEgressScanner(unittest.TestCase):
         self.assertTrue(res.blocked_pattern_matched)
         self.assertIn("[REDACTED_BLOCKED]", str(res.redacted_payload))
         self.assertTrue(any(f.kind == "blocked_pattern" for f in res.findings))
+
+    def test_detects_encoded_reversed_and_interleaved_canaries_without_false_positives(self) -> None:
+        canary = "MELLYN_CANARY_TOKEN_4242"
+        raw = canary.encode("utf-8")
+        hex_lower = raw.hex()
+        variants: list[tuple[str, str]] = [
+            ("hex_lower", hex_lower),
+            ("hex_upper", hex_lower.upper()),
+            ("hex_colon", ":".join(f"{b:02x}" for b in raw)),
+            ("hex_hyphen", "-".join(f"{b:02X}" for b in raw)),
+            ("b64_offset_0", base64.b64encode(raw).decode("ascii")),
+            ("b64_offset_1", base64.b64encode(b"a" + raw + b"z").decode("ascii")),
+            ("b64_offset_2", base64.b64encode(b"ab" + raw + b"yz").decode("ascii")),
+            ("b64_urlsafe", base64.urlsafe_b64encode(b"x" + raw).decode("ascii")),
+            ("b64_lowercase_canary", base64.b64encode(canary.lower().encode("utf-8")).decode("ascii")),
+            ("b64_percent_canary", base64.b64encode(canary.replace("_", "%5F").encode("ascii")).decode("ascii")),
+            ("reversed", canary[::-1]),
+            ("double_percent", canary.replace("_", "%255F")),
+            ("dot_interleaved", ".".join(canary)),
+            ("hyphen_interleaved", "-".join(canary)),
+        ]
+        for label, sample in variants:
+            with self.subTest(variant=label):
+                res = scan_payload({"out": f"prefix {sample} suffix"}, canary_tokens=(canary,))
+                self.assertFalse(res.clean, label)
+                self.assertTrue(res.canary_matched, label)
+                self.assertEqual(res.redacted_payload, {"out": "[REDACTED_CANARY]"})
+                self.assertNotIn(sample, str(res.redacted_payload))
+                self.assertNotIn(canary, str(res.redacted_payload))
+
+        clean_controls = (
+            "Summarize the quarterly architecture notes in docs/ARCHITECTURE.md for review.",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "https://docs.python.org/3/library/asyncio.html",
+        )
+        for text in clean_controls:
+            with self.subTest(control=text[:24]):
+                res = scan_payload({"msg": text}, canary_tokens=(canary,))
+                self.assertTrue(res.clean)
+                self.assertFalse(res.canary_matched)
+                self.assertEqual(res.findings, [])
+
+    def test_list_and_nested_dict_regex_rules(self) -> None:
+        policy = AirlockPolicy(
+            allowed_tools=["query"],
+            tool_rules={
+                "query": {
+                    "name": "query",
+                    "arg_regex_rules": {"tags": "^[a-z_]{2,12}$"},
+                    "arg_deny_regex_rules": {"filters": r"(?i)\bDROP\b|--"},
+                }
+            },
+        )
+        ok_req = JsonRpcRequest(
+            jsonrpc="2.0",
+            id=1,
+            method="tools/call",
+            params={
+                "name": "query",
+                "arguments": {"tags": ["alpha", "beta_two"], "filters": {"where": ["safe_col", {"eq": "ok"}]}},
+            },
+        )
+        self.assertTrue(evaluate_tool_call(ok_req, policy).verdict_allow)
+
+        for bad_label, args in (
+            ("empty_list", {"tags": []}),
+            ("non_str_elem", {"tags": ["alpha", 123]}),
+            ("non_nfkc_elem", {"tags": ["ａｌｐｈａ"]}),
+            ("list_regex_mismatch", {"tags": ["alpha", "BAD!"]}),
+            ("nested_list_deny", {"tags": ["alpha"], "filters": ["ok", "val -- comment"]}),
+            ("nested_dict_deny_value", {"tags": ["alpha"], "filters": {"nested": {"stmt": "DROP TABLE"}}}),
+            ("nested_dict_deny_key", {"tags": ["alpha"], "filters": {"nested": {"DROP": "x"}}}),
+        ):
+            with self.subTest(case=bad_label):
+                bad_req = JsonRpcRequest(
+                    jsonrpc="2.0",
+                    id=2,
+                    method="tools/call",
+                    params={"name": "query", "arguments": args},
+                )
+                verdict = evaluate_tool_call(bad_req, policy)
+                self.assertFalse(verdict.verdict_allow)
+                self.assertEqual(verdict.rule_id, "airlock.arg_regex_violation")
 
 
 class TestMigratedEgressAndWorkspaceGuards(unittest.TestCase):

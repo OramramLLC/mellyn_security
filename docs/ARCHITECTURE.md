@@ -7,7 +7,9 @@ Mellyn Security is a dual-purpose **AI Security Engineering Portfolio Reference 
 ## 1. Architectural Principles
 
 1. **Authorization-First, Not Detection-First**: Per OWASP LLM01, prompt-injection detection cannot be relied on as a primary security boundary. The runtime core enforces **deterministic tool-call authorization** driven by session provenance (taint), tool risk tiers, scoped argument policies, and human-in-the-loop approvals. Injection/DLP scores act only as risk-escalating signals and audit metadata—never as an allow gate.
-2. **MCP Gateway as the Integration Choke Point**: Rather than building a fragile multi-provider LLM proxy, Mellyn Security belongs at the **MCP / tool-execution boundary** where agent actions actually happen. It runs in two modes: an **HTTP authorization API** that a custom agent harness calls before each tool call (it only protects harnesses that call it), and a **stdio MCP gateway** that an MCP client launches in place of its servers, which puts the authorizer in the data path. One gateway process fronts all of a client's servers so that taint and approvals are shared across them. The client must be configured to reach its servers only through the gateway.
+2. **Two Complementary Runtime Planes (Airlock Containment + Multi-Server Control Plane)**: Rather than building a fragile multi-provider LLM proxy, Mellyn Security operates at the **MCP / tool-execution boundary** via two complementary runtime planes:
+   - **`mcp_airlock` (`src/mcp_airlock/` — Zero-Dependency Stdio Containment Airlock & Red-Team Flight Recorder)**: Wraps a single downstream MCP server over stdio with cryptographic AgBOM tool/manifest/instructions pinning (`mellyn-pin`), deterministic egress/canary detection across obfuscated & encoded variants (`mellyn-bench`), OS-level Automatic Activation Device (AAD) process-tree termination + post-reap confirmation, tamper-evident hash-chained `audit.jsonl` reconstruction (`mellyn-ir`), and an operator `--mode observe` red-teaming harness that also requires the policy's `allow_observe_mode = true`. Installs cleanly with only `pydantic>=2.10.0`.
+   - **`mellyn` Control Plane (`backend/mellyn/` — Multi-Server Taint-Tracking Gateway & Human-in-the-Loop Authorizer)**: Runs either as an **HTTP authorization API** (`pip install ".[gateway]"`) or as a **stdio MCP gateway** fronting all downstream servers under one shared session so cross-server taint, risk-tiered rules, exact-call human grants (`Role.APPROVER`), and container Squid egress isolation work across tools and servers.
 3. **Self-Hosted First (Zero Prompt Custody)**: v1 deploys as a single self-hosted container or local sidecar inside the customer's own environment. Mellyn Security never holds customer prompts, secrets, or proprietary code on multi-tenant servers.
 4. **Independent Defense-in-Depth Controls**: Prompt steering rules, agent permission sandboxes, pre-commit hooks, CI supply-chain gates, and runtime authorization operate as independent layers—compromise or bypass of one layer does not disable the others.
 
@@ -140,6 +142,30 @@ V1/
 │   ├── verify_dependencies.py       # Manifest, lockfile, hash, 90d package & 14d release-cooldown verifier
 │   ├── sync_agent_rules.py          # Canonical rules generator & hidden-Unicode smuggling detector
 │   └── verify_container_stack.py    # End-to-end Docker build, mount, role, egress & Linux assurance harness
+├── src/
+│   └── mcp_airlock/                 # Zero-dependency stdio containment airlock, AAD & red-team IR suite
+│       ├── __init__.py
+│       ├── py.typed                 # PEP 561 strict typing marker
+│       ├── core/                    # Canonicalization, schemas, canary redaction & hash-chained audit ledger
+│       │   ├── __init__.py
+│       │   ├── normalize.py         # Invisible-Unicode stripping, NFKC & exact vs canonical JSON SHA-256
+│       │   ├── schemas.py           # Strict frozen Pydantic v2 wire/verdict/audit models
+│       │   └── audit.py             # Redact-before-disk hash-chained JSONL ledger + standalone verifier
+│       ├── egress/                  # Egress scanning, path/URL guards & benchmark runner (`mellyn-bench`)
+│       │   ├── __init__.py
+│       │   ├── guards.py            # SSRF URL validator & workspace path/secret/guardrail jail
+│       │   ├── scanner.py           # Deterministic canary, API secret & high-entropy scanner
+│       │   └── bench.py             # Synthetic precision/recall & latency benchmark CLI (`mellyn-bench`)
+│       ├── airlock/                 # Fail-closed stdio proxy, pure policy engine & `mellyn-pin` CLI
+│       │   ├── __init__.py
+│       │   ├── models.py            # Strict JSON-RPC 2.0 envelopes & AirlockPolicy TOML schemas
+│       │   ├── engine.py            # Pure fail-closed AgBOM, path, regex & resource evaluators
+│       │   ├── proxy.py             # Bounded stdio proxy, AAD kill switch & operator harness modes
+│       │   └── pin_cli.py           # Quarantined starter AgBOM policy & pin generator (`mellyn-pin`)
+│       └── ir_lab/                  # Post-incident forensic ledger verification & timeline CLI (`mellyn-ir`)
+│           ├── __init__.py
+│           ├── verify_chain.py      # Cryptographic hash-chain verifier for audit ledgers
+│           └── reconstruct.py       # Chronological session & containment reconstructor (`mellyn-ir`)
 ├── tests/                           # Security & regression test suites
 │   ├── fakes.py                     # Unified recording in-memory MCP FakeDownstream fixture
 │   └── conformance/                 # OWASP/ATLAS control validation suite & assurance report recorder

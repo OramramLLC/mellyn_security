@@ -306,6 +306,10 @@ class AirlockPolicy(_StrictAirlockModel):
     blocked_patterns: list[str] = Field(default_factory=list)
     entropy_threshold: float = Field(default=4.0, gt=0.0, allow_inf_nan=False)
     min_entropy_length: int = Field(default=20, ge=8)
+    allow_resources_read: bool = False
+    # `--mode observe` forwards every policy violation (it only records them), so the reviewed policy must opt in
+    # as well as the launch arguments: editing an MCP client's launch command alone cannot switch enforcement off.
+    allow_observe_mode: bool = False
 
     @model_validator(mode="after")
     def _tool_rule_keys_match_names(self) -> AirlockPolicy:

@@ -246,11 +246,12 @@ class TestFullKillChainLifecycle(unittest.TestCase):
                     proxy_proc.kill()
                     proxy_proc.wait(timeout=5)
 
-            # Mutate 1 character inside entry seq=1 (1-based line 2)
+            # Mutate 1 character inside entry seq=1 (1-based line 2). Seq 0 is the session-start record, so seq 1 is
+            # the first forwarded request ("Forwarded ..."); match case-insensitively on "orwarded".
             lines = audit_path.read_text(encoding="utf-8").splitlines()
             self.assertGreaterEqual(len(lines), 4)
-            self.assertIn("forwarded", lines[1])
-            lines[1] = lines[1].replace("forwarded", "forwarted", 1)
+            self.assertIn("orwarded", lines[1])
+            lines[1] = lines[1].replace("orwarded", "orwarted", 1)
             audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
             ir_md = _run_cli(CLI_MODULES["mellyn-ir"], [str(audit_path)])
