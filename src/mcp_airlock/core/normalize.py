@@ -59,11 +59,17 @@ def is_invisible_codepoint(char: str) -> bool:
 
 def strip_invisible(text: str) -> str:
     """Remove all invisible format, tag, variation-selector, and filler codepoints from `text`."""
+    # No ASCII codepoint is invisible here (ASCII controls are category Cc, not Cf), so ASCII text is returned
+    # as is. This is exact, not an approximation, and skips a per-character Python loop on the common case.
+    if text.isascii():
+        return text
     return "".join(ch for ch in text if not is_invisible_codepoint(ch))
 
 
 def normalize_str(text: str) -> str:
     """Strip invisible codepoints, apply NFKC normalization, and re-strip idempotently."""
+    if text.isascii():  # NFKC maps every ASCII string to itself, and nothing ASCII is invisible.
+        return text
     return strip_invisible(unicodedata.normalize("NFKC", strip_invisible(text)))
 
 

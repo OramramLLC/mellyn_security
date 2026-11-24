@@ -44,7 +44,19 @@ Self-hosted deployment (control-plane authorizer, gateway, Squid egress proxy): 
 
 ## Quickstart: Red-Teaming & Containment Workflow
 
-Install the core Airlock package (installs only `pydantic>=2.10.0`):
+Want a self-contained **5-minute runnable demo** first (harmless in-memory MCP server + reviewed policy + one allowed call + one blocked call + ledger in the Plane 4 viewer)? See [**`examples/airlock_demo/README.md`**](examples/airlock_demo/README.md) or run:
+
+```bash
+python examples/airlock_demo/run_demo.py
+```
+
+Want to run the **28-scenario adversarial red-team scorecard** (six attack families, regression-tested on every run)? See [**`examples/adversarial_eval/README.md`**](examples/adversarial_eval/README.md) or run:
+
+```bash
+python examples/adversarial_eval/run_redteam.py
+```
+
+Or install the core Airlock package (installs only `pydantic>=2.10.0`):
 
 ```bash
 pip install -e .

@@ -179,6 +179,15 @@ class WorkspacePathGuard:
         except ValueError:
             return False, "Path escapes workspace root."
 
+        # Reject NTFS alternate data stream / colon syntax inside workspace-relative path segments.
+        if any(":" in part for part in rel_path.parts):
+            return False, "Path contains forbidden colon or alternate data stream syntax."
+        # Windows drops trailing dots and spaces from every path segment, so ".gitleaks.toml." or ".claude./x"
+        # would create the protected file itself. Existing targets resolve to their real name, but a file that
+        # does not exist yet keeps the trailing character here, so refuse such segments on every platform.
+        if any(part != part.rstrip(" .") for part in rel_path.parts):
+            return False, "Path segment ends with a dot or space, which Windows silently strips."
+
         rel_posix = rel_path.as_posix()
 
         for part in rel_path.parts:
@@ -186,15 +195,11 @@ class WorkspacePathGuard:
                 return False, f"Access to sensitive directory '{part.lower()}' is denied."
 
         filename = rel_path.name
-        stripped_name = filename.rstrip(" .")
         if filename.lower() != ".env.example":
             for pattern in SENSITIVE_FILENAME_PATTERNS:
-                if pattern.search(filename) or (stripped_name and pattern.search(stripped_name)):
+                if pattern.search(filename):
                     return False, "Access to sensitive file is denied."
-        if (
-            rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS
-            or rel_posix.rstrip(" .").casefold() in SENSITIVE_RELATIVE_PATHS
-        ):
+        if rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS:
             return False, "Access to sensitive file is denied."
 
         if is_write and self.is_protected(rel_posix):

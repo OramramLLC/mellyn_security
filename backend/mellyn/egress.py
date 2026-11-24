@@ -212,6 +212,15 @@ class WorkspacePathGuard:
         except ValueError:
             return False, "Path escapes workspace root."
 
+        # Reject NTFS alternate data stream / colon syntax inside workspace-relative path segments.
+        if any(":" in part for part in rel_path.parts):
+            return False, "Path contains forbidden colon or alternate data stream syntax."
+        # Windows drops trailing dots and spaces from every path segment, so ".gitleaks.toml." or ".claude./x"
+        # would create the protected file itself. Existing targets resolve to their real name, but a file that
+        # does not exist yet keeps the trailing character here, so refuse such segments on every platform.
+        if any(part != part.rstrip(" .") for part in rel_path.parts):
+            return False, "Path segment ends with a dot or space, which Windows silently strips."
+
         rel_posix = rel_path.as_posix()
 
         # Check sensitive directory components (e.g., .ssh, .aws, secrets)
