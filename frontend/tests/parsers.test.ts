@@ -231,3 +231,59 @@ test("an entry with an extra top-level field is rejected even when its hashes ar
   assert.equal(report.chain_valid, false);
   assert.equal(report.status, "INTEGRITY_COMPROMISED");
 });
+
+test("verifyAndReconstructAirlockJsonl tracks observe-mode sessions and observed violations", async () => {
+  const started = {
+    event_id: "evt-start",
+    timestamp_utc: "2026-11-24T14:00:00Z",
+    zone: "airlock",
+    action: "airlock/session",
+    verdict_allow: true,
+    severity: "WARN",
+    rule_id: "airlock.session_started",
+    reason: "Started observe-mode harness session.",
+    artifact_sha256: "a".repeat(64),
+    tool_name: null,
+    request_id: null,
+    redactions: [],
+    metadata: { session_id: "obs-1", enforcement_mode: "observe" },
+  };
+  const obsBlock = {
+    event_id: "evt-block",
+    timestamp_utc: "2026-11-24T14:00:01Z",
+    zone: "airlock",
+    action: "tools/call",
+    verdict_allow: false,
+    severity: "BLOCK",
+    rule_id: "airlock.path_boundary_violation",
+    reason: "Access to sensitive file denied (observed).",
+    artifact_sha256: "b".repeat(64),
+    tool_name: "read_workspace_file",
+    request_id: 4,
+    redactions: [],
+    metadata: { session_id: "obs-1", enforcement_mode: "observe" },
+  };
+  const obsAad = {
+    event_id: "evt-aad",
+    timestamp_utc: "2026-11-24T14:00:02Z",
+    zone: "airlock",
+    action: "tools/call",
+    verdict_allow: false,
+    severity: "AAD_FIRE",
+    rule_id: "egress.canary_exfiltration",
+    reason: "Canary detected in webhook (observed).",
+    artifact_sha256: "c".repeat(64),
+    tool_name: "post_webhook",
+    request_id: 5,
+    redactions: [],
+    metadata: { session_id: "obs-1", enforcement_mode: "observe", would_terminate: true },
+  };
+
+  const jsonl = buildChain([started, obsBlock, obsAad]);
+  const report = await verifyAndReconstructAirlockJsonl(jsonl, "observe.jsonl");
+  assert.equal(report.chain_valid, true);
+  assert.equal(report.status, "OBSERVED_VIOLATIONS");
+  assert.equal(report.observed_block_count, 1);
+  assert.equal(report.observed_aad_count, 1);
+  assert.equal(report.sessions[0]?.enforcement_mode, "observe");
+});

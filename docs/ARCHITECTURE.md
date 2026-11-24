@@ -166,11 +166,17 @@ V1/
 │   ├── adversarial_eval/            # 28-scenario adversarial red-team regression suite (6 families)
 │   │   ├── README.md                # Attack catalog & CLI scorecard instructions
 │   │   └── run_redteam.py           # Live red-team runner & scorecard emitter
-│   └── airlock_demo/                # Self-contained 5-minute Airlock + Viewer walkthrough
-│       ├── README.md                # Walkthrough guide & manual CLI commands
-│       ├── sample_mcp_server.py     # Harmless in-memory MCP stdio demo server
-│       ├── reviewed_policy.toml     # Pinned & reviewed AgBOM policy (1 allowed tool, 1 blocked tool)
-│       └── run_demo.py              # Single-command demo runner (allowed + blocked call + viewer)
+│   ├── airlock_demo/                # Self-contained 5-minute Airlock + Viewer walkthrough
+│   │   ├── README.md                # Walkthrough guide & manual CLI commands
+│   │   ├── sample_mcp_server.py     # Harmless in-memory MCP stdio demo server
+│   │   ├── reviewed_policy.toml     # Pinned & reviewed AgBOM policy (1 allowed tool, 1 blocked tool)
+│   │   └── run_demo.py              # Single-command demo runner (allowed + blocked call + viewer)
+│   └── observe_redteam/             # Live `--mode observe` multi-turn red-team workflow + viewer parity
+│       ├── README.md                # Workflow guide, MCP client JSON snippet & privacy notice
+│       ├── sandbox_mcp_server.py    # Sandboxed in-memory MCP server with prompt-injection & canary lure
+│       ├── policy.observe.toml      # Pinned observe policy (`allow_observe_mode = true`)
+│       ├── policy.enforce.toml      # Pinned enforce counterpart (`allow_observe_mode = false`)
+│       └── run_observe_workflow.py  # Multi-turn Observe vs Enforce runner + viewer server
 ├── scripts/
 │   ├── ci_guardrails.py             # Shared checksummed Gitleaks, base-allowlist & baseline-gate CI runner
 │   ├── run_conformance_report.py    # Fast-profile conformance runner & JSON/Markdown assurance exporter

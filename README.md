@@ -56,6 +56,12 @@ Want to run the **28-scenario adversarial red-team scorecard** (six attack famil
 python examples/adversarial_eval/run_redteam.py
 ```
 
+Want to see a live multi-turn **`--mode observe` red-team workflow** against `--mode enforce` in the Plane 4 console (including a ready-to-paste real MCP client config)? See [**`examples/observe_redteam/README.md`**](examples/observe_redteam/README.md) or run:
+
+```bash
+python examples/observe_redteam/run_observe_workflow.py
+```
+
 Or install the core Airlock package (installs only `pydantic>=2.10.0`):
 
 ```bash
