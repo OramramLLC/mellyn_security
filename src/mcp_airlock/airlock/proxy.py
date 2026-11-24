@@ -38,7 +38,7 @@ import signal
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,7 +69,7 @@ from mcp_airlock.airlock.models import (
 )
 from mcp_airlock.core.audit import AuditLedger, redact_core_secrets
 from mcp_airlock.core.normalize import JsonObject, JsonValue, exact_json_bytes, has_invisible_unicode, strip_invisible
-from mcp_airlock.core.schemas import RedactionRecord, Severity, ZoneEvent
+from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, RedactionRecord, Severity, ZoneEvent
 from mcp_airlock.egress.scanner import scan_payload
 
 AAD_EXIT_CODE = 78
@@ -85,6 +85,8 @@ JSONRPC_AAD_CONTAINMENT_SEVERED = -32099
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 # How long one write to the client may take before the client is treated as gone (it stopped reading stdout).
 DEFAULT_CLIENT_WRITE_TIMEOUT_SECONDS = 5.0
+DEFAULT_CLI_STDIN_READ_CHUNK_BYTES = 4096
+DEFAULT_CLI_STDIN_READAHEAD_BYTES = 65_536
 MAX_STDERR_LINE_BYTES = 4096
 # Ids of requests that timed out are remembered (bounded) so a late answer is dropped instead of firing AAD as a
 # "spoofed" id, and so the client cannot reuse such an id and receive the old request's late answer.
@@ -102,6 +104,12 @@ _POSIX_DEFAULT_ENV_KEYS: tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "TMPDIR", 
 _WIN32_DEFAULT_ENV_KEYS: tuple[str, ...] = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
 
 type RpcId = int | str
+
+
+class AsyncByteReader(Protocol):
+    """Minimal async byte-stream protocol satisfied by `asyncio.StreamReader` and `BoundedStdinReader`."""
+
+    async def read(self, n: int = -1) -> bytes: ...
 
 
 class ClientWriter(Protocol):
@@ -156,7 +164,7 @@ class BoundedLineReader:
     via single-line JSON bombs.
     """
 
-    def __init__(self, reader: asyncio.StreamReader, *, max_bytes: int) -> None:
+    def __init__(self, reader: AsyncByteReader, *, max_bytes: int) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive.")
         self._reader = reader
@@ -444,7 +452,7 @@ class AirlockProxy:
         command: Sequence[str],
         policy: AirlockPolicy,
         ledger: AuditLedger,
-        client_reader: asyncio.StreamReader,
+        client_reader: AsyncByteReader,
         client_writer: ClientWriter,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         allowed_env_keys: Sequence[str] | None = None,
@@ -498,6 +506,11 @@ class AirlockProxy:
         self._idle_event = asyncio.Event()
         self._idle_event.set()
         self._aad_fired = False
+        self._aad_trigger_event_id: str | None = None
+        self._aad_trigger_artifact_sha256 = _EMPTY_SHA256
+        self._aad_trigger_rpc_id: RpcId | None = None
+        self._aad_trigger_tool_name: str | None = None
+        self._aad_containment_recorded = False
         self._faulted = False
         self._exit_code = 0
         self._downstream_stdin_closed = False
@@ -552,7 +565,7 @@ class AirlockProxy:
         request_id: RpcId | None = None,
         redactions: Sequence[RedactionRecord] = (),
         metadata: JsonObject | None = None,
-    ) -> None:
+    ) -> str:
         merged_metadata: JsonObject = {"session_id": self._session_id}
         if metadata:
             merged_metadata.update(metadata)
@@ -572,6 +585,7 @@ class AirlockProxy:
             metadata=merged_metadata,
         )
         self._ledger.record(event)
+        return event.event_id
 
     async def _write_client_bytes(self, payload: bytes, *, allow_during_aad: bool = False) -> None:
         async with self._client_write_lock:
@@ -692,11 +706,47 @@ class AirlockProxy:
             await self._contain_downstream()
             self._stop_event.set()
 
-    async def _contain_downstream(self) -> None:
+    async def _contain_downstream(self) -> bool:
         """Sever the downstream input pipe, hard-kill its process group (or job, on Windows) and reap it."""
         self._close_downstream_stdin()
-        if self._proc is not None:
-            await _hard_kill_subprocess(self._proc, job=self._job)
+        if self._proc is None:
+            return False
+        await _hard_kill_subprocess(self._proc, job=self._job)
+        return self._proc.returncode is not None
+
+    def _record_aad_containment_confirmed(self) -> None:
+        """
+        Append one idempotent post-reap confirmation event linked to the triggering AAD_FIRE event.
+
+        Only writes after a real downstream process has exited (`returncode is not None`) and never prevents
+        shutdown if the audit write itself fails.
+        """
+        if (
+            self._aad_containment_recorded
+            or not self._aad_fired
+            or self._aad_trigger_event_id is None
+            or self._proc is None
+            or self._proc.returncode is None
+        ):
+            return
+        self._aad_containment_recorded = True
+        try:
+            self._record_event(
+                action="airlock/containment",
+                verdict_allow=False,
+                severity="INFO",
+                rule_id=AAD_CONTAINMENT_CONFIRMED_RULE_ID,
+                reason="Downstream MCP server process terminated and reaped after AAD_FIRE.",
+                artifact_sha256=self._aad_trigger_artifact_sha256,
+                tool_name=self._aad_trigger_tool_name,
+                request_id=self._aad_trigger_rpc_id,
+                metadata={
+                    "trigger_event_id": self._aad_trigger_event_id,
+                    "downstream_returncode": self._proc.returncode,
+                },
+            )
+        except Exception as rec_exc:
+            self._log_err(f"[airlock AAD_FIRE] containment confirmation write failed ({type(rec_exc).__name__})")
 
     async def _supervised(self, task_name: str, work: Awaitable[None]) -> None:
         try:
@@ -721,7 +771,8 @@ class AirlockProxy:
         """
         Execute the AAD containment kill switch sequence:
           1. Synchronously flush & fsync `AAD_FIRE` event to `AuditLedger` (a failed write does not stop step 2).
-          2. Close downstream stdin, `SIGKILL` the downstream process group (Windows: terminate its job) and reap it.
+          2. Close downstream stdin, `SIGKILL` the downstream process group (Windows: terminate its job), reap it,
+             and append the linked `airlock.aad_containment_confirmed` completion receipt once reaped.
           3. Only then emit terminal `-32099` (`AAD_CONTAINMENT_SEVERED`) error frames for active `rpc_id`s, each
              bounded by the client write timeout, so a client that stopped reading cannot delay containment.
           4. Stop proxy loop with deterministic exit code `78`.
@@ -735,7 +786,7 @@ class AirlockProxy:
             # 1. Synchronous tamper-evident ledger record first (redacted + fsynced). A failed write must not stop
             #    containment, so it is reported on stderr and the kill sequence continues.
             try:
-                self._record_event(
+                self._aad_trigger_event_id = self._record_event(
                     action=action,
                     verdict_allow=False,
                     severity="AAD_FIRE",
@@ -747,6 +798,9 @@ class AirlockProxy:
                     redactions=redactions,
                     metadata=metadata,
                 )
+                self._aad_trigger_artifact_sha256 = artifact_sha256
+                self._aad_trigger_rpc_id = rpc_id
+                self._aad_trigger_tool_name = tool_name
             except Exception as rec_exc:
                 self._log_err(f"[airlock AAD_FIRE] audit write failed ({type(rec_exc).__name__}); containing anyway")
             self._log_err(f"[airlock AAD_FIRE] rule={rule_id} reason={reason}")
@@ -760,8 +814,9 @@ class AirlockProxy:
             self._in_flight.clear()
             self._idle_event.set()
 
-            # 2. Contain first: kill the downstream before any client write that could block.
-            await self._contain_downstream()
+            # 2. Contain first: kill and reap the downstream before any client write that could block.
+            if await self._contain_downstream():
+                self._record_aad_containment_confirmed()
 
             # 3. Emit terminal -32099 error frame(s).
             for target_id in active_ids:
@@ -774,7 +829,8 @@ class AirlockProxy:
                 )
         finally:
             # Containment is guaranteed even if anything above raised (no-op if already done).
-            await self._contain_downstream()
+            if await self._contain_downstream():
+                self._record_aad_containment_confirmed()
             # 4. Signal proxy shutdown.
             self._stop_event.set()
 
@@ -1526,13 +1582,41 @@ class AirlockProxy:
             )
             return
 
+        wire_resp_body = exact_json_bytes(cast(JsonObject, forward_msg.model_dump(mode="json")))
+        if len(wire_resp_body) > self._policy.max_payload_bytes:
+            oversized_sha = hashlib.sha256(wire_resp_body).hexdigest()
+            self._record_event(
+                action=in_flight.method,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.response_too_large",
+                reason=(
+                    f"Response size {len(wire_resp_body)} exceeds limit of {self._policy.max_payload_bytes} bytes."
+                ),
+                artifact_sha256=oversized_sha,
+                tool_name=in_flight.tool_name,
+                request_id=msg.id,
+            )
+            await self._emit_client_error(
+                rpc_id=msg.id,
+                code=JSONRPC_POLICY_VIOLATION,
+                message=(
+                    f"Policy violation (airlock.response_too_large): "
+                    f"Response size {len(wire_resp_body)} exceeds limit of "
+                    f"{self._policy.max_payload_bytes} bytes."
+                ),
+                data={"rule_id": "airlock.response_too_large"},
+            )
+            return
+
+        receipt_sha256 = hashlib.sha256(wire_resp_body).hexdigest()
         self._record_event(
             action=in_flight.method,
             verdict_allow=True,
             severity="INFO",
             rule_id="airlock.response_allowed",
             reason=f"Verified and forwarded downstream response for '{in_flight.method}'.",
-            artifact_sha256=resp_verdict.artifact_sha256,
+            artifact_sha256=receipt_sha256,
             tool_name=in_flight.tool_name,
             request_id=msg.id,
         )
@@ -1543,8 +1627,7 @@ class AirlockProxy:
             self._verified_tool_names = base | verified_names
         if issued_cursor is not None:
             _remember(self._issued_cursors, issued_cursor, MAX_ISSUED_CURSORS)
-        wire_resp = exact_json_bytes(cast(JsonObject, forward_msg.model_dump(mode="json"))) + b"\n"
-        await self._write_client_bytes(wire_resp)
+        await self._write_client_bytes(wire_resp_body + b"\n")
 
     async def _fail_remaining_in_flight_on_eof(self) -> None:
         if not self._in_flight:
@@ -1795,51 +1878,147 @@ class _BinaryStdoutWriter:
         await fut
 
 
-def _start_stdin_pump(
-    loop: asyncio.AbstractEventLoop,
-    reader: asyncio.StreamReader,
-    raw_stdin: BinaryIO,
-    stop_flag: threading.Event,
-) -> threading.Thread:
+class BoundedStdinReader:
     """
-    Pump binary stdin chunks into `reader` via `call_soon_threadsafe` (works on Windows & POSIX).
+    Async reader bridging blocking binary stdin into an event loop under a fixed read-ahead budget.
 
-    Uses raw `os.read(fd, 4096)` when an OS descriptor is available so exiting on AAD while a daemon thread is
-    still waiting on an open stdin pipe cannot race CPython's `BufferedReader` finalizer.
+    Accounts for all unread bytes across queued chunks (including chunks whose loop wakeup is still pending),
+    blocks the producer thread when the budget is full, returns capacity as the consumer takes bytes, and
+    wakes any waiting producer immediately on `close()`.
     """
-    fd: int | None = None
-    try:
-        candidate = raw_stdin.fileno()
-        if isinstance(candidate, int) and candidate >= 0:
-            fd = candidate
-    except (AttributeError, OSError, ValueError):
-        fd = None
 
-    read1_fn = getattr(raw_stdin, "read1", None)
+    def __init__(
+        self,
+        raw_stdin: BinaryIO,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        max_buffered_bytes: int = DEFAULT_CLI_STDIN_READAHEAD_BYTES,
+        read_chunk_bytes: int = DEFAULT_CLI_STDIN_READ_CHUNK_BYTES,
+    ) -> None:
+        if max_buffered_bytes <= 0:
+            raise ValueError("max_buffered_bytes must be positive.")
+        if read_chunk_bytes <= 0:
+            raise ValueError("read_chunk_bytes must be positive.")
+        self._raw_stdin = raw_stdin
+        self._loop = loop
+        self._max_buffered_bytes = max_buffered_bytes
+        self._read_chunk_bytes = read_chunk_bytes
+        self._cond = threading.Condition()
+        self._chunks: deque[bytes] = deque()
+        self._buffered_bytes = 0
+        self._eof = False
+        self._closed = False
+        self._data_event = asyncio.Event()
+        self._waiting_for_capacity = threading.Event()
+        self._thread = threading.Thread(target=self._pump, name="airlock-stdin-pump", daemon=True)
+        self._thread.start()
 
-    def _pump() -> None:
+    @property
+    def max_buffered_bytes(self) -> int:
+        return self._max_buffered_bytes
+
+    @property
+    def buffered_bytes(self) -> int:
+        with self._cond:
+            return self._buffered_bytes
+
+    @property
+    def waiting_for_capacity(self) -> threading.Event:
+        return self._waiting_for_capacity
+
+    @property
+    def thread(self) -> threading.Thread:
+        return self._thread
+
+    def _notify_loop(self) -> None:
         try:
-            while not stop_flag.is_set():
-                if fd is not None:
-                    chunk = os.read(fd, 4096)
-                elif callable(read1_fn):
-                    chunk_obj = read1_fn(4096)
-                    chunk = chunk_obj if isinstance(chunk_obj, bytes) else b""
-                else:
-                    chunk = raw_stdin.read(1)
-                if not chunk:
-                    loop.call_soon_threadsafe(reader.feed_eof)
-                    return
-                loop.call_soon_threadsafe(reader.feed_data, chunk)
-        except (OSError, RuntimeError, ValueError):
-            try:
-                loop.call_soon_threadsafe(reader.feed_eof)
-            except RuntimeError:
-                pass
+            self._loop.call_soon_threadsafe(self._data_event.set)
+        except RuntimeError:
+            pass
 
-    thread = threading.Thread(target=_pump, name="airlock-stdin-pump", daemon=True)
-    thread.start()
-    return thread
+    def _pump(self) -> None:
+        # Use raw `os.read(fd, ...)` on real OS descriptors so exiting on AAD while a daemon thread is blocked
+        # waiting on an open stdin pipe never races CPython's `BufferedReader` finalizer on Windows.
+        fd: int | None = None
+        try:
+            candidate = self._raw_stdin.fileno()
+            if isinstance(candidate, int) and candidate >= 0:
+                fd = candidate
+        except (AttributeError, OSError, ValueError):
+            fd = None
+
+        read1_fn = getattr(self._raw_stdin, "read1", None)
+
+        def _read_chunk(size: int) -> bytes:
+            if fd is not None:
+                return os.read(fd, size)
+            if callable(read1_fn):
+                chunk_obj = read1_fn(size)
+                return chunk_obj if isinstance(chunk_obj, bytes) else b""
+            return self._raw_stdin.read(size)
+
+        try:
+            while True:
+                with self._cond:
+                    while not self._closed and self._buffered_bytes >= self._max_buffered_bytes:
+                        self._waiting_for_capacity.set()
+                        self._cond.wait()
+                    self._waiting_for_capacity.clear()
+                    if self._closed:
+                        return
+                    allowance = min(self._read_chunk_bytes, self._max_buffered_bytes - self._buffered_bytes)
+
+                chunk = _read_chunk(allowance)
+                if not chunk:
+                    with self._cond:
+                        self._eof = True
+                    self._notify_loop()
+                    return
+
+                with self._cond:
+                    if self._closed:
+                        return
+                    self._chunks.append(chunk)
+                    self._buffered_bytes += len(chunk)
+                self._notify_loop()
+        except (OSError, RuntimeError, ValueError):
+            with self._cond:
+                self._waiting_for_capacity.clear()
+                self._eof = True
+            self._notify_loop()
+
+    async def read(self, n: int = -1) -> bytes:
+        """Consume up to `n` unread bytes (or the next chunk if `n < 0`), returning read-ahead capacity."""
+        if n == 0:
+            return b""
+        while True:
+            with self._cond:
+                if self._chunks:
+                    if n > 0:
+                        head = self._chunks[0]
+                        if len(head) <= n:
+                            data = self._chunks.popleft()
+                        else:
+                            data = head[:n]
+                            self._chunks[0] = head[n:]
+                    else:
+                        data = self._chunks.popleft()
+                    self._buffered_bytes -= len(data)
+                    self._cond.notify_all()
+                    return data
+                if self._eof or self._closed:
+                    return b""
+                self._data_event.clear()
+            await self._data_event.wait()
+
+    def close(self) -> None:
+        """Mark closed, wake any capacity waiter on the producer thread, and unblock waiting consumers."""
+        with self._cond:
+            self._closed = True
+            self._eof = True
+            self._waiting_for_capacity.clear()
+            self._cond.notify_all()
+        self._notify_loop()
 
 
 def parse_allow_env_keys(raw_value: str | None) -> tuple[str, ...] | None:
@@ -1862,9 +2041,7 @@ async def _run_cli_async(
     session_id: str | None,
 ) -> int:
     loop = asyncio.get_running_loop()
-    client_reader = asyncio.StreamReader()
-    stop_flag = threading.Event()
-    _start_stdin_pump(loop, client_reader, sys.stdin.buffer, stop_flag)
+    client_reader = BoundedStdinReader(sys.stdin.buffer, loop=loop)
     client_writer = _BinaryStdoutWriter(sys.stdout.buffer)
     proxy = AirlockProxy(
         command=command,
@@ -1891,7 +2068,7 @@ async def _run_cli_async(
     try:
         return await proxy.run()
     finally:
-        stop_flag.set()
+        client_reader.close()
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
@@ -1990,6 +2167,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "AAD_EXIT_CODE",
+    "DEFAULT_CLI_STDIN_READ_CHUNK_BYTES",
+    "DEFAULT_CLI_STDIN_READAHEAD_BYTES",
     "DEFAULT_REQUEST_TIMEOUT_SECONDS",
     "INTERNAL_FAULT_EXIT_CODE",
     "JSONRPC_AAD_CONTAINMENT_SEVERED",
@@ -2002,7 +2181,9 @@ __all__ = [
     "MAX_ISSUED_CURSORS",
     "MAX_STDERR_LINE_BYTES",
     "AirlockProxy",
+    "AsyncByteReader",
     "BoundedLineReader",
+    "BoundedStdinReader",
     "ClientWriter",
     "InFlightRequest",
     "RpcId",

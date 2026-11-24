@@ -8,7 +8,9 @@ mellyn-bench passing with missed secrets, and non-finite timeouts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import math
 import os
 import signal
@@ -18,8 +20,9 @@ import tempfile
 import time
 import tomllib
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 from unittest import mock
 
 from pydantic import ValidationError
@@ -27,9 +30,9 @@ from pydantic import ValidationError
 from mcp_airlock.airlock.engine import evaluate_tool_call
 from mcp_airlock.airlock.models import JsonRpcRequest, ToolCallParams, parse_airlock_policy_toml
 from mcp_airlock.airlock.pin_cli import inspect_mcp_server
-from mcp_airlock.airlock.proxy import AAD_EXIT_CODE, AirlockProxy
+from mcp_airlock.airlock.proxy import AAD_EXIT_CODE, AirlockProxy, BoundedLineReader, BoundedStdinReader
 from mcp_airlock.core.audit import AuditLedger, verify_ledger, verify_ledger_bytes
-from mcp_airlock.core.schemas import ZoneEvent
+from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, ZoneEvent
 from mcp_airlock.egress import bench
 from mcp_airlock.ir_lab.reconstruct import reconstruct_incident, render_markdown
 
@@ -237,13 +240,49 @@ class TestPinPaginatedServer(ProxyHarness):
         proxy, reader, writer, _, _ = self._spawn_harness(mode="paginate", policy=policy)
         task = asyncio.create_task(proxy.run())
         self._send(reader, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-        page = await self._recv(writer)
-        self.assertIn("result", page, page)
+        page1 = await self._recv(writer)
+        self.assertIn("result", page1, page1)
+        page_cursor = "eyJvZmZzZXQiOjEsInNvcnQiOiJuYW1lIiwidiI6Mn0="
+        self.assertEqual(page1["result"].get("nextCursor"), page_cursor)
+
+        # Second cursor-free page as control
+        self._send(reader, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"cursor": page_cursor}})
+        page2 = await self._recv(writer)
+        self.assertIn("result", page2, page2)
+        self.assertNotIn("nextCursor", page2["result"])
+
         reader.feed_eof()
         self.assertEqual(await asyncio.wait_for(task, timeout=5.0), 0)
 
+        frames = writer.raw_bytes().splitlines(keepends=True)
+        self.assertEqual(len(frames), 2)
+        allowed_receipts = {
+            row["event"]["request_id"]: row["event"]
+            for row in self._read_audit_rows()
+            if row["event"]["rule_id"] == "airlock.response_allowed"
+        }
 
-def _event(idx: int, *, request_id: int | str | None = None, tool: str | None = None) -> ZoneEvent:
+        for rpc_id, frame, expect_cursor in ((1, frames[0], True), (2, frames[1], False)):
+            with self.subTest(rpc_id=rpc_id):
+                self.assertTrue(frame.endswith(b"\n"))
+                decoded = json.loads(frame[:-1].decode("utf-8"))
+                self.assertEqual(decoded["id"], rpc_id)
+                if expect_cursor:
+                    self.assertEqual(decoded["result"].get("nextCursor"), page_cursor)
+                else:
+                    self.assertNotIn("nextCursor", decoded["result"])
+                receipt = allowed_receipts[rpc_id]
+                self.assertEqual(receipt["artifact_sha256"], hashlib.sha256(frame[:-1]).hexdigest())
+
+
+def _event(
+    idx: int,
+    *,
+    request_id: int | str | None = None,
+    tool: str | None = None,
+    session_id: str = "s1",
+    rule_id: str = "egress.canary_exfiltration",
+) -> ZoneEvent:
     return ZoneEvent(
         event_id=f"e{idx}",
         timestamp_utc="2026-11-23T00:00:00Z",
@@ -251,12 +290,38 @@ def _event(idx: int, *, request_id: int | str | None = None, tool: str | None = 
         action="tools/call",
         verdict_allow=False,
         severity="AAD_FIRE",
-        rule_id="egress.canary_exfiltration",
+        rule_id=rule_id,
         reason="Reason with | pipe and [link](http://x) and <b>html</b>",
         artifact_sha256="0" * 64,
         request_id=request_id,
         tool_name=tool,
-        metadata={"session_id": "s1"},
+        metadata={"session_id": session_id},
+    )
+
+
+def _completion(
+    idx: int,
+    *,
+    trigger_event_id: str,
+    session_id: str = "s1",
+    returncode: int = -9,
+) -> ZoneEvent:
+    return ZoneEvent(
+        event_id=f"c{idx}",
+        timestamp_utc="2026-11-23T00:00:01Z",
+        zone="airlock",
+        action="airlock/containment",
+        verdict_allow=False,
+        severity="INFO",
+        rule_id=AAD_CONTAINMENT_CONFIRMED_RULE_ID,
+        reason="Downstream MCP server process terminated and reaped after AAD_FIRE.",
+        artifact_sha256="0" * 64,
+        request_id=7,
+        metadata={
+            "session_id": session_id,
+            "trigger_event_id": trigger_event_id,
+            "downstream_returncode": returncode,
+        },
     )
 
 
@@ -302,6 +367,80 @@ class TestIncidentReportIntegrity(unittest.TestCase):
             report = reconstruct_incident(self.path)
         self.assertEqual(report.total_events, 3)
         self.assertEqual(len(calls), 1)
+
+    def test_unconfirmed_aad_trigger_reports_aad_triggered_unconfirmed(self) -> None:
+        AuditLedger(self.path).record(_event(0, request_id=42))
+        report = reconstruct_incident(self.path)
+        report_json = report.model_dump(mode="json")
+        markdown = render_markdown(report)
+
+        self.assertEqual(report.status, "AAD_TRIGGERED_UNCONFIRMED")
+        self.assertEqual(report_json["status"], "AAD_TRIGGERED_UNCONFIRMED")
+        self.assertEqual(report_json["unconfirmed_aad_triggers"], 1)
+        if report.terminal_event is None:
+            self.fail("Expected terminal_event on AAD trigger report")
+        self.assertFalse(report.terminal_event.containment_confirmed)
+        self.assertEqual(report.terminal_event.reason_code, "CANARY_EXFILTRATION")
+        self.assertEqual(report.terminal_event.rpc_id, 42)
+        self.assertIn("# Mellyn Incident Reconstruction (AAD_TRIGGERED_UNCONFIRMED)", markdown)
+        self.assertIn("**Containment**: UNCONFIRMED", markdown)
+        self.assertIn("**containment_confirmed**: `False (unconfirmed)`", markdown)
+
+    def test_matching_post_reap_completion_confirms_aad_contained(self) -> None:
+        ledger = AuditLedger(self.path)
+        trigger = _event(0, request_id=42, session_id="s1", rule_id="airlock.agbom_pin_mismatch")
+        ledger.record(trigger)
+        ledger.record(_completion(1, trigger_event_id=trigger.event_id, session_id="s1"))
+
+        report = reconstruct_incident(self.path)
+        report_json = report.model_dump(mode="json")
+        markdown = render_markdown(report)
+
+        self.assertEqual(report.status, "AAD_CONTAINED")
+        self.assertEqual(report_json["status"], "AAD_CONTAINED")
+        self.assertEqual(report_json["unconfirmed_aad_triggers"], 0)
+        if report.terminal_event is None:
+            self.fail("Expected terminal_event on confirmed AAD report")
+        self.assertTrue(report.terminal_event.containment_confirmed)
+        self.assertEqual(report.terminal_event.containment_seq, 1)
+        self.assertEqual(report.terminal_event.reason_code, "AGBOM_HASH_MISMATCH")
+        self.assertEqual(report.terminal_event.rpc_id, 42)
+        self.assertIn("# Mellyn Incident Reconstruction (AAD_CONTAINED)", markdown)
+        self.assertIn("**Containment**: CONFIRMED", markdown)
+        self.assertIn("**containment_confirmed**: `True (seq=1)`", markdown)
+
+    def test_mismatched_session_or_trigger_completion_leaves_aad_unconfirmed(self) -> None:
+        cases = (
+            "different_session",
+            "wrong_trigger_id",
+            "completion_before_trigger",
+            "shared_ledger_one_unconfirmed",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                case_path = Path(self._tmp.name) / f"{case}.jsonl"
+                ledger = AuditLedger(case_path)
+                if case == "different_session":
+                    ledger.record(_event(0, request_id=10, session_id="s1"))
+                    ledger.record(_completion(1, trigger_event_id="e0", session_id="s2"))
+                elif case == "wrong_trigger_id":
+                    ledger.record(_event(0, request_id=10, session_id="s1"))
+                    ledger.record(_completion(1, trigger_event_id="e999", session_id="s1"))
+                elif case == "completion_before_trigger":
+                    ledger.record(_completion(0, trigger_event_id="e1", session_id="s1"))
+                    ledger.record(_event(1, request_id=10, session_id="s1"))
+                else:
+                    ledger.record(_event(0, request_id=10, session_id="s1"))
+                    ledger.record(_completion(1, trigger_event_id="e0", session_id="s1"))
+                    ledger.record(_event(2, request_id=20, session_id="s2"))
+
+                report = reconstruct_incident(case_path)
+                report_json = report.model_dump(mode="json")
+                markdown = render_markdown(report)
+                self.assertEqual(report.status, "AAD_TRIGGERED_UNCONFIRMED")
+                self.assertEqual(report_json["status"], "AAD_TRIGGERED_UNCONFIRMED")
+                self.assertEqual(report_json["unconfirmed_aad_triggers"], 1)
+                self.assertIn("AAD_TRIGGERED_UNCONFIRMED", markdown)
 
 
 class TestBenchAndTimeouts(unittest.TestCase):
@@ -356,3 +495,113 @@ class TestBenchAndTimeouts(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 2, res.stderr)
         self.assertIn("--timeout", res.stderr)
+
+
+class _ScriptedBinaryInput:
+    """Synthetic blocking-capable binary input yielding preset chunks for read-ahead backpressure tests."""
+
+    def __init__(self, chunks: Sequence[bytes]) -> None:
+        self._chunks = list(chunks)
+        self._index = 0
+        self.read_sizes: list[int] = []
+
+    def read1(self, n: int = -1) -> bytes:
+        self.read_sizes.append(n)
+        if self._index >= len(self._chunks):
+            return b""
+        chunk = self._chunks[self._index]
+        if n > 0 and len(chunk) > n:
+            piece, remainder = chunk[:n], chunk[n:]
+            self._chunks[self._index] = remainder
+        else:
+            piece = chunk
+            self._index += 1
+        return piece
+
+    def read(self, n: int = -1) -> bytes:
+        return self.read1(n)
+
+
+class TestBoundedCliStdinHandoff(unittest.IsolatedAsyncioTestCase):
+    async def test_cli_stdin_reader_enforces_readahead_budget_and_preserves_order(self) -> None:
+        chunks = [b"chunk-1\n", b"chunk-2\n", b"chunk-3\n", b"chunk-4\n"]
+        raw = _ScriptedBinaryInput(chunks)
+        loop = asyncio.get_running_loop()
+        stdin_reader = BoundedStdinReader(
+            cast(BinaryIO, raw),
+            loop=loop,
+            max_buffered_bytes=16,
+            read_chunk_bytes=8,
+        )
+        self.addCleanup(stdin_reader.close)
+
+        # Pause consumer until the producer reaches its two-chunk read-ahead budget.
+        self.assertTrue(await asyncio.to_thread(stdin_reader.waiting_for_capacity.wait, 5.0))
+        self.assertEqual(stdin_reader.buffered_bytes, 16)
+        self.assertEqual(len(raw.read_sizes), 2)
+        self.assertEqual(raw.read_sizes, [8, 8])
+
+        line_reader = BoundedLineReader(stdin_reader, max_bytes=64)
+        frames: list[bytes] = []
+        while True:
+            frame, oversized = await asyncio.wait_for(line_reader.read_frame(), timeout=5.0)
+            self.assertFalse(oversized)
+            if frame is None:
+                break
+            frames.append(frame)
+
+        self.assertEqual(frames, [b"chunk-1", b"chunk-2", b"chunk-3", b"chunk-4"])
+        await asyncio.to_thread(stdin_reader.thread.join, 5.0)
+        self.assertFalse(stdin_reader.thread.is_alive())
+        self.assertEqual(stdin_reader.buffered_bytes, 0)
+
+        # Verify oversized single-line framing still drains cleanly across bounded handoff chunks.
+        oversized_raw = _ScriptedBinaryInput([b"A" * 20 + b"B" * 20 + b"\n", b"ok\n"])
+        oversized_stdin = BoundedStdinReader(
+            cast(BinaryIO, oversized_raw),
+            loop=loop,
+            max_buffered_bytes=16,
+            read_chunk_bytes=8,
+        )
+        self.addCleanup(oversized_stdin.close)
+        oversized_lines = BoundedLineReader(oversized_stdin, max_bytes=16)
+        first_frame, first_oversized = await asyncio.wait_for(oversized_lines.read_frame(), timeout=5.0)
+        self.assertIsNone(first_frame)
+        self.assertTrue(first_oversized)
+        second_frame, second_oversized = await asyncio.wait_for(oversized_lines.read_frame(), timeout=5.0)
+        self.assertFalse(second_oversized)
+        self.assertEqual(second_frame, b"ok")
+        eof_frame, eof_oversized = await asyncio.wait_for(oversized_lines.read_frame(), timeout=5.0)
+        self.assertIsNone(eof_frame)
+        self.assertFalse(eof_oversized)
+
+    async def test_cli_stdin_reader_close_wakes_producer_waiting_at_capacity(self) -> None:
+        raw = _ScriptedBinaryInput([b"chunk-1\n", b"chunk-2\n", b"chunk-3\n", b"chunk-4\n"])
+        loop = asyncio.get_running_loop()
+        stdin_reader = BoundedStdinReader(
+            cast(BinaryIO, raw),
+            loop=loop,
+            max_buffered_bytes=16,
+            read_chunk_bytes=8,
+        )
+        self.assertTrue(await asyncio.to_thread(stdin_reader.waiting_for_capacity.wait, 5.0))
+        self.assertEqual(len(raw.read_sizes), 2)
+
+        stdin_reader.close()
+        await asyncio.to_thread(stdin_reader.thread.join, 5.0)
+        self.assertFalse(stdin_reader.thread.is_alive())
+        self.assertEqual(len(raw.read_sizes), 2)
+
+        # Real OS pipe descriptor: producer waits at capacity while writer keeps pipe open; close() wakes it.
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, b"12345678abcdefghxxxxxxxx")
+        pipe_stream = os.fdopen(r_fd, "rb", buffering=0)
+        try:
+            os_reader = BoundedStdinReader(pipe_stream, loop=loop, max_buffered_bytes=16, read_chunk_bytes=8)
+            self.assertTrue(await asyncio.to_thread(os_reader.waiting_for_capacity.wait, 5.0))
+            os_reader.close()
+            await asyncio.to_thread(os_reader.thread.join, 5.0)
+            self.assertFalse(os_reader.thread.is_alive())
+        finally:
+            os.close(w_fd)
+            pipe_stream.close()

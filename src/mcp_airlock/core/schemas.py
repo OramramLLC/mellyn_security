@@ -22,6 +22,7 @@ type Zone = Literal["core", "egress", "airlock", "ir_lab"]
 type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_pattern"]
 
 GENESIS_PREV_HASH = "0" * 64
+AAD_CONTAINMENT_CONFIRMED_RULE_ID = "airlock.aad_containment_confirmed"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
