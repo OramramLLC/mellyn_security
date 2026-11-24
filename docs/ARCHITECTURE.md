@@ -223,7 +223,11 @@ V1/
 ├── .pre-commit-config.yaml          # Local deterministic pre-commit hooks
 ├── .pre-commit-hooks.yaml           # Exported SHA-pinnable pre-commit hook manifest for client repos
 ├── CLAUDE.md                        # Claude Code context (imports .agent/rules)
+├── CHANGELOG.md                     # Versioned release notes (v1.0.0+)
 ├── Dockerfile                       # Digest- and hash-pinned non-root Mellyn runtime container
+├── LICENSE                          # Apache License, Version 2.0
+├── NOTICE                           # Apache-2.0 attribution notice (copyright & name use)
+├── SECURITY.md                      # Supported versions, private disclosure & security commitments
 └── pyproject.toml                   # Python project manifest
 ```
 
