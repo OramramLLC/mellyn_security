@@ -66,8 +66,27 @@ CORE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 _URL_USERINFO_SECRET_RE = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)")
 _CANARY_SEP_RE = re.compile(r"[\s._:/\\|-]+")
 _HEX_CANDIDATE_RE = re.compile(r"[0-9A-Fa-f]{16,}")
+_HEX_SECRET_CANDIDATE_RE = re.compile(r"[0-9A-Fa-f]{32,}")
 _DELIMITED_HEX_CANDIDATE_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:\-\s]+){7,}[0-9A-Fa-f]{2}")
 _B64_CANDIDATE_RE = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+# Source-code style escapes (\x4d, \u004d, \u{4d}, \U0000004d), which a model can emit as easily as the raw text.
+_ESCAPE_SEQUENCE_RE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u\{([0-9A-Fa-f]{1,6})\}|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8}))")
+
+# Encodings a known secret is decoded from, token by token. Every secret pattern needs at least 16 bytes, so each
+# candidate must carry that many. None of these can backtrack more than one repetition, so scans stay linear.
+_SECRET_DELIMITED_HEX_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:\-\s,]+){15,}[0-9A-Fa-f]{2}")
+_SECRET_0X_HEX_RE = re.compile(r"(?:0[xX][0-9A-Fa-f]{2}[\s,]*){16,}")
+_SECRET_DECIMAL_RE = re.compile(r"(?<![\d.])(?:\d{1,3}[\s,;]+){15,}\d{1,3}")
+_SECRET_B64_RE = re.compile(r"[A-Za-z0-9+/_-]{20,}={0,2}")
+_NON_HEX_RE = re.compile(r"[^0-9A-Fa-f]")
+_OX_BYTE_RE = re.compile(r"0[xX]([0-9A-Fa-f]{2})")
+
+# Split-canary fragments: a canary this long, cut into pieces of at least the fragment length, is found whatever the
+# order of the pieces and whatever sits between them. Fragments are sized to the canary's alphabet so unrelated data
+# (large hex or Base64 blobs included) is very unlikely to contain every one of them by chance.
+SPLIT_COVERAGE_MIN_CANARY_CHARS = 16
+_HEX_ALPHABET = frozenset("0123456789abcdef")
+_SPLIT_SCAN_CHUNK_CHARS = 65_536
 
 
 def _compile_obfuscated_canary_regex(token: str) -> re.Pattern[str]:
@@ -90,8 +109,13 @@ class _CanarySignature:
     obfuscated_re: re.Pattern[str]
     reversed_folded: str | None
     hex_lower: str | None
+    hex_reversed: str | None
     delimited_hex_re: re.Pattern[str] | None
+    ox_hex_re: re.Pattern[str] | None
+    decimal_re: re.Pattern[str] | None
     b64_slices: tuple[str, ...]
+    b64_reversed_slices: tuple[str, ...]
+    b32_slices: tuple[str, ...]
     skeleton: str | None
 
 
@@ -100,8 +124,17 @@ def _canary_signature(norm_canary: str) -> _CanarySignature:
     folded = norm_canary.casefold()
     raw_bytes = norm_canary.encode("utf-8")
     hex_lower = raw_bytes.hex() if len(raw_bytes) >= 6 else None
+    hex_reversed = hex_lower[::-1] if (hex_lower is not None and len(norm_canary) >= 8) else None
     delimited_hex_re = (
         re.compile(r"[:\-\s]+".join(f"{b:02x}" for b in raw_bytes), re.IGNORECASE) if len(norm_canary) >= 8 else None
+    )
+    ox_hex_re = (
+        re.compile(r"[\s,]+".join(f"0x{b:02x}" for b in raw_bytes), re.IGNORECASE) if len(norm_canary) >= 8 else None
+    )
+    decimal_re = (
+        re.compile(r"(?<!\d)" + r"[\s,;]+".join(str(b) for b in raw_bytes) + r"(?!\d)")
+        if len(norm_canary) >= 8
+        else None
     )
     slices: list[str] = []
     seen_slices: set[str] = set()
@@ -116,6 +149,21 @@ def _canary_signature(norm_canary: str) -> _CanarySignature:
             if len(inv) >= 12 and inv not in seen_slices:
                 seen_slices.add(inv)
                 slices.append(inv)
+    b64_reversed_slices = tuple(sl[::-1] for sl in slices)
+
+    b32_slices: list[str] = []
+    seen_b32: set[str] = set()
+    for offset in (0, 1, 2, 3, 4):
+        padded = (b"\x00" * offset) + raw_bytes
+        unpadded = base64.b32encode(padded).decode("ascii").rstrip("=")
+        lead = (offset * 8 + 4) // 5
+        trail = 0 if (len(padded) % 5 == 0) else 1
+        end = len(unpadded) - trail if trail else len(unpadded)
+        inv = unpadded[lead:end]
+        if len(inv) >= 12 and inv not in seen_b32:
+            seen_b32.add(inv)
+            b32_slices.append(inv)
+
     skel = _CANARY_SEP_RE.sub("", norm_canary).casefold()
     skeleton = skel if (len(norm_canary) >= 8 and len(skel) >= 8) else None
     return _CanarySignature(
@@ -124,8 +172,13 @@ def _canary_signature(norm_canary: str) -> _CanarySignature:
         obfuscated_re=_compile_obfuscated_canary_regex(norm_canary),
         reversed_folded=norm_canary[::-1].casefold() if len(norm_canary) >= 8 else None,
         hex_lower=hex_lower,
+        hex_reversed=hex_reversed,
         delimited_hex_re=delimited_hex_re,
+        ox_hex_re=ox_hex_re,
+        decimal_re=decimal_re,
         b64_slices=tuple(slices),
+        b64_reversed_slices=b64_reversed_slices,
+        b32_slices=tuple(b32_slices),
         skeleton=skeleton,
     )
 
@@ -157,26 +210,53 @@ def _canary_present_plain(text: str, sig: _CanarySignature) -> bool:
     return False
 
 
-def canary_present(text: str, canary: str) -> bool:
-    """
-    Deterministic check for raw, NFKC/invisible-obfuscated, percent-encoded (1x/2x), reversed,
-    punctuation/whitespace-interleaved, hex (contiguous/delimited), and Base64/Base64url (all 3 byte
-    alignments) canary forms inside `text`.
-    """
-    norm_canary = normalize_str(canary)
-    if not norm_canary:
+def _decoded_contains_canary(decoded: str, sig: _CanarySignature, depth: int) -> bool:
+    """Check decoded text; one more decoding layer is tried, so Base64-of-hex and double Base64 are caught."""
+    if not decoded:
         return False
-    sig = _canary_signature(norm_canary)
-    norm = normalize_str(text)
+    if depth >= 1:
+        return _canary_present_plain(decoded, sig)
+    return _canary_present_in_variant(normalize_str(decoded), sig, _depth=depth + 1)
+
+
+def _canary_present_in_variant(norm: str, sig: _CanarySignature, *, _depth: int = 0) -> bool:
     if _canary_present_plain(norm, sig):
         return True
     norm_folded = norm.casefold()
     if sig.hex_lower is not None and sig.hex_lower in norm_folded:
         return True
+    if sig.hex_reversed is not None and sig.hex_reversed in norm_folded:
+        return True
     if sig.delimited_hex_re is not None and sig.delimited_hex_re.search(norm) is not None:
+        return True
+    if sig.ox_hex_re is not None and sig.ox_hex_re.search(norm) is not None:
+        return True
+    if sig.decimal_re is not None and sig.decimal_re.search(norm) is not None:
         return True
     if any(sl in norm for sl in sig.b64_slices):
         return True
+    if any(sl in norm for sl in sig.b64_reversed_slices):
+        return True
+    if sig.b32_slices:
+        norm_upper = norm.upper()
+        if any(sl in norm_upper for sl in sig.b32_slices):
+            return True
+
+    if any(ch.isspace() for ch in norm):
+        compact_ws = "".join(norm.split())
+        compact_folded = compact_ws.casefold()
+        if sig.hex_lower is not None and sig.hex_lower in compact_folded:
+            return True
+        if sig.hex_reversed is not None and sig.hex_reversed in compact_folded:
+            return True
+        if any(sl in compact_ws for sl in sig.b64_slices):
+            return True
+        if any(sl in compact_ws for sl in sig.b64_reversed_slices):
+            return True
+        if sig.b32_slices:
+            compact_upper = compact_ws.upper()
+            if any(sl in compact_upper for sl in sig.b32_slices):
+                return True
 
     for m in _HEX_CANDIDATE_RE.finditer(norm):
         tok = m.group(0)
@@ -186,7 +266,7 @@ def canary_present(text: str, canary: str) -> bool:
                 decoded = bytes.fromhex(cand).decode("utf-8", errors="ignore")
             except ValueError:
                 continue
-            if decoded and _canary_present_plain(decoded, sig):
+            if _decoded_contains_canary(decoded, sig, _depth):
                 return True
 
     for m in _DELIMITED_HEX_CANDIDATE_RE.finditer(norm):
@@ -197,7 +277,7 @@ def canary_present(text: str, canary: str) -> bool:
             decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
         except ValueError:
             continue
-        if decoded and _canary_present_plain(decoded, sig):
+        if _decoded_contains_canary(decoded, sig, _depth):
             return True
 
     for m in _B64_CANDIDATE_RE.finditer(norm):
@@ -215,16 +295,179 @@ def canary_present(text: str, canary: str) -> bool:
                 decoded = base64.b64decode(shifted, validate=False).decode("utf-8", errors="ignore")
             except (binascii.Error, ValueError):
                 continue
-            if decoded and _canary_present_plain(decoded, sig):
+            if _decoded_contains_canary(decoded, sig, _depth):
                 return True
 
     return False
 
 
+def canary_present(text: str, canary: str) -> bool:
+    """
+    Deterministic check for raw, NFKC/invisible-obfuscated, percent-encoded (1x/2x), reversed,
+    punctuation/whitespace-interleaved, hex (contiguous/delimited/0x/reversed), Base32, and
+    Base64/Base64url (all byte alignments, wrapped, and reversed) canary forms inside `text`.
+    """
+    norm_canary = normalize_str(canary)
+    if not norm_canary:
+        return False
+    sig = _canary_signature(norm_canary)
+    norm = normalize_str(text)
+    if _canary_present_in_variant(norm, sig):
+        return True
+    if "%" in norm:
+        u1 = normalize_str(unquote(norm))
+        if _canary_present_in_variant(u1, sig):
+            return True
+        if "%" in u1:
+            u2 = normalize_str(unquote(u1))
+            if _canary_present_in_variant(u2, sig):
+                return True
+    unescaped = unescape_text(norm)
+    if unescaped is not None and _canary_present_in_variant(normalize_str(unescaped), sig):
+        return True
+    return False
+
+
+def unescape_text(text: str) -> str | None:
+    """Decode `\\xNN`, `\\uNNNN`, `\\u{N..}` and `\\UNNNNNNNN` escapes; `None` when there are none to decode."""
+    if "\\" not in text:
+        return None
+
+    def _sub(m: re.Match[str]) -> str:
+        code = int(next(g for g in m.groups() if g is not None), 16)
+        return chr(code) if code <= sys.maxunicode else m.group(0)
+
+    out = _ESCAPE_SEQUENCE_RE.sub(_sub, text)
+    return out if out != text else None
+
+
+def extract_split_canary_views(value: JsonValue, *, max_chars: int = 131_072) -> tuple[str, str, str]:
+    """
+    Extract contiguous `(values_only, keys_only, keys_and_values)` views from nested JSON containers
+    in bounded O(n) time to detect canary tokens split across adjacent list/dict fields.
+    """
+    val_parts: list[str] = []
+    key_parts: list[str] = []
+    both_parts: list[str] = []
+    budget = [max_chars, max_chars, max_chars]
+
+    def _append(parts: list[str], idx: int, piece: str) -> None:
+        if not piece or budget[idx] <= 0:
+            return
+        if len(piece) > budget[idx]:
+            parts.append(piece[: budget[idx]])
+            budget[idx] = 0
+        else:
+            parts.append(piece)
+            budget[idx] -= len(piece)
+
+    def _walk(node: JsonValue) -> None:
+        if all(rem <= 0 for rem in budget):
+            return
+        if isinstance(node, str):
+            _append(val_parts, 0, node)
+            _append(both_parts, 2, node)
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item)
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _append(key_parts, 1, k)
+                _append(both_parts, 2, k)
+                _walk(v)
+
+    _walk(value)
+    return "".join(val_parts), "".join(key_parts), "".join(both_parts)
+
+
+def _iter_json_strings(value: JsonValue) -> Iterator[str]:
+    """Yield every dict key and string value inside `value`, without recursion (depth cannot exhaust the stack)."""
+    stack: list[JsonValue] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, list):
+            stack.extend(reversed(node))
+        elif isinstance(node, dict):
+            for k, v in reversed(list(node.items())):
+                stack.append(v)
+                stack.append(k)
+
+
+def split_fragment_length(norm_canary: str) -> int:
+    """Shortest canary piece the order-free split check looks for: 7 characters for hex-only canaries, else 5."""
+    return 7 if set(norm_canary.casefold()) <= _HEX_ALPHABET else 5
+
+
+def _split_fragments_cover_canary(value: JsonValue, norm_canary: str) -> bool:
+    """
+    True when every character of the canary lies inside some fragment (of at least `split_fragment_length` chars)
+    found in one of the strings in `value`. Pieces may come in any order, in keys or values, with anything between
+    them. Single-pass and linear in the payload: strings are checked in chunks, with no size cap an attacker could
+    pad past.
+    """
+    folded = norm_canary.casefold()
+    k = split_fragment_length(norm_canary)
+    windows = {folded[i : i + k] for i in range(len(folded) - k + 1)}
+    pending = set(windows)
+    chunk: list[str] = []
+    chunk_chars = 0
+
+    def _flush() -> None:
+        # NUL never occurs in a normalized canary, so a fragment can never straddle two strings.
+        text = "\x00".join(chunk)
+        for w in [w for w in pending if w in text]:
+            pending.discard(w)
+
+    for piece in _iter_json_strings(value):
+        folded_piece = normalize_str(piece).casefold()
+        if not folded_piece:
+            continue
+        chunk.append(folded_piece)
+        chunk_chars += len(folded_piece)
+        if chunk_chars >= _SPLIT_SCAN_CHUNK_CHARS:
+            _flush()
+            chunk.clear()
+            chunk_chars = 0
+            if not pending:
+                break
+    if chunk and pending:
+        _flush()
+
+    found = windows - pending
+    covered = [False] * len(folded)
+    for i in range(len(folded) - k + 1):
+        if folded[i : i + k] in found:
+            covered[i : i + k] = [True] * k
+    return all(covered)
+
+
+def canary_present_in_json(value: JsonValue, canary: str) -> bool:
+    """
+    Detect a canary split across the strings of a list/dict.
+
+    A `>= 8`-char canary is found when its pieces sit in adjacent entries (in any encoding `canary_present`
+    understands). A `>= 16`-char canary is also found when cut into pieces of at least `split_fragment_length`
+    characters, in any order and with other data between them. Pieces shorter than that, scattered among other
+    data, are not detected.
+    """
+    if not isinstance(value, list | dict) or not canary:
+        return False
+    norm_canary = normalize_str(canary)
+    if len(norm_canary) < 8:
+        return False
+    if any(canary_present(view, canary) for view in extract_split_canary_views(value) if view):
+        return True
+    return len(norm_canary) >= SPLIT_COVERAGE_MIN_CANARY_CHARS and _split_fragments_cover_canary(value, norm_canary)
+
+
 def redact_canary_in_text(text: str, canary: str) -> tuple[str, bool]:
     """
-    Detect and redact any plain, obfuscated, reversed, interleaved, percent-encoded, hex, or Base64
-    representation of `canary` inside `text`. Returns `(sanitized, matched)`.
+    Detect and redact any plain, obfuscated, reversed, interleaved, percent-encoded, hex, Base32,
+    or Base64 representation of `canary` inside `text`. Returns `(sanitized, matched)`.
     """
     if not canary:
         return text, False
@@ -241,6 +484,84 @@ def redact_canary_in_text(text: str, canary: str) -> tuple[str, bool]:
     return sanitized, True
 
 
+def _hex_token_texts(tok: str) -> Iterator[str]:
+    hex_digits = _NON_HEX_RE.sub("", tok)
+    candidates = (hex_digits,) if len(hex_digits) % 2 == 0 else (hex_digits[:-1], hex_digits[1:])
+    for cand in candidates:
+        try:
+            yield bytes.fromhex(cand).decode("utf-8", errors="ignore")
+        except ValueError:
+            continue
+
+
+def _ox_hex_token_texts(tok: str) -> Iterator[str]:
+    yield bytes.fromhex("".join(_OX_BYTE_RE.findall(tok))).decode("utf-8", errors="ignore")
+
+
+def _decimal_token_texts(tok: str) -> Iterator[str]:
+    values = [int(n) for n in re.findall(r"\d+", tok)]
+    if all(v <= 255 for v in values):
+        yield bytes(values).decode("utf-8", errors="ignore")
+
+
+def _b64_token_texts(tok: str) -> Iterator[str]:
+    core = tok.rstrip("=").replace("-", "+").replace("_", "/")
+    for offset in (0, 1, 2, 3):
+        shifted = core[offset:]
+        rem = len(shifted) % 4
+        if rem == 1:
+            shifted = shifted[:-1]
+        elif rem:
+            shifted += "=" * (4 - rem)
+        try:
+            yield base64.b64decode(shifted, validate=False).decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+
+
+# Order matters only for overlap: a token already replaced by one decoder is not decoded again by the next.
+_ENCODED_SECRET_DECODERS: tuple[tuple[re.Pattern[str], Callable[[str], Iterator[str]]], ...] = (
+    (_SECRET_0X_HEX_RE, _ox_hex_token_texts),
+    (_SECRET_DECIMAL_RE, _decimal_token_texts),
+    (_SECRET_DELIMITED_HEX_RE, _hex_token_texts),
+    (_HEX_SECRET_CANDIDATE_RE, _hex_token_texts),
+    (_SECRET_B64_RE, _b64_token_texts),
+)
+
+
+def redact_encoded_secret_tokens(text: str, is_secret: Callable[[str], bool]) -> tuple[str, bool]:
+    """
+    Replace each hex (contiguous, delimited, `0x`), decimal-byte, or Base64/Base64url token whose decoded text
+    `is_secret` reports as a credential with `[REDACTED_SECRET]`. Returns `(text, any_replaced)`.
+    """
+    hit = False
+    for pattern, decode in _ENCODED_SECRET_DECODERS:
+        if pattern.search(text) is None:
+            continue
+
+        def _sub(m: re.Match[str], decode: Callable[[str], Iterator[str]] = decode) -> str:
+            nonlocal hit
+            for decoded in decode(m.group(0)):
+                if decoded and is_secret(normalize_str(decoded)):
+                    hit = True
+                    return "[REDACTED_SECRET]"
+            return m.group(0)
+
+        text = pattern.sub(_sub, text)
+    return text, hit
+
+
+def _apply_core_secret_regexes(text: str) -> tuple[str, bool]:
+    out = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", text)
+    changed = out != text
+    for pattern in CORE_SECRET_PATTERNS:
+        replaced = pattern.sub("[REDACTED_SECRET]", out)
+        if replaced != out:
+            changed = True
+            out = replaced
+    return out, changed
+
+
 def redact_core_secrets(
     text: str,
     *,
@@ -248,30 +569,56 @@ def redact_core_secrets(
     extra_redactor: Callable[[str], str] | None = None,
 ) -> str:
     """
-    Redact canary tokens (raw, tag-obfuscated, NFKC, percent-encoded, hex, Base64, reversed, interleaved),
-    URL passwords, and known credential patterns.
+    Redact canary tokens (raw, tag-obfuscated, NFKC, percent-encoded, hex, Base32, Base64, reversed,
+    interleaved), URL passwords, and known credential patterns (raw, percent-encoded, and hex).
     """
     sanitized = text
     for canary in canary_tokens:
         sanitized, _ = redact_canary_in_text(sanitized, canary)
 
-    sanitized = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", sanitized)
-    for pattern in CORE_SECRET_PATTERNS:
-        sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    sanitized, _ = _apply_core_secret_regexes(sanitized)
     norm_after = normalize_str(sanitized)
     if norm_after != sanitized:
-        norm_checked = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", norm_after)
-        changed = norm_checked != norm_after
-        for pattern in CORE_SECRET_PATTERNS:
-            replaced = pattern.sub("[REDACTED_SECRET]", norm_checked)
-            if replaced != norm_checked:
-                changed = True
-                norm_checked = replaced
+        norm_checked, changed = _apply_core_secret_regexes(norm_after)
         if changed:
             sanitized = norm_checked
+
+    if "%" in sanitized:
+        u1 = normalize_str(unquote(sanitized))
+        u1_checked, changed1 = _apply_core_secret_regexes(u1)
+        if changed1:
+            sanitized = u1_checked
+        elif "%" in u1:
+            u2 = normalize_str(unquote(u1))
+            u2_checked, changed2 = _apply_core_secret_regexes(u2)
+            if changed2:
+                sanitized = u2_checked
+
+    unescaped = unescape_text(sanitized)
+    if unescaped is not None:
+        unescaped_checked, changed_esc = _apply_core_secret_regexes(normalize_str(unescaped))
+        if changed_esc:
+            sanitized = unescaped_checked
+
+    sanitized, _ = redact_encoded_secret_tokens(sanitized, lambda decoded: _apply_core_secret_regexes(decoded)[1])
+
     if extra_redactor is not None:
         sanitized = extra_redactor(sanitized)
     return sanitized
+
+
+def _redact_dict(
+    value: JsonObject,
+    *,
+    canary_tokens: tuple[str, ...],
+    extra_redactor: Callable[[str], str] | None,
+) -> JsonObject:
+    redacted_dict: dict[str, JsonValue] = {}
+    for k, v in value.items():
+        safe_k = redact_core_secrets(k, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+        safe_v = _redact_json_value(v, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+        redacted_dict[safe_k] = safe_v
+    return redacted_dict
 
 
 def _redact_json_value(
@@ -282,16 +629,33 @@ def _redact_json_value(
 ) -> JsonValue:
     if isinstance(value, str):
         return redact_core_secrets(value, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+    # Split canaries are handled once per event in `_redact_split_canaries`; checking here, at every nesting level,
+    # rescanned each subtree once per level of depth.
     if isinstance(value, list):
         return [_redact_json_value(item, canary_tokens=canary_tokens, extra_redactor=extra_redactor) for item in value]
     if isinstance(value, dict):
-        redacted_dict: dict[str, JsonValue] = {}
-        for k, v in value.items():
-            safe_k = redact_core_secrets(k, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
-            safe_v = _redact_json_value(v, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
-            redacted_dict[safe_k] = safe_v
-        return redacted_dict
+        return _redact_dict(value, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
     return value
+
+
+def _split_canary_in(value: JsonValue, canary_tokens: tuple[str, ...]) -> bool:
+    return any(canary_present_in_json(value, canary) for canary in canary_tokens)
+
+
+def _carries_canary_piece(value: JsonValue, canary_tokens: tuple[str, ...]) -> bool:
+    """True when some string in `value` holds a canary fragment the split check counts, or a split of its own."""
+    if isinstance(value, list | dict) and _split_canary_in(value, canary_tokens):
+        return True
+    for canary in canary_tokens:
+        norm = normalize_str(canary)
+        if len(norm) < 8:
+            continue
+        folded = norm.casefold()
+        k = min(split_fragment_length(norm), len(folded))
+        windows = {folded[i : i + k] for i in range(len(folded) - k + 1)}
+        if any(any(w in normalize_str(s).casefold() for w in windows) for s in _iter_json_strings(value)):
+            return True
+    return False
 
 
 def _sanitize_event(
@@ -301,10 +665,7 @@ def _sanitize_event(
     canary_tokens: tuple[str, ...],
     extra_redactor: Callable[[str], str] | None,
 ) -> ZoneEvent:
-    safe_meta = cast(
-        JsonObject,
-        _redact_json_value(event.metadata, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
-    )
+    safe_meta = _redact_dict(event.metadata, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
     safe_req_id: int | str | None = (
         redact_core_secrets(event.request_id, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
         if isinstance(event.request_id, str)
@@ -315,15 +676,52 @@ def _sanitize_event(
         if event.tool_name is not None
         else None
     )
+    safe_action = redact_core_secrets(event.action, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+    safe_reason = redact_core_secrets(event.reason, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+
+    # Split canaries: one scan over metadata plus the top-level fields a peer can influence (the JSON-RPC method,
+    # tool name, string request id, and reason text). Only on a hit is metadata narrowed, then those fields
+    # redacted, then metadata dropped, so the on-disk invariant in `record()` only fires for something this missed.
+    def _peer_view() -> JsonObject:
+        view: JsonObject = {"action": safe_action, "reason": safe_reason, "metadata": safe_meta}
+        if safe_tool is not None:
+            view["tool_name"] = safe_tool
+        if isinstance(safe_req_id, str):
+            view["request_id"] = safe_req_id
+        return view
+
+    if canary_tokens and _split_canary_in(_peer_view(), canary_tokens):
+        # Redact every field holding a piece, not just enough to stop the check firing: removing one piece would
+        # otherwise leave the rest of the canary on disk. Unrelated fields (e.g. `trigger_event_id`) survive.
+        def _scrub(text: str) -> str:
+            return "[REDACTED_CANARY]" if _carries_canary_piece(text, canary_tokens) else text
+
+        safe_meta = {
+            k: ("[REDACTED_CANARY]" if _carries_canary_piece(v, canary_tokens) else v) for k, v in safe_meta.items()
+        }
+        safe_action, safe_reason = _scrub(safe_action), _scrub(safe_reason)
+        safe_tool = _scrub(safe_tool) if safe_tool is not None else None
+        safe_req_id = _scrub(safe_req_id) if isinstance(safe_req_id, str) else safe_req_id
+        if _split_canary_in(_peer_view(), canary_tokens):
+            # Pieces too small to count as fragments, sitting side by side: drop everything a peer could shape.
+            safe_action = safe_reason = "[REDACTED_CANARY]"
+            safe_tool = "[REDACTED_CANARY]" if safe_tool is not None else None
+            safe_req_id = "[REDACTED_CANARY]" if isinstance(safe_req_id, str) else safe_req_id
+            sid = safe_meta.get("session_id")
+            keep_sid = isinstance(sid, str) and not any(canary_present(sid, c) for c in canary_tokens)
+            safe_meta = (
+                {"session_id": sid, "redacted": "[REDACTED_CANARY]"} if keep_sid else {"redacted": "[REDACTED_CANARY]"}
+            )
+
     return ZoneEvent(
         event_id=redact_core_secrets(event.event_id, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
         timestamp_utc=event.timestamp_utc,
         zone=event.zone,
-        action=redact_core_secrets(event.action, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
+        action=safe_action,
         verdict_allow=event.verdict_allow,
         severity=event.severity,
         rule_id=redact_core_secrets(event.rule_id, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
-        reason=redact_core_secrets(event.reason, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
+        reason=safe_reason,
         artifact_sha256=artifact_sha256,
         tool_name=safe_tool,
         request_id=safe_req_id,
@@ -654,12 +1052,17 @@ class AuditLedger:
                 entry_hash=entry_hash,
                 event=canonical_event,
             )
-            line_bytes = canonical_json_bytes(cast(JsonObject, entry.model_dump(mode="json")))
+            entry_dump = cast(JsonObject, entry.model_dump(mode="json"))
+            line_bytes = canonical_json_bytes(entry_dump)
             line_text = line_bytes.decode("utf-8")
 
             # Hard defense-in-depth invariant: refuse to flush if any canary form survived sanitization.
             for canary in self.canary_tokens:
-                if canary in line_text or canary_present(line_text, canary):
+                if (
+                    canary in line_text
+                    or canary_present(line_text, canary)
+                    or canary_present_in_json(entry_dump, canary)
+                ):
                     raise RuntimeError("Audit redaction invariant violated: canary value survived sanitization.")
 
             payload_line = line_bytes + b"\n"

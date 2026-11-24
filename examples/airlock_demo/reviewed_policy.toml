@@ -1,0 +1,25 @@
+# Reviewed AgBOM policy for examples/airlock_demo/sample_mcp_server.py.
+# Pinned via `mellyn-pin` and explicitly reviewed to allow `read_status_note`
+# (slug-only `note_id`) while keeping `export_diagnostics` fail-closed.
+
+policy_id = "mellyn-5min-demo"
+allowed_tools = ["read_status_note"]
+max_payload_bytes = 65536
+workspace_roots = []
+manifest_sha256 = "4953dd98bc22d12acb49e47e504f820e03559fdbd9c92fc7fc46f2621bbc3407"
+
+[agbom_pins]
+read_status_note = "397a273375dc43c3e70c4049c9471cd63929e16ae592c310a80fe7689780cf14"
+export_diagnostics = "61b837c3ae79132a6888ea7654f5bf991303f8ec6b86f43e6498134a6f7a5330"
+
+[tool_rules.read_status_note]
+name = "read_status_note"
+allowed = true
+allowed_arg_names = ["note_id"]
+arg_regex_rules = { note_id = "^[a-z0-9-]+$" }
+
+[tool_rules.export_diagnostics]
+name = "export_diagnostics"
+allowed = false
+allowed_arg_names = []
+arg_regex_rules = {}

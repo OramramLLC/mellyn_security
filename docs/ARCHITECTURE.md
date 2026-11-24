@@ -162,6 +162,15 @@ V1/
 │   ├── CLIENT_ONBOARDING.md         # 10-minute B2B client onboarding guide (CI gate & pre-commit pack)
 │   ├── OWASP_AI_CODING_SECURITY.md  # OWASP AI-assisted & agentic security synthesis
 │   └── THREAT_MODEL.md              # Gateway threat model & automated test traceability matrix
+├── examples/
+│   ├── adversarial_eval/            # 28-scenario adversarial red-team regression suite (6 families)
+│   │   ├── README.md                # Attack catalog & CLI scorecard instructions
+│   │   └── run_redteam.py           # Live red-team runner & scorecard emitter
+│   └── airlock_demo/                # Self-contained 5-minute Airlock + Viewer walkthrough
+│       ├── README.md                # Walkthrough guide & manual CLI commands
+│       ├── sample_mcp_server.py     # Harmless in-memory MCP stdio demo server
+│       ├── reviewed_policy.toml     # Pinned & reviewed AgBOM policy (1 allowed tool, 1 blocked tool)
+│       └── run_demo.py              # Single-command demo runner (allowed + blocked call + viewer)
 ├── scripts/
 │   ├── ci_guardrails.py             # Shared checksummed Gitleaks, base-allowlist & baseline-gate CI runner
 │   ├── run_conformance_report.py    # Fast-profile conformance runner & JSON/Markdown assurance exporter

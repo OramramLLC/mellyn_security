@@ -14,10 +14,16 @@ import hashlib
 import math
 import re
 from collections.abc import Sequence
+from urllib.parse import unquote
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mcp_airlock.core.audit import redact_canary_in_text
+from mcp_airlock.core.audit import (
+    canary_present_in_json,
+    redact_canary_in_text,
+    redact_encoded_secret_tokens,
+    unescape_text,
+)
 from mcp_airlock.core.normalize import JsonValue, normalize_str, sha256_exact
 from mcp_airlock.core.schemas import RedactionRecord
 
@@ -157,6 +163,48 @@ class EgressScanResult(BaseModel):
     redacted_payload: JsonValue = None
 
 
+def _redact_secret_matches_in_text(
+    text: str,
+    *,
+    field_path: str,
+    findings: list[RedactionRecord],
+    ignore_placeholder: bool,
+) -> tuple[str, bool]:
+    sanitized = text
+    secret_hit = False
+    for rule_id, pattern in KNOWN_SECRET_RULES:
+        matches = [
+            m
+            for m in pattern.finditer(sanitized)
+            if not (ignore_placeholder and (m.group(1) if m.lastindex else m.group(0)) == "[REDACTED_SECRET]")
+        ]
+        if not matches:
+            continue
+        secret_hit = True
+        for match in matches:
+            matched_val = match.group(1) if match.lastindex else match.group(0)
+            findings.append(
+                RedactionRecord(
+                    kind="secret",
+                    rule_id=rule_id,
+                    field_path=field_path,
+                    match_sha256=_hash_match(matched_val),
+                )
+            )
+        if rule_id == "url-userinfo-password":
+            sanitized = pattern.sub(
+                lambda m: (
+                    m.group(0)
+                    if (ignore_placeholder and m.group(1) == "[REDACTED_SECRET]")
+                    else m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED_SECRET]@"
+                ),
+                sanitized,
+            )
+        else:
+            sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    return sanitized, secret_hit
+
+
 def _scan_single_string(
     text: str,
     *,
@@ -173,7 +221,7 @@ def _scan_single_string(
     entropy_hit = False
     blocked_hit = False
 
-    # 1. Planted canary tokens (raw, case, tags/ZWSP, NFKC, percent-encoded, hex, Base64, reversed, interleaved)
+    # 1. Planted canary tokens (raw, case, tags/ZWSP, NFKC, percent, hex, 0x-hex, Base32, Base64, reversed, interleaved)
     for idx, canary in enumerate(canary_tokens):
         if not canary:
             continue
@@ -190,59 +238,72 @@ def _scan_single_string(
                 )
             )
 
-    # 2. Known credential & API secret regexes (raw + NFKC/invisible-stripped obfuscation)
-    for rule_id, pattern in KNOWN_SECRET_RULES:
-        raw_matches = list(pattern.finditer(sanitized))
-        if raw_matches:
-            secret_hit = True
-            for match in raw_matches:
-                matched_val = match.group(1) if match.lastindex else match.group(0)
-                findings.append(
-                    RedactionRecord(
-                        kind="secret",
-                        rule_id=rule_id,
-                        field_path=field_path,
-                        match_sha256=_hash_match(matched_val),
-                    )
-                )
-            if rule_id == "url-userinfo-password":
-                sanitized = pattern.sub(
-                    lambda m: m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED_SECRET]@",
-                    sanitized,
-                )
-            else:
-                sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    # 2. Known credential & API secret regexes (raw, NFKC/invisible-stripped, percent-encoded, and hex)
+    sanitized, raw_secret_hit = _redact_secret_matches_in_text(
+        sanitized,
+        field_path=field_path,
+        findings=findings,
+        ignore_placeholder=False,
+    )
+    secret_hit = secret_hit or raw_secret_hit
 
-        norm_candidate = normalize_str(sanitized)
-        if norm_candidate != sanitized:
-            norm_matches = [
-                m
-                for m in pattern.finditer(norm_candidate)
-                if (m.group(1) if m.lastindex else m.group(0)) != "[REDACTED_SECRET]"
-            ]
-            if norm_matches:
+    norm_candidate = normalize_str(sanitized)
+    if norm_candidate != sanitized:
+        norm_redacted, norm_secret_hit = _redact_secret_matches_in_text(
+            norm_candidate,
+            field_path=field_path,
+            findings=findings,
+            ignore_placeholder=True,
+        )
+        if norm_secret_hit:
+            secret_hit = True
+            sanitized = norm_redacted
+
+    if "%" in sanitized:
+        u1 = normalize_str(unquote(sanitized))
+        u1_redacted, u1_hit = _redact_secret_matches_in_text(
+            u1,
+            field_path=field_path,
+            findings=findings,
+            ignore_placeholder=True,
+        )
+        if u1_hit:
+            secret_hit = True
+            sanitized = u1_redacted
+        elif "%" in u1:
+            u2 = normalize_str(unquote(u1))
+            u2_redacted, u2_hit = _redact_secret_matches_in_text(
+                u2,
+                field_path=field_path,
+                findings=findings,
+                ignore_placeholder=True,
+            )
+            if u2_hit:
                 secret_hit = True
-                for match in norm_matches:
-                    matched_val = match.group(1) if match.lastindex else match.group(0)
-                    findings.append(
-                        RedactionRecord(
-                            kind="secret",
-                            rule_id=rule_id,
-                            field_path=field_path,
-                            match_sha256=_hash_match(matched_val),
-                        )
-                    )
-                if rule_id == "url-userinfo-password":
-                    sanitized = pattern.sub(
-                        lambda m: (
-                            m.group(0)
-                            if m.group(1) == "[REDACTED_SECRET]"
-                            else m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED_SECRET]@"
-                        ),
-                        norm_candidate,
-                    )
-                else:
-                    sanitized = pattern.sub("[REDACTED_SECRET]", norm_candidate)
+                sanitized = u2_redacted
+
+    unescaped = unescape_text(sanitized)
+    if unescaped is not None:
+        esc_redacted, esc_hit = _redact_secret_matches_in_text(
+            normalize_str(unescaped),
+            field_path=field_path,
+            findings=findings,
+            ignore_placeholder=True,
+        )
+        if esc_hit:
+            secret_hit = True
+            sanitized = esc_redacted
+
+    def _decoded_is_secret(decoded: str) -> bool:
+        return _redact_secret_matches_in_text(
+            decoded,
+            field_path=field_path,
+            findings=findings,
+            ignore_placeholder=False,
+        )[1]
+
+    sanitized, encoded_hit = redact_encoded_secret_tokens(sanitized, _decoded_is_secret)
+    secret_hit = secret_hit or encoded_hit
 
     # 3. Blocked regex patterns from policy (checked against normalized form too)
     for rule_id, blk_pattern in blocked_regexes:
@@ -434,6 +495,22 @@ def scan_payload(
         min_entropy_length=min_entropy_length,
         findings=findings,
     )
+    if isinstance(redacted, list | dict) and clean_canaries:
+        split_hit = False
+        for idx, canary in enumerate(clean_canaries):
+            if canary_present_in_json(redacted, canary):
+                c_hit = True
+                split_hit = True
+                findings.append(
+                    RedactionRecord(
+                        kind="canary",
+                        rule_id=f"canary-{idx}",
+                        field_path="$[split]",
+                        match_sha256=_hash_match(canary),
+                    )
+                )
+        if split_hit:
+            redacted = "[REDACTED_CANARY]"
     clean = not (c_hit or s_hit or e_hit or b_hit)
     return EgressScanResult(
         artifact_sha256=artifact_sha256,
