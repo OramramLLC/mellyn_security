@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mcp_airlock.core.audit import LedgerAnchor, redact_core_secrets
 from mcp_airlock.core.normalize import is_invisible_codepoint
-from mcp_airlock.core.schemas import AuditLedgerEntry, Severity, Zone
+from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, AuditLedgerEntry, Severity, Zone
 from mcp_airlock.ir_lab.verify_chain import ChainVerificationReport, read_and_verify_chain
 
 _MD_UNSAFE_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
@@ -115,6 +115,9 @@ class TerminalTrigger(BaseModel):
     tool_name: str | None = None
     artifact_sha256: str
     redacted_summary: str
+    trigger_event_id: str | None = None
+    containment_confirmed: bool = False
+    containment_seq: int | None = None
 
 
 class SessionTimeline(BaseModel):
@@ -136,11 +139,18 @@ class IncidentReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    status: Literal["CLEAN", "BLOCKED_ACTIVITY", "AAD_CONTAINED", "INTEGRITY_COMPROMISED"]
+    status: Literal[
+        "CLEAN",
+        "BLOCKED_ACTIVITY",
+        "AAD_CONTAINED",
+        "AAD_TRIGGERED_UNCONFIRMED",
+        "INTEGRITY_COMPROMISED",
+    ]
     chain_valid: bool
     verification: ChainVerificationReport
     session_count: int = Field(ge=0)
     total_events: int = Field(ge=0)
+    unconfirmed_aad_triggers: int = Field(default=0, ge=0)
     sessions: list[SessionTimeline] = Field(default_factory=list)
     terminal_event: TerminalTrigger | None = None
 
@@ -178,6 +188,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
             verification=verification,
             session_count=0,
             total_events=0,
+            unconfirmed_aad_triggers=0,
             sessions=[],
             terminal_event=None,
         )
@@ -189,7 +200,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         grouped.setdefault(sid, []).append(entry)
 
     sessions: list[SessionTimeline] = []
-    global_terminal: TerminalTrigger | None = None
+    all_aad_triggers: list[TerminalTrigger] = []
     saw_block = False
 
     for sid, sid_entries in grouped.items():
@@ -197,7 +208,8 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         zone_transitions: list[str] = []
         block_precursors: list[TimelineEvent] = []
         events: list[TimelineEvent] = []
-        session_terminal: TerminalTrigger | None = None
+        aad_triggers: list[TerminalTrigger] = []
+        aad_index_by_id: dict[str, int] = {}
         prev_zone: Zone | None = None
 
         for entry in sid_entries:
@@ -243,9 +255,27 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
                     tool_name=ev.tool_name,
                     artifact_sha256=ev.artifact_sha256,
                     redacted_summary=safe_reason,
+                    trigger_event_id=ev.event_id,
+                    containment_confirmed=False,
+                    containment_seq=None,
                 )
-                session_terminal = trigger
-                global_terminal = trigger
+                aad_index_by_id[ev.event_id] = len(aad_triggers)
+                aad_triggers.append(trigger)
+            elif ev.rule_id == AAD_CONTAINMENT_CONFIRMED_RULE_ID:
+                ref_id = ev.metadata.get("trigger_event_id")
+                if isinstance(ref_id, str) and ref_id in aad_index_by_id:
+                    idx = aad_index_by_id[ref_id]
+                    existing = aad_triggers[idx]
+                    if entry.seq > existing.seq and not existing.containment_confirmed:
+                        aad_triggers[idx] = existing.model_copy(
+                            update={"containment_confirmed": True, "containment_seq": entry.seq}
+                        )
+
+        session_terminal: TerminalTrigger | None = None
+        if aad_triggers:
+            unconfirmed_in_session = [t for t in aad_triggers if not t.containment_confirmed]
+            session_terminal = unconfirmed_in_session[-1] if unconfirmed_in_session else aad_triggers[-1]
+            all_aad_triggers.extend(aad_triggers)
 
         sessions.append(
             SessionTimeline(
@@ -259,8 +289,16 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
             )
         )
 
-    status: Literal["CLEAN", "BLOCKED_ACTIVITY", "AAD_CONTAINED"]
-    if global_terminal is not None:
+    unconfirmed_triggers = [t for t in all_aad_triggers if not t.containment_confirmed]
+    unconfirmed_count = len(unconfirmed_triggers)
+    global_terminal: TerminalTrigger | None = (
+        unconfirmed_triggers[-1] if unconfirmed_triggers else (all_aad_triggers[-1] if all_aad_triggers else None)
+    )
+
+    status: Literal["CLEAN", "BLOCKED_ACTIVITY", "AAD_CONTAINED", "AAD_TRIGGERED_UNCONFIRMED"]
+    if unconfirmed_count > 0:
+        status = "AAD_TRIGGERED_UNCONFIRMED"
+    elif all_aad_triggers:
         status = "AAD_CONTAINED"
     elif saw_block:
         status = "BLOCKED_ACTIVITY"
@@ -273,6 +311,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         verification=verification,
         session_count=len(sessions),
         total_events=len(entries),
+        unconfirmed_aad_triggers=unconfirmed_count,
         sessions=sessions,
         terminal_event=global_terminal,
     )
@@ -308,8 +347,17 @@ def render_markdown(report: IncidentReport) -> str:
         f"- **Tail truncation**: {tail_note}",
         f"- **Sessions**: `{report.session_count}`",
     ]
+    if report.status == "AAD_TRIGGERED_UNCONFIRMED":
+        lines.append(
+            f"- **Containment**: UNCONFIRMED ({report.unconfirmed_aad_triggers} AAD_FIRE trigger(s) lack a matching "
+            f"`{AAD_CONTAINMENT_CONFIRMED_RULE_ID}` completion receipt; direct downstream exit is not proven)"
+        )
+    elif report.status == "AAD_CONTAINED":
+        lines.append("- **Containment**: CONFIRMED (matching post-reap completion receipt attests direct child exit)")
+
     if report.terminal_event is not None:
         term = report.terminal_event
+        confirm_str = f"True (seq={term.containment_seq})" if term.containment_confirmed else "False (unconfirmed)"
         lines.extend(
             [
                 "",
@@ -318,6 +366,7 @@ def render_markdown(report: IncidentReport) -> str:
                 f"- **session_id**: {_code(term.session_id)} (`seq={term.seq}`)",
                 f"- **rpc_id**: {_code(term.rpc_id)}",
                 f"- **artifact_sha256**: {_code(term.artifact_sha256)}",
+                f"- **containment_confirmed**: `{confirm_str}`",
                 f"- **redacted_summary**: {_md(term.redacted_summary)}",
             ]
         )

@@ -16,6 +16,7 @@ from mcp_airlock.core.normalize import (
     strip_invisible,
 )
 from mcp_airlock.core.schemas import (
+    AAD_CONTAINMENT_CONFIRMED_RULE_ID,
     GENESIS_PREV_HASH,
     AuditLedgerEntry,
     LedgerVerification,
@@ -28,6 +29,7 @@ from mcp_airlock.core.schemas import (
 )
 
 __all__ = [
+    "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
     "AuditLedger",
     "AuditLedgerEntry",
     "GENESIS_PREV_HASH",

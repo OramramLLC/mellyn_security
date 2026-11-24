@@ -166,12 +166,29 @@ class TestFullKillChainLifecycle(unittest.TestCase):
                     proxy_proc.wait(timeout=5)
 
             # 3. Run mellyn-ir --json on the resulting audit.jsonl
+            audit_rows = [
+                json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+            aad_rows = [row for row in audit_rows if row["event"]["severity"] == "AAD_FIRE"]
+            confirm_rows = [row for row in audit_rows if row["event"]["rule_id"] == "airlock.aad_containment_confirmed"]
+            self.assertEqual(len(aad_rows), 1)
+            self.assertEqual(len(confirm_rows), 1)
+            self.assertGreater(confirm_rows[0]["seq"], aad_rows[0]["seq"])
+            self.assertEqual(
+                confirm_rows[0]["event"]["metadata"].get("trigger_event_id"),
+                aad_rows[0]["event"]["event_id"],
+            )
+            self.assertEqual(confirm_rows[0]["event"]["metadata"].get("session_id"), "sess-killchain-01")
+
             ir_json_res = _run_cli(CLI_MODULES["mellyn-ir"], ["--json", str(audit_path)])
             self.assertEqual(ir_json_res.returncode, 0, ir_json_res.stderr)
             report = json.loads(ir_json_res.stdout)
             self.assertTrue(report["chain_valid"])
             self.assertEqual(report["status"], "AAD_CONTAINED")
+            self.assertEqual(report["unconfirmed_aad_triggers"], 0)
             self.assertIsNotNone(report["terminal_event"])
+            self.assertTrue(report["terminal_event"]["containment_confirmed"])
+            self.assertEqual(report["terminal_event"]["containment_seq"], confirm_rows[0]["seq"])
             self.assertEqual(report["terminal_event"]["reason_code"], "AGBOM_HASH_MISMATCH")
             self.assertEqual(report["terminal_event"]["rpc_id"], 4)
             self.assertEqual(report["terminal_event"]["session_id"], "sess-killchain-01")
