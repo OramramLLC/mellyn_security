@@ -63,13 +63,16 @@ from tests.conformance.recorder import (  # noqa: E402
 
 AUTH_IMAGE = "mellyn-security:ci-verify"
 EGRESS_IMAGE = "mellyn-egress:ci-verify"
+VIEWER_IMAGE = "mellyn-viewer:ci-verify"
 INTERNAL_SUBNET = "172.30.252.0/24"
 INTERNAL_NET = "mellyn-ci-internal"
 EXT_NET = "mellyn-ci-egress"
 SQUID_CONTAINER = "mellyn-ci-squid"
 AUTH_CONTAINER = "mellyn-ci-authorizer"
+VIEWER_CONTAINER = "mellyn-ci-viewer"
 OUTSIDE_TARGET_CONTAINER = "mellyn-ci-outside-target"
 GW_AUDIT_VOLUME = "mellyn-ci-gw-audit"
+VIEWER_EVIDENCE_VOLUME = "mellyn-ci-viewer-evidence"
 
 ROUTING_DENIAL_ERRNOS: frozenset[str] = frozenset({"ENETUNREACH", "EHOSTUNREACH"})
 _PROBE_REQUIRED_KEYS: frozenset[str] = frozenset({"phase", "status", "http_status", "errno_name", "exc_type"})
@@ -340,11 +343,146 @@ def denied_by_squid(outcome: str) -> bool:
 
 
 def cleanup() -> None:
-    for name in (AUTH_CONTAINER, SQUID_CONTAINER, OUTSIDE_TARGET_CONTAINER):
+    for name in (AUTH_CONTAINER, VIEWER_CONTAINER, SQUID_CONTAINER, OUTSIDE_TARGET_CONTAINER):
         run_cmd(["docker", "rm", "-f", name], check=False)
     for net in (INTERNAL_NET, EXT_NET):
         run_cmd(["docker", "network", "rm", net], check=False)
-    run_cmd(["docker", "volume", "rm", "-f", GW_AUDIT_VOLUME], check=False)
+    for vol in (GW_AUDIT_VOLUME, VIEWER_EVIDENCE_VOLUME):
+        run_cmd(["docker", "volume", "rm", "-f", vol], check=False)
+
+
+_SEED_VIEWER_LEDGER = """
+from pathlib import Path
+from mcp_airlock.core.audit import AuditLedger
+from mcp_airlock.core.schemas import ZoneEvent
+ledger = AuditLedger(Path('/var/lib/mellyn/evidence/audit.jsonl'))
+ledger.record(ZoneEvent(
+    event_id='ci-evt-1',
+    timestamp_utc='2026-11-24T12:00:00Z',
+    zone='airlock',
+    action='tools/call',
+    verdict_allow=True,
+    severity='INFO',
+    rule_id='airlock.tool_call_allowed',
+    reason='Container smoke check event.',
+    artifact_sha256='0' * 64,
+    tool_name='read_note',
+    request_id=1,
+    metadata={'session_id': 'ci-viewer-sess'},
+))
+"""
+
+
+def verify_viewer_container(
+    *,
+    viewer_image: str = VIEWER_IMAGE,
+    container_name: str = VIEWER_CONTAINER,
+    evidence_volume: str = VIEWER_EVIDENCE_VOLUME,
+    host_port: int = 18080,
+) -> None:
+    """Smoke-test hardened `mellyn-viewer` SPA serving, DNS-rebinding Host check, and RBAC."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _call(
+        path: str, *, api_key: str | None = None, host_header: str | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        headers: dict[str, str] = {}
+        if api_key is not None:
+            headers["X-Mellyn-API-Key"] = api_key
+        if host_header is not None:
+            headers["Host"] = host_header
+        req = urllib.request.Request(f"http://127.0.0.1:{host_port}{path}", headers=headers)  # noqa: S310
+        try:
+            with opener.open(req, timeout=5) as resp:
+                return int(resp.status), {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return int(exc.code), {k.lower(): v for k, v in exc.headers.items()}, exc.read()
+
+    pepper = secrets.token_urlsafe(32)
+    viewer_key = secrets.token_urlsafe(32)
+    approver_key = secrets.token_urlsafe(32)
+
+    run_cmd(["docker", "rm", "-f", container_name], check=False)
+    run_cmd(["docker", "volume", "rm", "-f", evidence_volume], check=False)
+    run_cmd(["docker", "volume", "create", evidence_volume])
+    try:
+        run_cmd(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "10001:10001",
+                "-v",
+                f"{evidence_volume}:/var/lib/mellyn/evidence",
+                viewer_image,
+                "python",
+                "-c",
+                _SEED_VIEWER_LEDGER,
+            ]
+        )
+        run_cmd(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                container_name,
+                "--read-only",
+                "--tmpfs",
+                "/tmp:noexec,nosuid,size=32m",  # noqa: S108 - tmpfs inside container
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "-p",
+                f"127.0.0.1:{host_port}:8080",
+                "-v",
+                f"{evidence_volume}:/var/lib/mellyn/evidence:ro",
+                "-e",
+                f"MELLYN_API_KEY_PEPPER={pepper}",
+                "-e",
+                f"MELLYN_VIEWER_KEY_DIGEST={key_digest(viewer_key, pepper)}",
+                "-e",
+                f"MELLYN_APPROVER_KEY_DIGEST={key_digest(approver_key, pepper)}",
+                "-e",
+                "MELLYN_AIRLOCK_AUDIT_PATH=/var/lib/mellyn/evidence/audit.jsonl",
+                viewer_image,
+            ]
+        )
+        wait_for_healthz(f"http://127.0.0.1:{host_port}/api/v1/healthz")
+
+        idx_code, idx_hdrs, idx_body = _call("/")
+        if idx_code != 200 or b"Mellyn Security" not in idx_body or idx_hdrs.get("x-frame-options") != "DENY":
+            raise RuntimeError(f"Viewer SPA / check failed: code={idx_code}, headers={idx_hdrs}")
+        if "content-security-policy" not in idx_hdrs:
+            raise RuntimeError(f"Viewer SPA missing Content-Security-Policy: {idx_hdrs}")
+
+        rebind_code, _, _ = _call("/api/v1/healthz", host_header=f"evil.attacker:{host_port}")
+        if rebind_code != 421:
+            raise RuntimeError(f"Expected 421 on DNS-rebinding Host header, got {rebind_code}")
+
+        unauth_code, _, _ = _call("/api/v1/airlock/report")
+        if unauth_code != 401:
+            raise RuntimeError(f"Expected 401 unauthenticated on /api/v1/airlock/report, got {unauth_code}")
+
+        wrong_role_code, _, _ = _call("/api/v1/airlock/report", api_key=approver_key)
+        if wrong_role_code != 403:
+            raise RuntimeError(f"Expected 403 for approver key on /api/v1/airlock/report, got {wrong_role_code}")
+
+        ok_code, _, ok_body = _call("/api/v1/airlock/report", api_key=viewer_key)
+        parsed = json.loads(ok_body.decode("utf-8"))
+        if (
+            ok_code != 200
+            or not parsed.get("chain_valid")
+            or parsed.get("status") != "CLEAN"
+            or parsed.get("verification", {}).get("ledger_path") != "audit.jsonl"
+        ):
+            raise RuntimeError(f"Viewer report API check failed: code={ok_code}, body={parsed}")
+    finally:
+        run_cmd(["docker", "rm", "-f", container_name], check=False)
+        run_cmd(["docker", "volume", "rm", "-f", evidence_volume], check=False)
 
 
 def emit_linux_assurance_report(
@@ -388,6 +526,17 @@ def main(argv: list[str] | None = None) -> int:
                 "-f",
                 str(REPO_ROOT / "deploy" / "egress" / "Dockerfile"),
                 str(REPO_ROOT / "deploy" / "egress"),
+            ]
+        )
+        run_cmd(
+            [
+                "docker",
+                "build",
+                "-t",
+                VIEWER_IMAGE,
+                "-f",
+                str(REPO_ROOT / "deploy" / "viewer" / "Dockerfile"),
+                str(REPO_ROOT),
             ]
         )
 
@@ -664,6 +813,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError(f"Audit sentinel was modified: {verified_data['sentinel']!r}")
             if not audit_appended or not audit_ver.complete:
                 raise RuntimeError(f"Expected 1 valid allow audit event, got: {audit_lines}")
+
+            print("[3c/5] Verifying hardened mellyn-viewer (Plane 4) SPA, Host guard, and RBAC...")
+            verify_viewer_container(viewer_image=VIEWER_IMAGE)
 
             print("[4/5] Starting isolated internal network, outside target listener, and Squid egress proxy...")
             run_cmd(["docker", "network", "create", "--internal", "--subnet", INTERNAL_SUBNET, INTERNAL_NET])

@@ -129,9 +129,12 @@ V1/
 │   ├── requirements.lock            # Hash-pinned container runtime Python lockfile
 │   ├── requirements-ci-scanners.lock # Hash-pinned CI SAST & lint lockfile (Semgrep + Ruff)
 │   ├── requirements-ci-tests.lock   # Hash-pinned CI API test lockfile (FastAPI + Starlette + HTTPX)
-│   └── egress/
-│       ├── Dockerfile               # Digest-pinned Ubuntu Squid egress image
-│       └── squid.conf               # Policy-generated Squid config
+│   ├── egress/
+│   │   ├── Dockerfile               # Digest-pinned Ubuntu Squid egress image
+│   │   └── squid.conf               # Policy-generated Squid config
+│   └── viewer/
+│       ├── Dockerfile               # Multi-stage digest-pinned Plane 4 SPA + BFF viewer image
+│       └── Dockerfile.dockerignore  # Deny-all BuildKit context allowlist for viewer builds
 ├── frontend/                        # Plane 4 Vite + React + TypeScript Posture, Audit & Approval Console
 │   ├── package.json                 # Minimal React/Vite manifest
 │   ├── package-lock.json            # Pinned npm registry lockfile
