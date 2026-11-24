@@ -196,6 +196,13 @@ def parse_jsonrpc_bytes(data: bytes | str) -> JsonRpcMessage:
     return parse_jsonrpc_message(parsed)
 
 
+def _reject_control_chars(value: str, what: str) -> str:
+    # Tool names end up in audit records and IR reports; a newline or other control character could forge lines.
+    if _CONTROL_CHARS_RE.search(value):
+        raise ValueError(f"{what} cannot contain control characters.")
+    return value
+
+
 class ToolDefinition(_StrictAirlockModel):
     """MCP downstream tool manifest descriptor pinned by AgBOM (fields per the MCP 2025-06-18 `Tool` type)."""
 
@@ -211,6 +218,11 @@ class ToolDefinition(_StrictAirlockModel):
         """The definition as it appears on the wire (`_meta` alias, unset optional fields omitted)."""
         return cast(JsonObject, self.model_dump(mode="json", by_alias=True, exclude_none=True))
 
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        return _reject_control_chars(v, "Tool name")
+
     @field_validator("inputSchema", "outputSchema", "annotations", "meta")
     @classmethod
     def _validate_json_fields(cls, v: JsonObject | None) -> JsonObject | None:
@@ -224,6 +236,11 @@ class ToolCallParams(_StrictAirlockModel):
 
     name: str = Field(min_length=1)
     arguments: JsonObject = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        return _reject_control_chars(v, "tools/call name")
 
     @field_validator("arguments")
     @classmethod

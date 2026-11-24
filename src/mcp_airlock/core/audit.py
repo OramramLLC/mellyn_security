@@ -222,6 +222,16 @@ def verify_ledger(path: Path, *, anchor: LedgerAnchor | None = None) -> LedgerVe
         return LedgerVerification(
             valid=False, entry_count=0, first_invalid_seq=0, reason=f"Could not read audit ledger: {exc}"
         )
+    return verify_ledger_bytes(raw_bytes, anchor=anchor)
+
+
+def verify_ledger_bytes(raw_bytes: bytes, *, anchor: LedgerAnchor | None = None) -> LedgerVerification:
+    """
+    Verify ledger content already read into memory (same checks as `verify_ledger`). Use this when the caller goes
+    on to parse the content, so what it reports on is exactly what was verified (no second read of a live file).
+    """
+    if anchor is not None and (anchor[0] < 0 or not re.fullmatch(r"[0-9a-f]{64}", anchor[1])):
+        return LedgerVerification(valid=False, entry_count=0, first_invalid_seq=0, reason="Ledger anchor is malformed.")
 
     if not raw_bytes:
         if anchor is not None:

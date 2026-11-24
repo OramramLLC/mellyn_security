@@ -25,20 +25,25 @@ escapes it, and on Windows only the direct child is killed. Full containment nee
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import ctypes
 import hashlib
+import math
 import os
+import queue
 import re
 import secrets
 import signal
 import sys
+import threading
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, TextIO, cast
+from typing import BinaryIO, Protocol, TextIO, cast
 
 from pydantic import ValidationError
 
@@ -59,6 +64,7 @@ from mcp_airlock.airlock.models import (
     JsonRpcRequest,
     JsonRpcSuccessResponse,
     ToolDefinition,
+    parse_airlock_policy_toml,
     parse_jsonrpc_bytes,
 )
 from mcp_airlock.core.audit import AuditLedger, redact_core_secrets
@@ -77,6 +83,8 @@ JSONRPC_REQUEST_TIMEOUT = -32001
 JSONRPC_AAD_CONTAINMENT_SEVERED = -32099
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+# How long one write to the client may take before the client is treated as gone (it stopped reading stdout).
+DEFAULT_CLIENT_WRITE_TIMEOUT_SECONDS = 5.0
 MAX_STDERR_LINE_BYTES = 4096
 # Ids of requests that timed out are remembered (bounded) so a late answer is dropped instead of firing AAD as a
 # "spoofed" id, and so the client cannot reuse such an id and receive the old request's late answer.
@@ -202,8 +210,166 @@ class BoundedLineReader:
                 self._buf.extend(chunk)
 
 
-async def _hard_kill_subprocess(proc: asyncio.subprocess.Process) -> None:
-    """Forcefully terminate `proc` (preferring its process group via `SIGKILL` on POSIX) and reap it."""
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_uint64) for name in ("Reads", "Writes", "Other", "ReadBytes", "WriteBytes", "OtherBytes")
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+class _WindowsJob:
+    """
+    A Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Every process in the job (the downstream and the
+    children it starts after being assigned) is terminated when the last handle closes, which includes the proxy
+    itself being killed. `terminate()` kills the whole tree on AAD. Raises `OSError` if the job cannot be set up.
+    """
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise OSError("Job Objects exist only on Windows.")
+        handle = _kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = _ExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(
+            handle, self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            err = ctypes.WinError(ctypes.get_last_error())
+            _kernel32.CloseHandle(handle)
+            raise err
+        self._handle: int | None = handle
+
+    def assign(self, pid: int) -> None:
+        if sys.platform != "win32" or self._handle is None:
+            raise OSError("Job Object is not open.")
+        proc_handle = _kernel32.OpenProcess(self._PROCESS_SET_QUOTA | self._PROCESS_TERMINATE, False, pid)
+        if not proc_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not _kernel32.AssignProcessToJobObject(self._handle, proc_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            _kernel32.CloseHandle(proc_handle)
+
+    def terminate(self) -> None:
+        if sys.platform == "win32" and self._handle is not None:
+            _kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if sys.platform == "win32" and self._handle is not None:
+            _kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _linux_parent_death_preexec() -> Callable[[], None] | None:
+    """
+    On Linux, return a `preexec_fn` that sets `PR_SET_PDEATHSIG(SIGKILL)` in the child, so the downstream is killed
+    if the proxy dies for any reason (including SIGKILL, which no handler can catch). Returns None elsewhere.
+
+    Note: the signal fires when the *thread* that spawned the child exits; the proxy spawns from its event-loop thread.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+    parent_pid = os.getpid()
+    sigkill = int(getattr(signal, "SIGKILL", 9))
+
+    def _set_parent_death_signal() -> None:
+        prctl(1, sigkill, 0, 0, 0)  # PR_SET_PDEATHSIG
+        if os.getppid() != parent_pid:  # the proxy died before the signal was armed
+            os._exit(1)
+
+    return _set_parent_death_signal
+
+
+async def spawn_contained_subprocess(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    cwd: str | None = None,
+    stderr: int = asyncio.subprocess.PIPE,
+) -> tuple[asyncio.subprocess.Process, _WindowsJob | None]:
+    """
+    Spawn an untrusted MCP server so it cannot outlive the proxy: its own session/process group (POSIX), the
+    parent-death signal (Linux), and a kill-on-close Job Object (Windows). Fails closed: if the Windows job cannot be
+    set up, the child is killed and `OSError` is raised. Processes the child starts before it is assigned to the job,
+    or that leave the process group with `setsid()` on POSIX, are not covered.
+    """
+    proc = await asyncio.create_subprocess_exec(  # noqa: S603 - explicit argv list, never a shell
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=stderr,
+        start_new_session=True,
+        env=dict(env),
+        cwd=cwd,
+        preexec_fn=_linux_parent_death_preexec(),
+    )
+    job: _WindowsJob | None = None
+    if sys.platform == "win32":
+        try:
+            job = _WindowsJob()
+            job.assign(proc.pid)
+        except OSError:
+            if job is not None:
+                job.close()
+            await _hard_kill_subprocess(proc)
+            raise
+    return proc, job
+
+
+async def _hard_kill_subprocess(proc: asyncio.subprocess.Process, *, job: _WindowsJob | None = None) -> None:
+    """Forcefully terminate `proc` (its Windows job, or its process group via `SIGKILL` on POSIX) and reap it."""
+    if job is not None:
+        job.terminate()
     if proc.returncode is None:
         killed_group = False
         if os.name == "posix":
@@ -286,11 +452,17 @@ class AirlockProxy:
         cwd: Path | None = None,
         err_stream: TextIO | None = None,
         aad_on_malformed_server_frame: bool = False,
+        session_id: str | None = None,
+        client_write_timeout_seconds: float = DEFAULT_CLIENT_WRITE_TIMEOUT_SECONDS,
     ) -> None:
         if not command:
             raise ValueError("AirlockProxy requires a non-empty command.")
-        if request_timeout_seconds <= 0:
-            raise ValueError("request_timeout_seconds must be positive.")
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be a finite positive number.")
+        if not math.isfinite(client_write_timeout_seconds) or client_write_timeout_seconds <= 0:
+            raise ValueError("client_write_timeout_seconds must be a finite positive number.")
+        if session_id is not None and not session_id.strip():
+            raise ValueError("session_id cannot be blank.")
 
         self._command = tuple(command)
         self._policy = policy
@@ -298,11 +470,13 @@ class AirlockProxy:
         self._client_reader = client_reader
         self._client_writer = client_writer
         self._request_timeout_seconds = float(request_timeout_seconds)
+        self._client_write_timeout_seconds = float(client_write_timeout_seconds)
         self._allowed_env_keys = None if allowed_env_keys is None else tuple(allowed_env_keys)
         self._extra_env = dict(extra_env) if extra_env is not None else None
         self._cwd = cwd
         self._err_stream: TextIO = sys.stderr if err_stream is None else err_stream
         self._aad_on_malformed_server_frame = aad_on_malformed_server_frame
+        self._session_id = session_id if session_id is not None else f"sess-{secrets.token_hex(8)}"
 
         max_client_frame = max(
             [
@@ -327,6 +501,9 @@ class AirlockProxy:
         self._faulted = False
         self._exit_code = 0
         self._downstream_stdin_closed = False
+        self._client_stalled = False
+        # Windows Job Object (kill-on-close) holding the downstream; None elsewhere.
+        self._job: _WindowsJob | None = None
         self._expired_ids: OrderedDict[RpcId, None] = OrderedDict()
         self._issued_cursors: OrderedDict[str, None] = OrderedDict()
         # Tool names from tools/list responses that passed AgBOM verification; None until the first one does.
@@ -347,6 +524,10 @@ class AirlockProxy:
     @property
     def exit_code(self) -> int:
         return self._exit_code
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
     def _log_err(self, message: str) -> None:
         """Write sanitized diagnostic text strictly to `err_stream` (never `stdout`)."""
@@ -372,6 +553,9 @@ class AirlockProxy:
         redactions: Sequence[RedactionRecord] = (),
         metadata: JsonObject | None = None,
     ) -> None:
+        merged_metadata: JsonObject = {"session_id": self._session_id}
+        if metadata:
+            merged_metadata.update(metadata)
         event = ZoneEvent(
             event_id=f"air-{secrets.token_hex(8)}",
             timestamp_utc=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -385,19 +569,42 @@ class AirlockProxy:
             tool_name=tool_name,
             request_id=request_id,
             redactions=list(redactions),
-            metadata=metadata or {},
+            metadata=merged_metadata,
         )
         self._ledger.record(event)
 
     async def _write_client_bytes(self, payload: bytes, *, allow_during_aad: bool = False) -> None:
         async with self._client_write_lock:
+            if self._client_stalled:
+                return
             if (self._aad_fired or self._faulted) and not allow_during_aad:
                 return
             try:
                 self._client_writer.write(payload)
-                await self._client_writer.drain()
+                await asyncio.wait_for(self._client_writer.drain(), timeout=self._client_write_timeout_seconds)
+            except TimeoutError:
+                self._handle_client_stall()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+
+    def _handle_client_stall(self) -> None:
+        """The client stopped reading stdout: drop further output and end the session (the downstream is killed)."""
+        self._client_stalled = True
+        self._log_err(
+            f"[airlock] client did not read stdout within {self._client_write_timeout_seconds}s; ending session"
+        )
+        try:
+            self._record_event(
+                action="client/write",
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.client_write_stalled",
+                reason="Client stopped reading the proxy's stdout; session ended.",
+                artifact_sha256=_EMPTY_SHA256,
+            )
+        except Exception as rec_exc:
+            self._log_err(f"[airlock] could not record client stall: {type(rec_exc).__name__}")
+        self._stop_event.set()
 
     async def _emit_client_error(
         self,
@@ -473,6 +680,8 @@ class AirlockProxy:
             pending = list(self._in_flight)
             self._in_flight.clear()
             self._idle_event.set()
+            # Contain before notifying: a client that has stopped reading must not delay the kill.
+            await self._contain_downstream()
             for rpc_id in pending:
                 await self._emit_client_error(
                     rpc_id=rpc_id,
@@ -481,10 +690,14 @@ class AirlockProxy:
                     allow_during_aad=True,
                 )
         finally:
-            self._close_downstream_stdin()
-            if self._proc is not None:
-                await _hard_kill_subprocess(self._proc)
+            await self._contain_downstream()
             self._stop_event.set()
+
+    async def _contain_downstream(self) -> None:
+        """Sever the downstream input pipe, hard-kill its process group (or job, on Windows) and reap it."""
+        self._close_downstream_stdin()
+        if self._proc is not None:
+            await _hard_kill_subprocess(self._proc, job=self._job)
 
     async def _supervised(self, task_name: str, work: Awaitable[None]) -> None:
         try:
@@ -508,10 +721,10 @@ class AirlockProxy:
     ) -> None:
         """
         Execute the AAD containment kill switch sequence:
-          1. Synchronously flush & fsync `AAD_FIRE` event to `AuditLedger`.
-          2. Emit terminal `-32099` (`AAD_CONTAINMENT_SEVERED`) error frames to client for active `rpc_id`s and close
-             downstream stdin.
-          3. Immediately `SIGKILL` downstream process/group and await exit.
+          1. Synchronously flush & fsync `AAD_FIRE` event to `AuditLedger` (a failed write does not stop step 2).
+          2. Close downstream stdin, `SIGKILL` the downstream process group (Windows: terminate its job) and reap it.
+          3. Only then emit terminal `-32099` (`AAD_CONTAINMENT_SEVERED`) error frames for active `rpc_id`s, each
+             bounded by the client write timeout, so a client that stopped reading cannot delay containment.
           4. Stop proxy loop with deterministic exit code `78`.
         """
         if self._aad_fired:
@@ -539,7 +752,6 @@ class AirlockProxy:
                 self._log_err(f"[airlock AAD_FIRE] audit write failed ({type(rec_exc).__name__}); containing anyway")
             self._log_err(f"[airlock AAD_FIRE] rule={rule_id} reason={reason}")
 
-            # 2. Emit terminal -32099 error frame(s).
             active_ids: list[RpcId] = []
             if rpc_id is not None:
                 active_ids.append(rpc_id)
@@ -549,6 +761,10 @@ class AirlockProxy:
             self._in_flight.clear()
             self._idle_event.set()
 
+            # 2. Contain first: kill the downstream before any client write that could block.
+            await self._contain_downstream()
+
+            # 3. Emit terminal -32099 error frame(s).
             for target_id in active_ids:
                 await self._emit_client_error(
                     rpc_id=target_id,
@@ -558,10 +774,8 @@ class AirlockProxy:
                     allow_during_aad=True,
                 )
         finally:
-            # 3. Sever the downstream input pipe, hard SIGKILL its process group/process and reap it.
-            self._close_downstream_stdin()
-            if self._proc is not None:
-                await _hard_kill_subprocess(self._proc)
+            # Containment is guaranteed even if anything above raised (no-op if already done).
+            await self._contain_downstream()
             # 4. Signal proxy shutdown.
             self._stop_event.set()
 
@@ -1459,15 +1673,7 @@ class AirlockProxy:
         """Spawn the isolated downstream MCP server, proxy frames until EOF or AAD kill, and return exit code."""
         child_env = build_minimal_subprocess_env(allowed_keys=self._allowed_env_keys, extra_env=self._extra_env)
         cwd_str = str(self._cwd) if self._cwd is not None else None
-        self._proc = await asyncio.create_subprocess_exec(  # noqa: S603 - explicit argv list, never a shell
-            *self._command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            env=child_env,
-            cwd=cwd_str,
-        )
+        self._proc, self._job = await spawn_contained_subprocess(self._command, env=child_env, cwd=cwd_str)
 
         tasks = (
             asyncio.create_task(self._supervised("client-pump", self._pump_client()), name="airlock-client-pump"),
@@ -1484,7 +1690,7 @@ class AirlockProxy:
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=2.0)
                 except TimeoutError:
-                    await _hard_kill_subprocess(self._proc)
+                    await _hard_kill_subprocess(self._proc, job=self._job)
             if self._proc.returncode is not None and not tasks[2].done():
                 try:
                     await asyncio.wait_for(asyncio.shield(tasks[2]), timeout=0.2)
@@ -1497,9 +1703,279 @@ class AirlockProxy:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             if self._proc.returncode is None:
-                await _hard_kill_subprocess(self._proc)
+                await _hard_kill_subprocess(self._proc, job=self._job)
+            if self._job is not None:
+                self._job.close()  # kill-on-close: also ends anything the server left running in its job
 
         return self._exit_code
+
+    def request_shutdown(self, reason: str = "shutdown requested") -> None:
+        """Begin a normal shutdown (used by the CLI's SIGTERM/SIGHUP/SIGINT handlers); the downstream is stopped."""
+        if not self._stop_event.is_set():
+            self._log_err(f"[airlock] {reason}; shutting down")
+            self._stop_event.set()
+
+
+def _settle_write(fut: asyncio.Future[None], error: BaseException | None) -> None:
+    if fut.done():  # already cancelled by the proxy's client write timeout
+        return
+    if error is None:
+        fut.set_result(None)
+    else:
+        fut.set_exception(error)
+
+
+class _BinaryStdoutWriter:
+    """
+    Write framed JSON-RPC bytes to stdout from a dedicated daemon thread.
+
+    A client that stops reading blocks only this thread, never the event loop, so timeouts and the AAD kill switch keep
+    running; `drain()` completes once the bytes are written and the proxy bounds it with its client write timeout.
+    Writes go straight to the file descriptor (`os.write`), so a thread stuck on a full pipe never holds the lock of
+    `sys.stdout`'s buffer at interpreter exit.
+    """
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        try:
+            self._fd: int | None = stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            self._fd = None
+        self._pending = bytearray()
+        self._queue: queue.SimpleQueue[tuple[bytes, asyncio.AbstractEventLoop, asyncio.Future[None]]] = (
+            queue.SimpleQueue()
+        )
+        self._thread = threading.Thread(target=self._run, name="airlock-stdout-writer", daemon=True)
+        self._thread.start()
+
+    def _write_all(self, data: bytes) -> None:
+        if self._fd is None:
+            self._stream.write(data)
+            self._stream.flush()
+            return
+        view = memoryview(data)
+        while view:
+            written = os.write(self._fd, view)
+            view = view[written:]
+
+    def _run(self) -> None:
+        while True:
+            data, loop, fut = self._queue.get()
+            error: BaseException | None = None
+            try:
+                self._write_all(data)
+            except (OSError, ValueError) as exc:
+                error = exc
+            try:
+                loop.call_soon_threadsafe(_settle_write, fut, error)
+            except RuntimeError:  # event loop already closed
+                return
+
+    def write(self, data: bytes) -> None:
+        self._pending.extend(data)
+
+    async def drain(self) -> None:
+        if not self._pending:
+            return
+        data = bytes(self._pending)
+        self._pending.clear()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._queue.put((data, loop, fut))
+        await fut
+
+
+def _start_stdin_pump(
+    loop: asyncio.AbstractEventLoop,
+    reader: asyncio.StreamReader,
+    raw_stdin: BinaryIO,
+    stop_flag: threading.Event,
+) -> threading.Thread:
+    """
+    Pump binary stdin chunks into `reader` via `call_soon_threadsafe` (works on Windows & POSIX).
+
+    Uses raw `os.read(fd, 4096)` when an OS descriptor is available so exiting on AAD while a daemon thread is
+    still waiting on an open stdin pipe cannot race CPython's `BufferedReader` finalizer.
+    """
+    fd: int | None = None
+    try:
+        candidate = raw_stdin.fileno()
+        if isinstance(candidate, int) and candidate >= 0:
+            fd = candidate
+    except (AttributeError, OSError, ValueError):
+        fd = None
+
+    read1_fn = getattr(raw_stdin, "read1", None)
+
+    def _pump() -> None:
+        try:
+            while not stop_flag.is_set():
+                if fd is not None:
+                    chunk = os.read(fd, 4096)
+                elif callable(read1_fn):
+                    chunk_obj = read1_fn(4096)
+                    chunk = chunk_obj if isinstance(chunk_obj, bytes) else b""
+                else:
+                    chunk = raw_stdin.read(1)
+                if not chunk:
+                    loop.call_soon_threadsafe(reader.feed_eof)
+                    return
+                loop.call_soon_threadsafe(reader.feed_data, chunk)
+        except (OSError, RuntimeError, ValueError):
+            try:
+                loop.call_soon_threadsafe(reader.feed_eof)
+            except RuntimeError:
+                pass
+
+    thread = threading.Thread(target=_pump, name="airlock-stdin-pump", daemon=True)
+    thread.start()
+    return thread
+
+
+def parse_allow_env_keys(raw_value: str | None) -> tuple[str, ...] | None:
+    """Merge comma-separated user `--allow-env` keys onto OS execution defaults cleanly."""
+    if raw_value is None:
+        return None
+    defaults = _WIN32_DEFAULT_ENV_KEYS if sys.platform == "win32" else _POSIX_DEFAULT_ENV_KEYS
+    extras = [item.strip() for item in raw_value.split(",") if item.strip()]
+    return tuple(dict.fromkeys([*defaults, *extras]))
+
+
+async def _run_cli_async(
+    *,
+    command: Sequence[str],
+    policy: AirlockPolicy,
+    ledger: AuditLedger,
+    request_timeout_seconds: float,
+    allowed_env_keys: Sequence[str] | None,
+    aad_on_malformed_server_frame: bool,
+    session_id: str | None,
+) -> int:
+    loop = asyncio.get_running_loop()
+    client_reader = asyncio.StreamReader()
+    stop_flag = threading.Event()
+    _start_stdin_pump(loop, client_reader, sys.stdin.buffer, stop_flag)
+    client_writer = _BinaryStdoutWriter(sys.stdout.buffer)
+    proxy = AirlockProxy(
+        command=command,
+        policy=policy,
+        ledger=ledger,
+        client_reader=client_reader,
+        client_writer=client_writer,
+        request_timeout_seconds=request_timeout_seconds,
+        allowed_env_keys=allowed_env_keys,
+        err_stream=sys.stderr,
+        aad_on_malformed_server_frame=aad_on_malformed_server_frame,
+        session_id=session_id,
+    )
+    if sys.platform != "win32":
+        # A client usually stops a server with SIGTERM (or SIGHUP/SIGINT). Run the normal shutdown so the downstream
+        # is stopped too; the Linux parent-death signal covers SIGKILL, and on Windows the Job Object does.
+        for sig_name in ("SIGTERM", "SIGHUP", "SIGINT"):
+            sig = getattr(signal, sig_name, None)
+            if isinstance(sig, signal.Signals):
+                try:
+                    loop.add_signal_handler(sig, proxy.request_shutdown, f"received {sig_name}")
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
+    try:
+        return await proxy.run()
+    finally:
+        stop_flag.set()
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mellyn-airlock",
+        description="Fail-closed async MCP stdio security proxy with AgBOM verification and AAD kill switch.",
+    )
+    parser.add_argument(
+        "--policy",
+        required=True,
+        type=Path,
+        help="Path to TOML AirlockPolicy file.",
+    )
+    parser.add_argument(
+        "--audit-log",
+        required=True,
+        type=Path,
+        help="Path to append-only hash-chained audit.jsonl ledger.",
+    )
+    parser.add_argument(
+        "--allow-env",
+        default=None,
+        help="Comma-separated environment variable names additionally permitted inside the downstream subprocess.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        help=f"Per-request timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--aad-on-malformed-server-frame",
+        action="store_true",
+        help="Trigger AAD containment kill immediately if the downstream server emits non-JSON stdout.",
+    )
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional session identifier attached to every AuditLedger ZoneEvent.",
+    )
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Downstream MCP server command to spawn (prefix with '--').",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `mellyn-airlock`."""
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        sys.stderr.write("mellyn-airlock: missing downstream MCP server command after '--'.\n")
+        return 2
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        sys.stderr.write("mellyn-airlock: --timeout must be a finite positive number of seconds.\n")
+        return 2
+
+    try:
+        policy_text = args.policy.read_text(encoding="utf-8")
+        policy = parse_airlock_policy_toml(policy_text)
+    except (OSError, UnicodeDecodeError, ValueError, ValidationError) as exc:
+        sys.stderr.write(f"mellyn-airlock: failed to load TOML policy '{args.policy}': {exc}\n")
+        return 2
+
+    try:
+        ledger = AuditLedger(args.audit_log, canary_tokens=tuple(policy.canary_tokens))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"mellyn-airlock: failed to open audit ledger '{args.audit_log}': {exc}\n")
+        return 2
+
+    try:
+        allowed_env = parse_allow_env_keys(args.allow_env)
+        return asyncio.run(
+            _run_cli_async(
+                command=command,
+                policy=policy,
+                ledger=ledger,
+                request_timeout_seconds=args.timeout,
+                allowed_env_keys=allowed_env,
+                aad_on_malformed_server_frame=bool(args.aad_on_malformed_server_frame),
+                session_id=args.session_id,
+            )
+        )
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # fail closed; never write tracebacks to stdout
+        sys.stderr.write(f"mellyn-airlock: fatal error ({type(exc).__name__}): {exc}\n")
+        return INTERNAL_FAULT_EXIT_CODE
 
 
 __all__ = [
@@ -1521,4 +1997,10 @@ __all__ = [
     "InFlightRequest",
     "RpcId",
     "build_minimal_subprocess_env",
+    "main",
+    "parse_allow_env_keys",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

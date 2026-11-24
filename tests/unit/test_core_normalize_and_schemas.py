@@ -207,6 +207,7 @@ class TestDependencyDag(unittest.TestCase):
             "core": {"core"},
             "egress": {"core", "egress"},
             "airlock": {"core", "egress", "airlock"},
+            "ir_lab": {"core", "ir_lab"},
         }
         for zone, allowed in rules.items():
             zone_dir = SRC_PACKAGE / zone

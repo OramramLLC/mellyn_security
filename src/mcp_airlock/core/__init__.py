@@ -1,6 +1,6 @@
 """Mellyn core primitives: Unicode/JSON canonicalization, strict wire schemas, and tamper-evident audit ledger."""
 
-from mcp_airlock.core.audit import AuditLedger, LedgerAnchor, redact_core_secrets, verify_ledger
+from mcp_airlock.core.audit import AuditLedger, LedgerAnchor, redact_core_secrets, verify_ledger, verify_ledger_bytes
 from mcp_airlock.core.normalize import (
     JsonObject,
     JsonScalar,
@@ -53,4 +53,5 @@ __all__ = [
     "sha256_exact",
     "strip_invisible",
     "verify_ledger",
+    "verify_ledger_bytes",
 ]
