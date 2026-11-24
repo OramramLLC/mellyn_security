@@ -48,9 +48,9 @@ flowchart TB
     end
 
     subgraph ControlPlane["Plane 4: Posture & Audit Viewer (Built Last)"]
-        Audit["Redacted Structured Audit Log<br/>(Decisions, Taint Sources, Tool Hashes)"]
-        UI["SMB Evidence & Posture Dashboard<br/>(OWASP LLM/Agentic & NIST AI RMF Mapping)"]
-        Audit --> UI
+        Viewer["Fail-Closed Viewer BFF + React SPA<br/>(viewer_server.py + frontend/, Role.VIEWER reads, Role.APPROVER approvals)"]
+        Audit["Redacted Structured Audit Log<br/>(Airlock hash-chain &amp; Gateway JSONL + Assurance JSON)"]
+        Audit --> Viewer
     end
 
     DevPlane --> CICDPlane
@@ -110,13 +110,14 @@ V1/
 │       ├── policy_loader.py         # Fail-closed TOML/JSON policy loader
 │       ├── authorizer.py            # Core Authorizer: sessions, taint, capabilities, policy, grants & audit
 │       ├── audit.py                 # Redacted structured JSONL audit logger
-│       ├── credentials.py           # Role-separated agent/approver keys as HMAC-SHA256(pepper, key) digests
+│       ├── credentials.py           # Role-separated agent/approver/viewer keys as HMAC-SHA256(pepper, key) digests
 │       ├── legacy_env.py            # Refuses to start while pre-rename variables are still set
 │       ├── gateway_config.py        # Strict loader for the MCP gateway's downstream server list
 │       ├── mcp_gateway.py           # Single-session multi-server stdio MCP gateway + pinned tool hashes
 │       ├── approvals.py             # Pending approvals store + HTTP approval server
 │       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)
+│       ├── viewer_server.py         # Fail-closed loopback BFF + SPA (VIEWER reads, APPROVER approvals)
 │       └── api.py                   # FastAPI HTTP adapter (/healthz, /v1/sessions, /v1/agent/authorize, grants)
 ├── config/
 │   ├── mellyn-policy.example.toml   # Starter policy for client workspaces
@@ -131,6 +132,31 @@ V1/
 │   └── egress/
 │       ├── Dockerfile               # Digest-pinned Ubuntu Squid egress image
 │       └── squid.conf               # Policy-generated Squid config
+├── frontend/                        # Plane 4 Vite + React + TypeScript Posture, Audit & Approval Console
+│   ├── package.json                 # Minimal React/Vite manifest
+│   ├── package-lock.json            # Pinned npm registry lockfile
+│   ├── tsconfig.json                # Strict TypeScript compiler configuration
+│   ├── vite.config.ts               # Dev proxy & production bundle configuration
+│   ├── index.html                   # SPA entrypoint
+│   ├── src/
+│   │   ├── main.tsx                 # React 18 root mount
+│   │   ├── App.tsx                  # Console layout, mode state & live/offline routing
+│   │   ├── types.ts                 # Airlock, Control Plane, Assurance & Approval interfaces
+│   │   ├── styles.css               # Dark-mode security console styles
+│   │   ├── lib/
+│   │   │   ├── parsers.ts           # Client-side SHA-256 chain verifier, JSONL/JSON parsers & URL guard
+│   │   │   └── api.ts               # Memory-only X-Mellyn-API-Key HTTP client
+│   │   ├── data/
+│   │   │   └── sampleData.ts        # Redacted demo dataset
+│   │   └── components/
+│   │       ├── StatusBadge.tsx
+│   │       ├── OverviewTab.tsx      # OWASP/ATLAS Control Assurance matrix & KPIs
+│   │       ├── AirlockForensicsTab.tsx # Cryptographic chain status & session timelines
+│   │       ├── GatewayAuditTab.tsx  # Control Plane audit stream & taint viewer
+│   │       ├── ApprovalsTab.tsx     # Exact-call human grant Approve/Reject workflow
+│   │       └── DataSourceDrawer.tsx # Live loopback connection & local file uploader
+│   └── tests/
+│       └── parsers.test.ts          # Node built-in test suite for parsers & URL validation
 ├── docs/
 │   ├── ARCHITECTURE.md              # This document
 │   ├── CLIENT_ONBOARDING.md         # 10-minute B2B client onboarding guide (CI gate & pre-commit pack)
@@ -188,4 +214,4 @@ V1/
 
 1. **Product 1 (Built & packaged) — Versioned Repo-Hardening Pack**: Packaged as a SHA-pinned pre-commit hook pack (`.pre-commit-hooks.yaml`) and a reusable GitHub Actions workflow (`.github/workflows/mellyn-reusable-ai-security-gate.yml`), so SMB clients receive versioned guardrail updates without copy-paste drift. See [`CLIENT_ONBOARDING.md`](CLIENT_ONBOARDING.md).
 2. **Product 2 (Active MVP) — Self-Hosted MCP Tool-Call Authorizer & Gateway**: The capability-bound authorization core, pinned tool-description hashes, HTTP API, stdio MCP gateway, host approval relay, and digest/hash-pinned Docker + Squid egress stack (`deploy/`, continuously verified in CI via `scripts/verify_container_stack.py`) are implemented and tested. Still to build before v1.0 GA: persistent session state and a browser approval UI.
-3. **Product 3 (Later) — Redacted Posture & Evidence Viewer**: Lightweight Next.js UI over real redacted audit logs, providing structured control evidence mapped to OWASP LLM Top 10, OWASP Agentic Top 10, and NIST AI RMF.
+3. **Product 3 (Built & Tested — `frontend/` + `backend/mellyn/viewer_server.py`) — Redacted Posture, Audit & Approval Console**: React + TypeScript SPA backed by a fail-closed loopback HTTP server (read-only `Role.VIEWER` key for evidence, `Role.APPROVER` key only for approvals, `Host` allowlist, `0.0.0.0` only with `--allow-non-loopback`), combining Control Assurance evidence (OWASP LLM/Agentic & MITRE ATLAS), cryptographic Airlock `audit.jsonl` verification, gateway taint/audit logs, and live human approval actions.

@@ -11,7 +11,7 @@ An **OWASP-aligned AI Security Engineering Reference Architecture** and **B2B Se
 | 1–2. Secure AI-assisted coding (agent rules, pre-commit, CI gate, CODEOWNERS) | **Implemented & Tested** |
 | 3a. MCP Airlock & Red-Team Flight Recorder (`src/mcp_airlock/`) | **Implemented & Tested** (`mellyn-pin`, `mellyn-airlock`, `mellyn-ir`, `mellyn-bench`, AgBOM pinning, AAD kill switch, `--mode observe` harness) |
 | 3b. Self-hosted MCP Control Plane (`backend/mellyn/`) | **Core, HTTP API, stdio MCP gateway & container deployment with egress proxy implemented & tested** (stack built and run; see `deploy/README.md`); persistent state planned |
-| 4. B2B posture & audit viewer (`frontend/`) | Planned (built after telemetry matures) |
+| 4. B2B posture & audit viewer (`frontend/` + `backend/mellyn/viewer_server.py`) | **Implemented & Tested** (loopback fail-closed BFF, Control Assurance matrix, Airlock hash-chain verifier, Control Plane audit stream & live human approvals UI) |
 
 Self-hosted deployment (control-plane authorizer, gateway, Squid egress proxy): [`deploy/README.md`](deploy/README.md).
 
@@ -36,8 +36,9 @@ Self-hosted deployment (control-plane authorizer, gateway, Squid egress proxy): 
 4. **Self-Hosted MCP Control Plane (`backend/mellyn/` — Optional `[gateway]` Extras)**
    - **Authorization-First Core**: Server-issued sessions with automatic cross-server taint tracking, tool risk tiers (fail-closed for unknown tools), exact-match policy rules, and single-use, short-TTL human grants for one exact call (`authorizer.py`, `approvals.py`). Install optional server extras via `pip install ".[gateway]"`.
    - **Multi-Server MCP Gateway** ([`mcp_gateway.py`](backend/mellyn/mcp_gateway.py)): One stdio process fronting all downstream MCP servers (`<server>__<tool>`), holding high-risk/tainted calls for loopback human approval (`python -m mellyn.approve`) with container Squid egress isolation (`deploy/`).
-5. **B2B Posture & Evidence Viewer (`frontend/` — TypeScript / Next.js)** — *planned*
-   - Redacted audit viewer and structured control evidence mapped to OWASP LLM/Agentic Top 10 and NIST AI RMF.
+5. **B2B Posture, Forensic Audit & Approval Console (`frontend/` + `backend/mellyn/viewer_server.py`)**
+   - **Loopback Fail-Closed BFF (`viewer_server.py`)**: Serves the built SPA on `127.0.0.1:8080` with strict `CSP`/`nosniff`/`DENY` headers and refuses any `Host` header outside its allowlist (`421`, against DNS rebinding). Reads (status, reconstructed Airlock reports, gateway audit logs, OWASP/ATLAS assurance reports) need a separate read-only `Role.VIEWER` key (`MELLYN_VIEWER_KEY_DIGEST`); listing, approving, and rejecting held calls need the `Role.APPROVER` key. Both are checked in constant time via `X-Mellyn-API-Key` (`503` if unconfigured, `403` for the wrong role), and approvals are relayed without following redirects. Binding `0.0.0.0` requires `--allow-non-loopback`; extra hostnames are allowed with `--allow-host`.
+   - **Offline + Live Security Console (`frontend/` — React + TypeScript + Vite)**: Works with built-in redacted synthetic demos, client-side local file uploads (verifying `audit.jsonl` SHA-256 hash chains via Web Crypto), or live loopback API connections (the viewer key is kept in memory only; the approver key is entered in the Approvals tab and held only while that tab is open). Uploaded pre-built reports are labelled unverified.
 
 ---
 
@@ -81,6 +82,18 @@ mellyn-ir audit.jsonl --json
 
 ```bash
 mellyn-bench --json
+```
+
+6. **Build & launch the Plane 4 Posture, Audit & Approval Console**:
+
+```bash
+npm --prefix frontend install
+npm --prefix frontend run build
+# Needs MELLYN_API_KEY_PEPPER, MELLYN_VIEWER_KEY_DIGEST (reads) and MELLYN_APPROVER_KEY_DIGEST (approvals).
+PYTHONPATH=backend python -m mellyn.viewer_server \
+  --airlock-audit-log audit.jsonl \
+  --gateway-audit-log gateway-audit.jsonl \
+  --approval-port 8765
 ```
 
 ---
