@@ -604,7 +604,7 @@ class AirlockProxy:
             )
         except Exception as rec_exc:
             self._log_err(f"[airlock] could not record client stall: {type(rec_exc).__name__}")
-        self._stop_event.set()
+        self._request_stop()
 
     async def _emit_client_error(
         self,
@@ -660,8 +660,7 @@ class AirlockProxy:
         going) would silently stop answering, so every task fault ends the session with `INTERNAL_FAULT_EXIT_CODE`.
         """
         if self._faulted or self._aad_fired:
-            self._stop_event.set()
-            return
+            return  # the kill-switch or fault sequence already running sets the stop event when it finishes
         self._faulted = True
         self._exit_code = INTERNAL_FAULT_EXIT_CODE
         try:
@@ -1593,7 +1592,7 @@ class AirlockProxy:
             await self._wait_idle_or_stopped()
             if not self._stop_event.is_set():
                 self._close_downstream_stdin()
-                self._stop_event.set()
+                self._request_stop()
 
     async def _pump_server(self) -> None:
         proc = self._proc
@@ -1615,9 +1614,9 @@ class AirlockProxy:
             if frame is None:
                 break
             await self._handle_server_frame(frame)
-        if not self._stop_event.is_set():
+        if not self._stop_event.is_set() and not (self._aad_fired or self._faulted):
             await self._fail_remaining_in_flight_on_eof()
-            self._stop_event.set()
+            self._request_stop()
 
     async def _pump_stderr(self) -> None:
         proc = self._proc
@@ -1713,7 +1712,18 @@ class AirlockProxy:
         """Begin a normal shutdown (used by the CLI's SIGTERM/SIGHUP/SIGINT handlers); the downstream is stopped."""
         if not self._stop_event.is_set():
             self._log_err(f"[airlock] {reason}; shutting down")
-            self._stop_event.set()
+            self._request_stop()
+
+    def _request_stop(self) -> None:
+        """
+        Ask `run()` to shut down, unless the AAD kill switch or a fault shutdown is in progress. Those sequences set
+        the stop event themselves once they finish: `run()` cancels the remaining tasks on stop, so stopping early
+        (e.g. because killing the downstream made the server pump hit EOF) could cancel the task that is still
+        sending the client its terminal `-32099` / `-32603` errors.
+        """
+        if self._aad_fired or self._faulted:
+            return
+        self._stop_event.set()
 
 
 def _settle_write(fut: asyncio.Future[None], error: BaseException | None) -> None:

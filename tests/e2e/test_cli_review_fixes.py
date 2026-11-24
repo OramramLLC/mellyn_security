@@ -33,7 +33,7 @@ from mcp_airlock.core.schemas import ZoneEvent
 from mcp_airlock.egress import bench
 from mcp_airlock.ir_lab.reconstruct import reconstruct_incident, render_markdown
 
-from .test_proxy_aad import HOSTILE_SERVER, REPO_ROOT, ProxyHarness, _pid_is_alive
+from .test_proxy_aad import CANARY, HOSTILE_SERVER, REPO_ROOT, ProxyHarness, _pid_is_alive
 
 
 def _cli_env() -> dict[str, str]:
@@ -111,6 +111,57 @@ class TestStalledClientCannotDelayContainment(ProxyHarness):
         self.assertFalse(_pid_is_alive(proxy.downstream_pid or 0))
         rules = [row["event"]["rule_id"] for row in self._read_audit_rows()]
         self.assertIn("airlock.client_write_stalled", rules)
+
+
+class _SlowDeliveryWriter:
+    """Client writer whose frames are only delivered once a slow (but finite) drain completes."""
+
+    def __init__(self, delay: float) -> None:
+        self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+        self._delay = delay
+        self._buf = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self._buf.extend(data)
+
+    async def drain(self) -> None:
+        await asyncio.sleep(self._delay)
+        while b"\n" in self._buf:
+            nl = self._buf.index(b"\n")
+            self.lines.put_nowait(bytes(self._buf[:nl]))
+            del self._buf[: nl + 1]
+
+
+class TestKillSwitchNotificationIsNotCancelled(ProxyHarness):
+    async def test_client_gets_its_aad_error_when_the_kill_makes_the_server_pump_hit_eof(self) -> None:
+        # Regression (seen on CI's Python 3.12): AAD from the CLIENT pump kills the downstream first; the server pump
+        # then hits EOF and used to set the stop event, so run() cancelled the client pump before the -32099 reached
+        # the client. A slow drain makes that interleaving deterministic.
+        reader, writer = asyncio.StreamReader(), _SlowDeliveryWriter(delay=0.5)
+        proxy = AirlockProxy(
+            command=[sys.executable, str(HOSTILE_SERVER), "--mode", "benign"],
+            policy=self._build_policy(),
+            ledger=AuditLedger(self.audit_path),
+            client_reader=reader,
+            client_writer=writer,
+            err_stream=io.StringIO(),
+        )
+        task = asyncio.create_task(proxy.run())
+        self._send(reader, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        await asyncio.wait_for(writer.lines.get(), timeout=5.0)
+        self._send(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "x", "note": CANARY}},
+            },
+        )
+        self.assertEqual(await asyncio.wait_for(task, timeout=8.0), AAD_EXIT_CODE)
+        aad_error = await asyncio.wait_for(writer.lines.get(), timeout=1.0)
+        self.assertIn(b'"code":-32099', aad_error)
+        self.assertFalse(_pid_is_alive(proxy.downstream_pid or 0))
 
 
 class TestDownstreamCannotOutliveTheProxy(unittest.TestCase):
