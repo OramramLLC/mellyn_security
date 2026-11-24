@@ -192,6 +192,83 @@ class TestCreateAppFromEnv(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertIn("git_status", lines[0])
 
+    def test_persists_sessions_taint_and_grants_across_app_restart_when_state_db_configured(self) -> None:
+        from fastapi.testclient import TestClient
+        from mellyn.api import create_app_from_env
+        from mellyn.credentials import key_digest
+        from mellyn.state_store import StateStoreError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            (workspace / "note.txt").write_text("hi\n", encoding="utf-8")
+            state_db = Path(tmp) / "state" / "authorizer.db"
+            pepper = secrets.token_urlsafe(32)
+            agent_key = secrets.token_urlsafe(32)
+            approver_key = secrets.token_urlsafe(32)
+            env = {
+                "MELLYN_WORKSPACE_ROOT": str(workspace),
+                "MELLYN_REQUIRE_WORKSPACE_MOUNT": "0",
+                "MELLYN_STATE_DB_PATH": str(state_db),
+                "MELLYN_API_KEY_PEPPER": pepper,
+                "MELLYN_AGENT_KEY_DIGEST": key_digest(agent_key, pepper),
+                "MELLYN_APPROVER_KEY_DIGEST": key_digest(approver_key, pepper),
+            }
+            agent_hdr = {"X-Mellyn-API-Key": agent_key}
+            approver_hdr = {"X-Mellyn-API-Key": approver_key}
+
+            with unittest.mock.patch.dict("os.environ", env, clear=True):
+                with TestClient(create_app_from_env()) as client1:
+                    sid = client1.post("/v1/sessions", headers=agent_hdr).json()["session_id"]
+                    self.assertEqual(
+                        client1.post(
+                            f"/v1/sessions/{sid}/taint",
+                            headers=agent_hdr,
+                            json={"source_type": "web_page", "origin": "https://example.com"},
+                        ).status_code,
+                        200,
+                    )
+                    self.assertEqual(
+                        client1.post(
+                            f"/v1/sessions/{sid}/grants",
+                            headers=approver_hdr,
+                            json={
+                                "tool_name": "git_push",
+                                "arguments": {"branch": "feature/api"},
+                                "approved_by": "reviewer@mellyn.security",
+                            },
+                        ).status_code,
+                        201,
+                    )
+
+                with TestClient(create_app_from_env()) as client2:
+                    write_res = client2.post(
+                        "/v1/agent/authorize",
+                        headers=agent_hdr,
+                        json={"session_id": sid, "tool_name": "workspace_write", "arguments": {"path": "note.txt"}},
+                    ).json()
+                    self.assertEqual(write_res["decision"], "require_approval")
+                    self.assertTrue(write_res["tainted"])
+
+                    first_push = client2.post(
+                        "/v1/agent/authorize",
+                        headers=agent_hdr,
+                        json={"session_id": sid, "tool_name": "git_push", "arguments": {"branch": "feature/api"}},
+                    ).json()
+                    self.assertEqual(first_push["decision"], "allow")
+
+                    retry_push = client2.post(
+                        "/v1/agent/authorize",
+                        headers=agent_hdr,
+                        json={"session_id": sid, "tool_name": "git_push", "arguments": {"branch": "feature/api"}},
+                    ).json()
+                    self.assertEqual(retry_push["decision"], "require_approval")
+
+            # Corrupt DB fails closed at startup
+            state_db.write_bytes(b"corrupt")
+            with unittest.mock.patch.dict("os.environ", env, clear=True), self.assertRaises(StateStoreError):
+                create_app_from_env()
+
 
 @unittest.skipUnless(HAS_FASTAPI, "fastapi and httpx are not installed")
 class TestApiRefusesHalfMigratedEnvironment(unittest.TestCase):

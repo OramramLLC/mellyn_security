@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import secrets
 import threading
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +32,8 @@ from mellyn.policy import (
     ToolCapability,
     validate_argv,
 )
+from mellyn.state_store import AuthorizerStateStore, InMemoryStateStore
+from mellyn.state_store import SessionLimitError as SessionLimitError
 
 # MCP resources/read is authorized as a pseudo-tool of this name, with arguments {"uri": ...}.
 RESOURCE_READ_TOOL = "resources/read"
@@ -43,20 +43,6 @@ MAX_GRANT_USES = 100
 DEFAULT_SESSION_TTL_SECONDS = 86400
 DEFAULT_MAX_SESSIONS = 10_000
 DEFAULT_MAX_TAINT_SAMPLE = 16
-
-
-class SessionLimitError(RuntimeError):
-    """The authorizer already holds max_sessions active sessions. Existing sessions are not evicted."""
-
-
-@dataclass
-class _SessionState:
-    created_at: datetime
-    last_seen_at: datetime
-    tainted: bool = False
-    taint_count: int = 0
-    taint_sample: deque[TaintSource] = field(default_factory=deque)
-    taint_entries: deque[str] = field(default_factory=deque)
 
 
 class Authorizer:
@@ -74,11 +60,12 @@ class Authorizer:
        (ALLOW -> REQUIRE_APPROVAL -> DENY), never relax it.
 
     Session model: session IDs are issued by the authorizer (`create_session`) and unknown IDs are
-    denied, so a caller cannot shed taint by inventing a fresh ID, and a restart (which clears this
-    in-memory state) fails closed rather than resetting every session to clean. Taint is recorded
-    automatically whenever an allowed call's result brings outside content into the session (by
-    `authorize`, or by `record_tool_result_taint` once the gateway has the server's reply);
-    `mark_tainted` is for other sources the harness knows about (an issue body, a PR comment).
+    denied, so a caller cannot shed taint by inventing a fresh ID. Ephemeral in-memory restarts fail
+    closed rather than resetting sessions to clean; configuring `SqliteStateStore` persists session
+    taint and exact-call grants durably across restarts while still failing closed on corruption or
+    expiry. Taint is recorded automatically whenever an allowed call's result brings outside content
+    into the session (by `authorize`, or by `record_tool_result_taint` once the gateway has the server's
+    reply); `mark_tainted` is for other sources the harness knows about (an issue body, a PR comment).
     """
 
     def __init__(
@@ -90,6 +77,7 @@ class Authorizer:
         session_ttl_seconds: int | None = DEFAULT_SESSION_TTL_SECONDS,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         max_taint_sample: int = DEFAULT_MAX_TAINT_SAMPLE,
+        state_store: AuthorizerStateStore | None = None,
     ) -> None:
         # session_ttl_seconds=None: sessions never expire (the stdio gateway's single session lives as long
         # as the process, so an idle client is not locked out after a day).
@@ -108,49 +96,44 @@ class Authorizer:
         self.max_taint_sample = max_taint_sample
         # FastAPI runs sync handlers in a thread pool; one lock keeps taint and grant use atomic.
         self._lock = threading.Lock()
-        self._sessions: dict[str, _SessionState] = {}
-        self._grants: dict[str, ApprovalGrant] = {}
-        self._grant_uses: dict[str, int] = {}
+        self._state: AuthorizerStateStore = state_store if state_store is not None else InMemoryStateStore()
+
+    @property
+    def _grants(self) -> dict[str, ApprovalGrant]:
+        return self._state.active_grants_snapshot()
+
+    def close(self) -> None:
+        """Close the backing state store (idempotent)."""
+        self._state.close()
+
+    def __enter__(self) -> Authorizer:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     # ---- Sessions & taint -------------------------------------------------------------------------
-
-    def _evict_session_locked(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-        stale_grants = [gid for gid, grant in self._grants.items() if grant.session_id == session_id]
-        for gid in stale_grants:
-            del self._grants[gid]
-            self._grant_uses.pop(gid, None)
-
-    def _prune_sessions_locked(self, now: datetime) -> None:
-        if self.session_ttl_seconds is None:
-            return
-        cutoff = now - timedelta(seconds=self.session_ttl_seconds)
-        expired = [sid for sid, state in self._sessions.items() if state.last_seen_at < cutoff]
-        for sid in expired:
-            self._evict_session_locked(sid)
 
     def create_session(self, *, now: datetime | None = None) -> str:
         """Issue a new, clean session ID. Only IDs issued here are accepted by authorize()."""
         created = now or utc_now()
         session_id = f"ses_{secrets.token_urlsafe(18)}"
         with self._lock:
-            self._prune_sessions_locked(created)
-            # Refuse rather than evict: evicting the oldest session would let anyone holding the agent key
-            # end other agents' active sessions just by opening new ones.
-            if len(self._sessions) >= self.max_sessions:
-                raise SessionLimitError(f"Session limit ({self.max_sessions}) reached; try again later.")
-            self._sessions[session_id] = _SessionState(
-                created_at=created,
-                last_seen_at=created,
-                taint_sample=deque(maxlen=self.max_taint_sample),
-                taint_entries=deque(maxlen=self.max_taint_sample),
+            self._state.create_session(
+                session_id,
+                now=created,
+                session_ttl_seconds=self.session_ttl_seconds,
+                max_sessions=self.max_sessions,
             )
         return session_id
 
     def has_session(self, session_id: str, *, now: datetime | None = None) -> bool:
         with self._lock:
-            self._prune_sessions_locked(now or utc_now())
-            return session_id in self._sessions
+            return self._state.has_session(
+                session_id,
+                now=now or utc_now(),
+                session_ttl_seconds=self.session_ttl_seconds,
+            )
 
     def _safe_origin_for_request(self, request: ToolCallRequest) -> str:
         if request.mcp_server is None:
@@ -166,27 +149,32 @@ class Authorizer:
             tool_part = hash_untrusted_identifier("untrusted_tool", request.tool_name)
         return f"{srv_part}:{tool_part}"
 
-    def _append_taint_locked(self, state: _SessionState, source: TaintSource, check_time: datetime) -> None:
-        state.last_seen_at = check_time
-        state.tainted = True
-        state.taint_count += 1
+    @staticmethod
+    def _sanitize_taint_source(source: TaintSource) -> tuple[TaintSource, str]:
         sanitized = TaintSource(
             source_type=redact_text(source.source_type)[:64],
             origin=redact_text(source.origin)[:MAX_TAINT_ENTRY_CHARS],
             recorded_at=source.recorded_at,
         )
-        state.taint_sample.append(sanitized)
-        state.taint_entries.append(format_taint_entry(sanitized))
+        return sanitized, format_taint_entry(sanitized)
 
     def mark_tainted(self, session_id: str, source: TaintSource, *, now: datetime | None = None) -> None:
         """Record that untrusted external content has entered the session and emit a durable audit event."""
         check_time = now or utc_now()
+        sanitized, formatted = self._sanitize_taint_source(source)
         with self._lock:
-            self._prune_sessions_locked(check_time)
-            state = self._session(session_id)
-            self._append_taint_locked(state, source, check_time)
-            taint_count = state.taint_count
-            taint_entries = tuple(state.taint_entries)
+            updated = self._state.record_taint(
+                session_id,
+                sanitized,
+                formatted,
+                now=check_time,
+                session_ttl_seconds=self.session_ttl_seconds,
+                max_taint_sample=self.max_taint_sample,
+                missing_ok=False,
+            )
+        if updated is None:
+            raise KeyError(f"Unknown session '{session_id}'.")
+        taint_count, taint_entries = updated
         self.audit.record_taint(
             session_id=session_id,
             taint_count=taint_count,
@@ -206,18 +194,22 @@ class Authorizer:
             return False
         check_time = now or utc_now()
         origin = self._safe_origin_for_request(request)
+        sanitized, formatted = self._sanitize_taint_source(
+            TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time)
+        )
         with self._lock:
-            self._prune_sessions_locked(check_time)
-            state = self._sessions.get(request.session_id)
-            if state is None:
-                return False
-            self._append_taint_locked(
-                state,
-                TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time),
-                check_time,
+            updated = self._state.record_taint(
+                request.session_id,
+                sanitized,
+                formatted,
+                now=check_time,
+                session_ttl_seconds=self.session_ttl_seconds,
+                max_taint_sample=self.max_taint_sample,
+                missing_ok=True,
             )
-            taint_count = state.taint_count
-            taint_entries = tuple(state.taint_entries)
+        if updated is None:
+            return False
+        taint_count, taint_entries = updated
         self.audit.record_taint(
             session_id=request.session_id,
             taint_count=taint_count,
@@ -228,24 +220,18 @@ class Authorizer:
 
     def is_tainted(self, session_id: str) -> bool:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._state.get_session_snapshot(session_id)
             return bool(state and state.tainted)
 
     def get_taint_count(self, session_id: str) -> int:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._state.get_session_snapshot(session_id)
             return state.taint_count if state else 0
 
     def get_taint_sources(self, session_id: str) -> tuple[TaintSource, ...]:
         with self._lock:
-            state = self._sessions.get(session_id)
-            return tuple(state.taint_sample) if state else ()
-
-    def _session(self, session_id: str) -> _SessionState:
-        state = self._sessions.get(session_id)
-        if state is None:
-            raise KeyError(f"Unknown session '{session_id}'.")
-        return state
+            state = self._state.get_session_snapshot(session_id)
+            return state.taint_sample if state else ()
 
     # ---- Human approval grants ------------------------------------------------------------------
 
@@ -285,24 +271,12 @@ class Authorizer:
             mcp_method=mcp_method,
         )
         with self._lock:
-            self._prune_sessions_locked(issued_at)
-            state = self._session(session_id)
-            state.last_seen_at = issued_at
-            self._prune_grants(issued_at)
-            self._grants[grant.grant_id] = grant
-            self._grant_uses[grant.grant_id] = 0
+            self._state.issue_grant(
+                grant,
+                now=issued_at,
+                session_ttl_seconds=self.session_ttl_seconds,
+            )
         return grant
-
-    def _prune_grants(self, now: datetime) -> None:
-        for grant_id in [g.grant_id for g in self._grants.values() if not g.is_valid(now)]:
-            del self._grants[grant_id]
-            del self._grant_uses[grant_id]
-
-    def _find_matching_grant(self, request: ToolCallRequest, now: datetime) -> ApprovalGrant | None:
-        for grant in self._grants.values():
-            if self._grant_uses[grant.grant_id] < grant.max_uses and grant.matches(request, now=now):
-                return grant
-        return None
 
     # ---- Authorization ---------------------------------------------------------------------------
 
@@ -331,9 +305,12 @@ class Authorizer:
         record_taint_on_allow: bool,
         denial_reason: str | None = None,
     ) -> AuthorizationResult:
-        self._prune_sessions_locked(check_time)
         risk_tier = self.policy.classify_risk(request.tool_name, request.mcp_server)
-        state = self._sessions.get(request.session_id)
+        state = self._state.touch_session(
+            request.session_id,
+            now=check_time,
+            session_ttl_seconds=self.session_ttl_seconds,
+        )
 
         # 0. Hard boundary: the session must have been issued by this authorizer
         if state is None:
@@ -349,9 +326,8 @@ class Authorizer:
                 session_known=False,
             )
 
-        state.last_seen_at = check_time
         tainted = state.tainted
-        taint_entries = tuple(state.taint_entries)
+        taint_entries = state.taint_entries
         taint_count = state.taint_count
         reasons: list[str] = []
         policy_id: str | None = None
@@ -445,34 +421,54 @@ class Authorizer:
             policy_id = matched_rule.rule_id
 
         # 6. A human grant for this exact call can turn REQUIRE_APPROVAL into ALLOW
-        matching_grant = None
+        matching_grants: list[ApprovalGrant] = []
         if decision == Decision.REQUIRE_APPROVAL:
-            matching_grant = self._find_matching_grant(request, check_time)
-            if matching_grant is not None:
+            matching_grants = [
+                grant
+                for grant in self._state.list_usable_grants(request.session_id, now=check_time)
+                if grant.matches(request, now=check_time)
+            ]
+            if matching_grants:
                 decision = Decision.ALLOW
-                grant_id = matching_grant.grant_id
-                reasons.append(
-                    f"Approved by human grant '{matching_grant.grant_id}' (approved_by={matching_grant.approved_by})."
-                )
 
         # 7. Apply supporting risk signals (escalate ONLY; never downgrade)
         decision = self._apply_risk_signals(request, decision, reasons)
 
+        if decision == Decision.ALLOW and matching_grants:
+            # A grant is spent only after risk signals leave ALLOW, and atomically so concurrent callers fail closed.
+            consumed_grant = None
+            for candidate in matching_grants:
+                if self._state.consume_grant(candidate.grant_id, now=check_time):
+                    consumed_grant = candidate
+                    grant_id = candidate.grant_id
+                    reasons.append(
+                        f"Approved by human grant '{candidate.grant_id}' (approved_by={candidate.approved_by})."
+                    )
+                    break
+            if consumed_grant is None:
+                decision = Decision.REQUIRE_APPROVAL
+                grant_id = None
+                reasons.append("Approval grant was already consumed or expired; requiring approval.")
+
         if decision == Decision.ALLOW:
-            # A grant is spent only by a call it actually let through.
-            if matching_grant is not None:
-                self._grant_uses[matching_grant.grant_id] += 1
             # The result of this call will enter the agent's context: taint the session (the gateway defers
             # this to record_tool_result_taint, once it knows whether the server actually replied).
             if record_taint_on_allow and self.policy.brings_untrusted_content(request):
                 origin = self._safe_origin_for_request(request)
-                self._append_taint_locked(
-                    state,
-                    TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time),
-                    check_time,
+                sanitized, formatted = self._sanitize_taint_source(
+                    TaintSource(source_type="tool_result", origin=origin, recorded_at=check_time)
                 )
-                taint_entries = tuple(state.taint_entries)
-                taint_count = state.taint_count
+                updated = self._state.record_taint(
+                    request.session_id,
+                    sanitized,
+                    formatted,
+                    now=check_time,
+                    session_ttl_seconds=self.session_ttl_seconds,
+                    max_taint_sample=self.max_taint_sample,
+                    missing_ok=True,
+                )
+                if updated is not None:
+                    taint_count, taint_entries = updated
                 reasons.append(f"Session tainted by the result of '{origin}'.")
         elif grant_id is not None:
             grant_id = None

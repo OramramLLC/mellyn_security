@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import IO, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from mellyn.audit import AuditLogger
@@ -19,6 +20,7 @@ from mellyn.legacy_env import check_no_legacy_env
 from mellyn.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
 from mellyn.policy import PolicyConfig
 from mellyn.policy_loader import load_policy_file
+from mellyn.state_store import AuthorizerStateStore, SqliteStateStore, StateStoreError
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 _STRICT = ConfigDict(extra="forbid", strict=True)
@@ -71,8 +73,10 @@ def create_app(
     policy_config: PolicyConfig | None = None,
     credentials: CredentialConfig | None = None,
     audit_logger: AuditLogger | None = None,
+    state_store: AuthorizerStateStore | None = None,
     *,
     _owned_sink: IO[str] | None = None,
+    _owned_state_store: AuthorizerStateStore | None = None,
 ) -> FastAPI:
     """
     Build the FastAPI application wrapping an Authorizer instance.
@@ -86,15 +90,27 @@ def create_app(
         try:
             yield
         finally:
-            if _owned_sink is not None and not _owned_sink.closed:
-                _owned_sink.close()
+            try:
+                if _owned_state_store is not None:
+                    _owned_state_store.close()
+            finally:
+                if _owned_sink is not None and not _owned_sink.closed:
+                    _owned_sink.close()
 
     app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="0.1.0", lifespan=_lifespan)
     authorizer = Authorizer(
         workspace_root=workspace_root or Path.cwd(),
         policy_config=policy_config,
         audit_logger=audit_logger,
+        state_store=state_store,
     )
+
+    @app.exception_handler(StateStoreError)
+    def _handle_state_store_error(_request: Request, _exc: StateStoreError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Authorizer state store unavailable (fail-closed)."},
+        )
 
     loaded: CredentialConfig | None = credentials
     if loaded is None:
@@ -203,6 +219,7 @@ def create_app_from_env() -> FastAPI:
                             the container image: without the agent's real workspace mounted, the path guard
                             resolves links against an empty directory and cannot see where they lead.
       MELLYN_AUDIT_LOG_PATH  optional append-only JSONL file path for redacted audit events
+      MELLYN_STATE_DB_PATH   optional SQLite file path for persistent sessions, taint, and single-use grants
     """
     check_no_legacy_env()  # a half-migrated deployment must not start with its old settings silently ignored
     policy_path_raw = os.environ.get("MELLYN_POLICY_PATH", "").strip()
@@ -215,6 +232,7 @@ def create_app_from_env() -> FastAPI:
     audit_path_raw = os.environ.get("MELLYN_AUDIT_LOG_PATH", "").strip()
     audit_logger: AuditLogger | None = None
     sink: IO[str] | None = None
+    state_store: SqliteStateStore | None = None
     if audit_path_raw:
         audit_path = Path(audit_path_raw)
         audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,13 +240,22 @@ def create_app_from_env() -> FastAPI:
         audit_logger = AuditLogger(sink=sink)
 
     try:
+        state_db_raw = os.environ.get("MELLYN_STATE_DB_PATH", "").strip()
+        if state_db_raw:
+            state_store = SqliteStateStore(Path(state_db_raw))
         return create_app(
             workspace_root=workspace_root,
             policy_config=policy_config,
             audit_logger=audit_logger,
+            state_store=state_store,
             _owned_sink=sink,
+            _owned_state_store=state_store,
         )
     except Exception:
-        if sink is not None and not sink.closed:
-            sink.close()
+        try:
+            if state_store is not None:
+                state_store.close()
+        finally:
+            if sink is not None and not sink.closed:
+                sink.close()
         raise
