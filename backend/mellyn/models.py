@@ -175,3 +175,32 @@ class AuthorizationResult:
     audit_id: str
     policy_id: str | None = None
     grant_id: str | None = None
+
+
+MAX_LINE_BYTES = 4 * 1024 * 1024
+DOWNSTREAM_TIMEOUT_SECONDS = 60.0
+SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-06-18", "2025-03-26", "2024-11-05")
+DOWNSTREAM_ERROR = -32000
+
+
+class GatewayLocalError(dict):  # type: ignore[type-arg]
+    """
+    A JSON-RPC error the gateway generated itself because a downstream server never answered (timeout,
+    closed pipe, HTTP/OAuth failure, refused input). Carries no server-written text, so it does not taint.
+
+    Replies a server actually sent are parsed into plain `dict`s, so a server cannot make its own reply
+    look like one of these, whatever fields it includes.
+    """
+
+
+def jsonrpc_error(req_id: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Construct a JSON-RPC 2.0 error reply dict."""
+    error_body: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error_body["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": error_body}
+
+
+def local_downstream_error(req_id: Any, message: str) -> GatewayLocalError:
+    """Construct a non-tainting gateway-authored JSON-RPC error reply."""
+    return GatewayLocalError(jsonrpc_error(req_id, DOWNSTREAM_ERROR, message))

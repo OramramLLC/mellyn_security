@@ -6,7 +6,9 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
+from mellyn.oauth_client import OAuthClientConfig
 from mellyn.policy import validate_argv
 from mellyn.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
 
@@ -19,7 +21,10 @@ _SERVER_KEYS = frozenset({"name", "command"})
 @dataclass(frozen=True)
 class ServerSpec:
     name: str
-    command: tuple[str, ...]
+    command: tuple[str, ...] = ()
+    transport: Literal["stdio", "streamable-http"] = "stdio"
+    url: str | None = None
+    oauth: OAuthClientConfig | None = None
 
 
 @dataclass(frozen=True)

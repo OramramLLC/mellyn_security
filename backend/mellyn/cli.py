@@ -25,8 +25,10 @@ _AIRLOCK_VERIFY_HINT = (
 )
 _AIRLOCK_PIN_MODULE = "mcp_airlock.airlock.pin_cli"
 _AIRLOCK_PIN_HINT = "The `pin` command requires the `mcp_airlock` package (not installed in gateway-only containers)."
-_GATEWAY_PIN_FLAGS = frozenset({"--name", "--config", "--preset", "--trusted", "--untrusted", "--cwd", "--json"})
-_GATEWAY_PIN_PREFIXES = ("--name=", "--config=", "--preset=", "--cwd=")
+_GATEWAY_PIN_FLAGS = frozenset(
+    {"--name", "--config", "--preset", "--trusted", "--untrusted", "--cwd", "--json", "--url"}
+)
+_GATEWAY_PIN_PREFIXES = ("--name=", "--config=", "--preset=", "--cwd=", "--url=")
 
 _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),

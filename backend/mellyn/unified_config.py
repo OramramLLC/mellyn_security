@@ -18,6 +18,7 @@ from typing import Any, Literal
 from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME, GatewayConfig, ServerSpec, load_gateway_config
 from mellyn.models import RiskTier
+from mellyn.oauth_client import OAuthClientConfig, extract_url_host, validate_outbound_url
 from mellyn.policy import (
     SMB_SERVER_PRESETS,
     PolicyConfig,
@@ -33,7 +34,23 @@ _UNIFIED_TOP_KEYS = frozenset({"schema_version", "runtime", "egress", "policy", 
 _RUNTIME_KEYS = frozenset({"mode", "allow_observe_mode", "state_db", "audit_log"})
 _EGRESS_KEYS = frozenset({"allowed_domains", "auto_sync_squid"})
 _SCANNER_KEYS = frozenset({"canary_tokens", "block_known_secrets", "aad_kill_on_leak", "blocked_patterns"})
-_SERVER_KEYS = frozenset({"name", "transport", "preset", "trusted", "command", "tools_sha256"})
+_SERVER_KEYS = frozenset({"name", "transport", "preset", "trusted", "command", "url", "oauth", "tools_sha256"})
+_OAUTH_KEYS = frozenset(
+    {
+        "flow",
+        "allowed_authorization_servers",
+        "client_id",
+        "client_id_env",
+        "client_secret_env",
+        "bearer_token_env",
+        "scopes",
+        "resource",
+        "token_endpoint",
+        "authorization_endpoint",
+        "token_cache_path",
+    }
+)
+_FORBIDDEN_OAUTH_RAW_KEYS = frozenset({"client_secret", "bearer_token", "access_token", "refresh_token"})
 _POLICY_SECTION_KEYS = frozenset(
     {
         "protected_paths",
@@ -154,6 +171,72 @@ def _parse_scanner_section(raw: Any) -> ScannerConfig:
         raise PolicyLoadError(f"[scanner] configuration invalid: {exc}") from exc
 
 
+def _add_domain_from_url(url: str, seen_domains: set[str], allowed_domains: list[str]) -> None:
+    host = extract_url_host(url)
+    norm = validate_egress_domain(host)
+    if norm not in seen_domains:
+        seen_domains.add(norm)
+        allowed_domains.append(norm)
+
+
+def _parse_oauth_section(raw: Any, *, server_idx: int, server_name: str, base_dir: Path) -> OAuthClientConfig:
+    sec = _require_mapping(raw, f"servers[{server_idx}] ({server_name}).oauth")
+    forbidden = _FORBIDDEN_OAUTH_RAW_KEYS & set(sec)
+    if forbidden:
+        raise PolicyLoadError(
+            f"servers[{server_idx}] ({server_name}).oauth must not store raw secret fields {sorted(forbidden)}; "
+            "reference environment variable names with *_env instead."
+        )
+    unknown = set(sec) - _OAUTH_KEYS
+    if unknown:
+        raise PolicyLoadError(f"servers[{server_idx}] ({server_name}).oauth contains unknown key(s): {sorted(unknown)}")
+
+    flow_raw = sec.get("flow")
+    if not isinstance(flow_raw, str) or flow_raw.strip() not in ("client_credentials", "pkce", "bearer_env"):
+        raise PolicyLoadError(
+            f"servers[{server_idx}] ({server_name}).oauth.flow must be 'client_credentials', 'pkce', or 'bearer_env'."
+        )
+    flow_str = flow_raw.strip()
+    flow: Literal["client_credentials", "pkce", "bearer_env"] = (
+        "client_credentials" if flow_str == "client_credentials" else ("pkce" if flow_str == "pkce" else "bearer_env")
+    )
+
+    label = f"servers[{server_idx}].oauth"
+    allowed_as = tuple(_require_str_list(sec, "allowed_authorization_servers", label))
+    scopes = tuple(_require_str_list(sec, "scopes", label))
+
+    def _opt_str(key: str) -> str | None:
+        if key not in sec:
+            return None
+        val = sec[key]
+        if not isinstance(val, str) or not val.strip():
+            raise PolicyLoadError(f"{label}.{key} must be a non-empty string.")
+        return val.strip()
+
+    raw_cache = _opt_str("token_cache_path")
+    cache_path: Path | None = None
+    if raw_cache is not None:
+        raw_p = Path(raw_cache)
+        cache_path = raw_p.resolve() if raw_p.is_absolute() else (base_dir / raw_p).resolve()
+
+    try:
+        return OAuthClientConfig(
+            flow=flow,
+            allowed_authorization_servers=allowed_as,
+            client_id=_opt_str("client_id"),
+            client_id_env=_opt_str("client_id_env"),
+            client_secret_env=_opt_str("client_secret_env"),
+            bearer_token_env=_opt_str("bearer_token_env"),
+            scopes=scopes,
+            resource=_opt_str("resource"),
+            token_endpoint=_opt_str("token_endpoint"),
+            authorization_endpoint=_opt_str("authorization_endpoint"),
+            token_cache_path=cache_path,
+        )
+    except ValueError as exc:
+        raise PolicyLoadError(f"servers[{server_idx}] ({server_name}).oauth invalid: {exc}") from exc
+
+
 def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: Path) -> UnifiedConfig:
     """Validate a `schema_version = 2` unified configuration dictionary and compile Policy/Gateway models."""
     if not isinstance(data, Mapping):
@@ -210,18 +293,56 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
         if any(s.name == name for s in server_specs):
             raise PolicyLoadError(f"Duplicate server name '{name}'.")
 
-        transport = entry.get("transport", "stdio")
-        if not isinstance(transport, str) or transport.strip() != "stdio":
+        transport_raw = entry.get("transport", "stdio")
+        if not isinstance(transport_raw, str) or transport_raw.strip() not in ("stdio", "streamable-http"):
             raise PolicyLoadError(
-                f"servers[{idx}] ({name}) specifies unsupported transport {transport!r}; only 'stdio' is supported."
+                f"servers[{idx}] ({name}) specifies unsupported transport {transport_raw!r}; "
+                "expected 'stdio' or 'streamable-http'."
             )
+        transport_str = transport_raw.strip()
+        transport: Literal["stdio", "streamable-http"] = (
+            "streamable-http" if transport_str == "streamable-http" else "stdio"
+        )
 
-        if "command" not in entry:
-            raise PolicyLoadError(f"servers[{idx}] ({name}) requires 'command'.")
-        command = entry["command"]
-        argv_ok, argv_reason = validate_argv({"argv": command})
-        if not argv_ok:
-            raise PolicyLoadError(f"Server '{name}' command rejected: {argv_reason}")
+        cmd_tuple: tuple[str, ...] = ()
+        server_url: str | None = None
+        oauth_cfg: OAuthClientConfig | None = None
+        if transport == "stdio":
+            if "url" in entry or "oauth" in entry:
+                raise PolicyLoadError(
+                    f"servers[{idx}] ({name}) with transport='stdio' must not specify 'url' or 'oauth'."
+                )
+            if "command" not in entry:
+                raise PolicyLoadError(f"servers[{idx}] ({name}) requires 'command'.")
+            command = entry["command"]
+            argv_ok, argv_reason = validate_argv({"argv": command})
+            if not argv_ok:
+                raise PolicyLoadError(f"Server '{name}' command rejected: {argv_reason}")
+            cmd_tuple = tuple(command)
+        else:
+            if "command" in entry:
+                raise PolicyLoadError(
+                    f"servers[{idx}] ({name}) with transport='streamable-http' must not specify 'command'."
+                )
+            url_raw = entry.get("url")
+            if not isinstance(url_raw, str) or not url_raw.strip():
+                raise PolicyLoadError(f"servers[{idx}] ({name}) with transport='streamable-http' requires 'url'.")
+            try:
+                server_url = validate_outbound_url(url_raw, allow_loopback_http=False)
+            except ValueError as exc:
+                raise PolicyLoadError(f"servers[{idx}] ({name}).url rejected: {exc}") from exc
+            _add_domain_from_url(server_url, seen_domains, allowed_domains)
+
+            oauth_raw = entry.get("oauth")
+            if oauth_raw is not None:
+                oauth_cfg = _parse_oauth_section(oauth_raw, server_idx=idx, server_name=name, base_dir=base_dir)
+                for oauth_url in (
+                    *oauth_cfg.allowed_authorization_servers,
+                    *([oauth_cfg.resource] if oauth_cfg.resource else ()),
+                    *([oauth_cfg.token_endpoint] if oauth_cfg.token_endpoint else ()),
+                    *([oauth_cfg.authorization_endpoint] if oauth_cfg.authorization_endpoint else ()),
+                ):
+                    _add_domain_from_url(oauth_url, seen_domains, allowed_domains)
 
         trusted = _require_bool(entry, "trusted", False, f"servers[{idx}]")
 
@@ -257,10 +378,31 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                     )
                 pinned_hashes[name] = pin_clean
 
-        server_specs.append(ServerSpec(name=name, command=tuple(command)))
+        server_specs.append(
+            ServerSpec(
+                name=name,
+                command=cmd_tuple,
+                transport=transport,
+                url=server_url,
+                oauth=oauth_cfg,
+            )
+        )
         allowed_servers.append(name)
         if trusted:
             trusted_servers.append(name)
+
+    # Two servers sharing a token cache would send each other's tokens; refuse the config instead.
+    cache_owner: dict[Path, str] = {}
+    for spec in server_specs:
+        cache = spec.oauth.token_cache_path if spec.oauth is not None else None
+        if cache is None:
+            continue
+        if cache in cache_owner:
+            raise PolicyLoadError(
+                f"Servers '{cache_owner[cache]}' and '{spec.name}' share oauth.token_cache_path '{cache}'; "
+                "each server needs its own cache."
+            )
+        cache_owner[cache] = spec.name
 
     policy_dict: dict[str, Any] = {
         "schema_version": 1,

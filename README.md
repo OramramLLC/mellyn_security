@@ -71,6 +71,8 @@ mellyn init --unified --preset mcp-filesystem --preset github --workspace /abs/p
                                                      # digest-only .env + single schema_version=2 config/mellyn.toml (omit --unified for v1 split files)
 mellyn pin --name workspace --preset mcp-filesystem --config config/mellyn.toml -- my-mcp-server --root .
                                                      # inspect tools/list in a minimal env & pin exact tools_sha256 into mellyn.toml
+# Or pin a remote Streamable HTTP MCP server with OAuth 2.1 (M2M, PKCE, or bearer_env):
+mellyn pin --name github --url https://api.githubcopilot.com/mcp/ --oauth-flow pkce --oauth-as https://github.com/login/oauth --client-id-env GITHUB_CLIENT_ID --preset github --config config/mellyn.toml
 mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
 mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
 mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl
