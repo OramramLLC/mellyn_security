@@ -84,7 +84,9 @@ mellyn verify mellyn-audit.jsonl --json              # auto-detects Gateway or A
 also records `MELLYN_CONFIG_DIR`, `MELLYN_POLICY_FILE` and `MELLYN_GATEWAY_CONFIG_FILE` in `.env`, and `mellyn up`
 passes `.env` to compose, so the containers enforce the generated policy rather than the checked-in example. Replace
 any placeholder commands in `config/mellyn.toml` (or run `mellyn pin --name ... --config config/mellyn.toml -- <cmd>`)
-before connecting a client.
+before connecting a client. Add `[notifications]` to `mellyn.toml` to send redacted approval alerts with deep links
+to `https://<console>/approvals/apr_...` for Slack, Microsoft Teams, or generic webhooks; the webhook URL goes in an
+environment variable (`approval_webhook_url_env`) alongside the one host it may point at (`webhook_host`).
 
 1. **Pin a downstream MCP server manifest (`mellyn-pin`)**:
 

@@ -53,6 +53,7 @@ from mellyn.models import (
     SUPPORTED_PROTOCOL_VERSIONS,
     jsonrpc_error,
 )
+from mellyn.notifications import ApprovalWebhookNotifier
 from mellyn.oauth_client import OAuthError
 from mellyn.oauth_resource import (
     AuthConfig,
@@ -153,6 +154,31 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
 
+    def _drain_small_unread_body(self) -> None:
+        if getattr(self, "_body_consumed", False) or "Transfer-Encoding" in self.headers:
+            return
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return
+        try:
+            length = int(raw_len)
+        except ValueError:
+            return
+        if not 0 < length <= 65_536:
+            return
+        prev_timeout = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(0.05)
+            self.rfile.read(length)
+        except OSError:
+            pass
+        finally:
+            with_sock = self.connection
+            try:
+                with_sock.settimeout(prev_timeout)
+            except OSError:
+                pass
+
     def _send_bytes(
         self,
         status: HTTPStatus | int,
@@ -161,6 +187,7 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
         *,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
+        self.close_connection = True
         self.send_response(int(status))
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -172,6 +199,9 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if payload:
             self.wfile.write(payload)
+        self.wfile.flush()
+        if int(status) >= 400:
+            self._drain_small_unread_body()
 
     def _send_empty(
         self,
@@ -179,6 +209,7 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
         *,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
+        self.close_connection = True
         self.send_response(int(status))
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
@@ -187,6 +218,9 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
             for key, val in extra_headers.items():
                 self.send_header(key, val)
         self.end_headers()
+        self.wfile.flush()
+        if int(status) >= 400:
+            self._drain_small_unread_body()
 
     def _send_json(
         self,
@@ -357,6 +391,7 @@ class _HttpGatewayHandler(BaseHTTPRequestHandler):
                 jsonrpc_error(None, JSONRPC_INVALID_REQUEST, "Request payload exceeds maximum byte limit."),
             )
             return None
+        self._body_consumed = True
         raw_bytes = self.rfile.read(length) if length > 0 else b""
         if len(raw_bytes) != length:
             self._send_json(
@@ -857,10 +892,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if unified.auth.mode == "oidc":
         oidc_validator = OAuthResourceValidator(
             unified.auth,
-            allowed_domains=policy.allowed_egress_domains,
+            allowed_domains=unified.gateway_egress_domains,
         )
 
     approval_server: ApprovalHTTPServer | None = None
+    notifier: ApprovalWebhookNotifier | None = None
     http_server: StreamableHttpGatewayServer | None = None
     servers: dict[str, Downstream] = {}
     audit_file: IO[str] | None = None
@@ -878,6 +914,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     group=ds_gid,
                     child_home=ds_home,
                     child_username=ds_name,
+                    secret_env_names=unified.secret_env_names,
                 )
         if args.gateway_user is not None:
             _drop_gateway_privileges(args.gateway_user)
@@ -909,7 +946,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         approvals: PendingApprovals | None = None
         if approver_credentials is not None or oidc_validator is not None:
-            approvals = PendingApprovals(authorizer)
+            if unified.notifications.enabled:
+                notifier = ApprovalWebhookNotifier(
+                    unified.notifications,
+                    allowed_domains=unified.gateway_egress_domains,
+                    canary_tokens=unified.scanner.canary_tokens,
+                )
+            approvals = PendingApprovals(
+                authorizer,
+                on_new_pending=notifier.on_new_pending if notifier is not None else None,
+            )
             approval_server = ApprovalHTTPServer(
                 approvals,
                 approver_credentials,
@@ -954,6 +1000,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if approval_server is not None:
             approval_server.shutdown()
             approval_server.server_close()
+        if notifier is not None:
+            notifier.close()
         if state_store is not None:
             state_store.close()
         if audit_file is not None and not audit_file.closed:

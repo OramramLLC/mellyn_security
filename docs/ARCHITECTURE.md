@@ -122,6 +122,7 @@ V1/
 │       ├── mcp_gateway.py           # Single-session multi-server MCP gateway (stdio + HTTP) & pinned tool hashes
 │       ├── http_gateway.py          # Upstream Streamable HTTP `/mcp` server (`mellyn serve`, HMAC & OIDC)
 │       ├── approvals.py             # Pending approvals store + HTTP approval server
+│       ├── notifications.py         # Outbound redacted approval webhook alerts (Slack, Teams, JSON deep links)
 │       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)
 │       ├── viewer_server.py         # Fail-closed loopback BFF + SPA (VIEWER reads, APPROVER approvals)

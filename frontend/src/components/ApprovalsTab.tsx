@@ -5,6 +5,8 @@ import { StatusBadge } from "./StatusBadge.tsx";
 interface ApprovalsTabProps {
   pending: PendingApproval[];
   isLiveMode: boolean;
+  focusedApprovalId?: string | null;
+  onClearFocus?: () => void;
   onRefresh: (approverKey: string) => Promise<void>;
   onApprove: (
     approvalId: string,
@@ -14,7 +16,15 @@ interface ApprovalsTabProps {
   onReject: (approvalId: string, approverKey: string) => Promise<void>;
 }
 
-export function ApprovalsTab({ pending, isLiveMode, onRefresh, onApprove, onReject }: ApprovalsTabProps) {
+export function ApprovalsTab({
+  pending,
+  isLiveMode,
+  focusedApprovalId = null,
+  onClearFocus,
+  onRefresh,
+  onApprove,
+  onReject,
+}: ApprovalsTabProps) {
   const [approvedBy, setApprovedBy] = useState<string>("security-operator");
   const [ttlSeconds, setTtlSeconds] = useState<number>(300);
   const [maxUses, setMaxUses] = useState<number>(1);
@@ -75,8 +85,32 @@ export function ApprovalsTab({ pending, isLiveMode, onRefresh, onApprove, onReje
     }
   }
 
+  const focusedMatch = focusedApprovalId ? pending.find((item) => item.approval_id === focusedApprovalId) : undefined;
+  const orderedPending =
+    focusedMatch !== undefined
+      ? [focusedMatch, ...pending.filter((item) => item.approval_id !== focusedMatch.approval_id)]
+      : pending;
+
   return (
     <div className="stack-lg">
+      {focusedApprovalId && (
+        <div className="callout-info approval-deeplink-banner">
+          <div>
+            <strong>Deep Link Target:</strong> <code>{focusedApprovalId}</code>.{" "}
+            {isLiveMode
+              ? focusedMatch
+                ? "Highlighted at the top of the approval queue below."
+                : 'Enter your Role.APPROVER key and click "Load / Refresh Queue" to inspect this request.'
+              : 'Connect via "Data Sources & Key" and enter your Role.APPROVER key to load live approvals.'}
+          </div>
+          {onClearFocus && (
+            <button type="button" className="btn btn-secondary" onClick={onClearFocus}>
+              Clear focus
+            </button>
+          )}
+        </div>
+      )}
+
       {!isLiveMode && (
         <div className="callout-info">
           <strong>Offline Sample Mode:</strong> Approvals below are interactive synthetic demos. Connect a live
@@ -153,14 +187,20 @@ export function ApprovalsTab({ pending, isLiveMode, onRefresh, onApprove, onReje
 
         {actionMsg && <div className="callout-neutral">{actionMsg}</div>}
 
-        {pending.length === 0 ? (
+        {orderedPending.length === 0 ? (
           <div className="empty-box">
             <strong>No held calls waiting for approval.</strong>
           </div>
         ) : (
           <div className="stack-md">
-            {pending.map((item) => (
-              <article key={item.approval_id} className="approval-item">
+            {orderedPending.map((item) => {
+              const isFocused = focusedApprovalId === item.approval_id;
+              return (
+                <article
+                  key={item.approval_id}
+                  data-focused={isFocused ? "true" : undefined}
+                  className={`approval-item ${isFocused ? "approval-item-focused" : ""}`}
+                >
                 <div className="approval-head">
                   <div>
                     <div className="approval-title-row">
@@ -200,8 +240,9 @@ export function ApprovalsTab({ pending, isLiveMode, onRefresh, onApprove, onReje
                   ))}
                 </div>
                 <pre className="json-pre">{JSON.stringify(item.arguments, null, 2)}</pre>
-              </article>
-            ))}
+                </article>
+              );
+            })}
           </div>
         )}
       </section>

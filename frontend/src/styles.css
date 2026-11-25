@@ -484,6 +484,19 @@ select {
   background: var(--surface-alt);
 }
 
+.approval-item-focused {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35);
+}
+
+.approval-deeplink-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
 .reasons-box {
   margin: 0.55rem 0;
 }

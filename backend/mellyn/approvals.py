@@ -15,10 +15,11 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -115,9 +116,16 @@ class PendingApproval:
 class PendingApprovals:
     """Thread-safe store of calls waiting for a human. Identical calls share one pending entry."""
 
-    def __init__(self, authorizer: Authorizer, *, max_pending: int = MAX_PENDING) -> None:
+    def __init__(
+        self,
+        authorizer: Authorizer,
+        *,
+        max_pending: int = MAX_PENDING,
+        on_new_pending: Callable[[PendingApproval], None] | None = None,
+    ) -> None:
         self.authorizer = authorizer
         self.max_pending = max_pending
+        self._on_new_pending = on_new_pending
         self._lock = threading.Lock()
         self._pending: dict[str, PendingApproval] = {}
 
@@ -132,6 +140,7 @@ class PendingApprovals:
             request.tool_name,
             canonical_json(request.arguments),
         )
+        created_pending: PendingApproval | None = None
         with self._lock:
             self._expire(check_time)
             for existing in self._pending.values():
@@ -158,7 +167,13 @@ class PendingApprovals:
                 mcp_method=request.mcp_method,
             )
             self._pending[pending.approval_id] = pending
-            return pending
+            created_pending = pending
+        if created_pending is not None and self._on_new_pending is not None:
+            try:
+                self._on_new_pending(created_pending)
+            except Exception as exc:  # noqa: BLE001 - notification failure never breaks approval queueing
+                print(f"Approval notification hook error ({type(exc).__name__}).", file=sys.stderr)
+        return created_pending
 
     def list(self, *, now: datetime | None = None) -> list[PendingApproval]:
         with self._lock:

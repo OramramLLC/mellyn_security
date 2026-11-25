@@ -81,3 +81,14 @@ command = ["replace-with-your-github-mcp-server", "--read-only"]
 # approver_scopes = ["mellyn:approve"]
 # approver_groups = ["security-approvers"]
 # allowed_origins = ["https://console.mellyn.company.internal"]
+
+# Optional outbound redacted approval webhook alerts (Slack / Teams / generic JSON). The webhook URL is a credential,
+# so it is read from the environment (never this file) and withheld from downstream MCP servers. webhook_host is the
+# only host alerts may go to; it is reachable by the gateway (and via Squid) but is not added to the tool egress
+# allowlist, so tools cannot post to other webhooks on the same shared host.
+# [notifications]
+# approval_webhook_url_env = "SLACK_WEBHOOK_URL"
+# webhook_host = "hooks.slack.com"
+# webhook_format = "auto"
+# console_base_url = "https://mellyn.company.internal"
+# timeout_seconds = 5.0

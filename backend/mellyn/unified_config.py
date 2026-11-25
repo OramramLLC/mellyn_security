@@ -18,6 +18,7 @@ from typing import Any, Literal
 from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME, GatewayConfig, ServerSpec, load_gateway_config
 from mellyn.models import RiskTier
+from mellyn.notifications import NotificationsConfig
 from mellyn.oauth_client import OAuthClientConfig, extract_url_host, validate_outbound_url
 from mellyn.oauth_resource import AuthConfig
 from mellyn.policy import (
@@ -31,9 +32,25 @@ from mellyn.scanner import ScannerConfig
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
-_UNIFIED_TOP_KEYS = frozenset({"schema_version", "runtime", "egress", "auth", "policy", "scanner", "servers"})
+_UNIFIED_TOP_KEYS = frozenset(
+    {"schema_version", "runtime", "egress", "auth", "notifications", "policy", "scanner", "servers"}
+)
 _RUNTIME_KEYS = frozenset({"mode", "allow_observe_mode", "state_db", "audit_log"})
 _EGRESS_KEYS = frozenset({"allowed_domains", "auto_sync_squid"})
+_NOTIFICATIONS_KEYS = frozenset(
+    {
+        "approval_webhook_url_env",
+        "webhook_host",
+        "webhook_format",
+        "console_base_url",
+        "timeout_seconds",
+    }
+)
+# A webhook URL is itself the credential (anyone holding it can post to the channel), so it lives in the
+# environment like every other secret, never in mellyn.toml.
+_FORBIDDEN_NOTIFICATION_KEYS = frozenset(
+    {"approval_webhook_url", "webhook_url", "webhook_secret", "signing_secret", "bot_token", "slack_token"}
+)
 _AUTH_KEYS = frozenset(
     {
         "mode",
@@ -107,6 +124,20 @@ class UnifiedConfig:
     scanner: ScannerConfig
     auto_sync_squid: bool = True
     auth: AuthConfig = field(default_factory=AuthConfig)
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    # Hosts only the gateway process contacts (identity provider, approval webhook). Kept out of
+    # `policy.allowed_egress_domains`, which bounds where tools may send data: a shared webhook host such as
+    # hooks.slack.com there would let a tool post to anyone's webhook. Squid still allows them (see egress_proxy).
+    gateway_egress_domains: frozenset[str] = frozenset()
+
+    @property
+    def secret_env_names(self) -> tuple[str, ...]:
+        """Environment variables this config names as secrets; downstream MCP servers must not inherit them."""
+        names: list[str] = list(self.notifications.secret_env_names)
+        for spec in self.gateway.servers:
+            if spec.oauth is not None:
+                names.extend(n for n in (spec.oauth.client_secret_env, spec.oauth.bearer_token_env) if n)
+        return tuple(dict.fromkeys(names))
 
 
 def _require_mapping(raw: Any, label: str) -> Mapping[str, Any]:
@@ -240,6 +271,55 @@ def _parse_auth_section(raw: Any) -> AuthConfig:
         raise PolicyLoadError(f"[auth] configuration invalid: {exc}") from exc
 
 
+def _parse_notifications_section(raw: Any) -> NotificationsConfig:
+    if raw is None:
+        return NotificationsConfig()
+    sec = _require_mapping(raw, "notifications")
+    forbidden = _FORBIDDEN_NOTIFICATION_KEYS & set(sec)
+    if forbidden:
+        raise PolicyLoadError(
+            f"[notifications] must not store secrets {sorted(forbidden)}; a webhook URL is a credential, so put it "
+            "in an environment variable and name it with approval_webhook_url_env."
+        )
+    unknown = set(sec) - _NOTIFICATIONS_KEYS
+    if unknown:
+        raise PolicyLoadError(f"[notifications] contains unknown key(s): {sorted(unknown)}")
+
+    def _opt_notif_str(key: str) -> str | None:
+        if key not in sec:
+            return None
+        val = sec[key]
+        if not isinstance(val, str) or not val.strip():
+            raise PolicyLoadError(f"[notifications].{key} must be a non-empty string.")
+        return val.strip()
+
+    fmt_raw = sec.get("webhook_format", "auto")
+    if not isinstance(fmt_raw, str) or fmt_raw.strip() not in ("auto", "slack", "teams", "generic"):
+        raise PolicyLoadError("[notifications].webhook_format must be 'auto', 'slack', 'teams', or 'generic'.")
+    fmt_clean = fmt_raw.strip()
+    webhook_fmt: Literal["auto", "slack", "teams", "generic"] = (
+        "slack"
+        if fmt_clean == "slack"
+        else ("teams" if fmt_clean == "teams" else ("generic" if fmt_clean == "generic" else "auto"))
+    )
+
+    timeout_raw = sec.get("timeout_seconds", 5.0)
+    if isinstance(timeout_raw, bool) or not isinstance(timeout_raw, int | float):
+        raise PolicyLoadError("[notifications].timeout_seconds must be numeric.")
+
+    try:
+        return NotificationsConfig(
+            approval_webhook_url_env=_opt_notif_str("approval_webhook_url_env"),
+            webhook_host=_opt_notif_str("webhook_host"),
+            webhook_format=webhook_fmt,
+            console_base_url=_opt_notif_str("console_base_url"),
+            timeout_seconds=float(timeout_raw),
+            allow_insecure_loopback_for_tests=False,
+        )
+    except ValueError as exc:
+        raise PolicyLoadError(f"[notifications] configuration invalid: {exc}") from exc
+
+
 def _add_domain_from_url(url: str, seen_domains: set[str], allowed_domains: list[str]) -> None:
     host = extract_url_host(url)
     norm = validate_egress_domain(host)
@@ -319,6 +399,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
     runtime = _parse_runtime_section(data.get("runtime"), base_dir=base_dir)
     scanner = _parse_scanner_section(data.get("scanner"))
     auth = _parse_auth_section(data.get("auth"))
+    notifications = _parse_notifications_section(data.get("notifications"))
 
     egress_raw = data.get("egress")
     allowed_domains: list[str] = []
@@ -339,9 +420,16 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                 seen_domains.add(norm)
                 allowed_domains.append(norm)
 
+    gateway_domains: list[str] = []
+    seen_gateway_domains: set[str] = set()
     if auth.mode == "oidc":
         for auth_url in (*([auth.issuer] if auth.issuer else ()), *([auth.jwks_uri] if auth.jwks_uri else ())):
-            _add_domain_from_url(auth_url, seen_domains, allowed_domains)
+            _add_domain_from_url(auth_url, seen_gateway_domains, gateway_domains)
+    if notifications.webhook_host is not None:
+        host = validate_egress_domain(notifications.webhook_host)
+        if host not in seen_gateway_domains:
+            seen_gateway_domains.add(host)
+            gateway_domains.append(host)
 
     servers_raw = data.get("servers")
     if not isinstance(servers_raw, list) or not servers_raw:
@@ -518,6 +606,8 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
         scanner=scanner,
         auto_sync_squid=auto_sync_squid,
         auth=auth,
+        notifications=notifications,
+        gateway_egress_domains=frozenset(gateway_domains),
     )
 
 
@@ -557,6 +647,15 @@ def load_mellyn_config(path: Path) -> UnifiedConfig:
         scanner=ScannerConfig(),
         auto_sync_squid=True,
     )
+
+
+def load_gateway_egress_domains_any(path: Path) -> frozenset[str]:
+    """Hosts the gateway itself contacts, from a `schema_version = 2` `mellyn.toml` (empty for v1 policy files)."""
+    if path.suffix.lower() == ".toml":
+        data = _read_toml_checked(path)
+        if data.get("schema_version") == 2:
+            return parse_unified_dict(data, base_dir=path.parent.resolve(), config_path=path).gateway_egress_domains
+    return frozenset()
 
 
 def load_policy_any(path: Path) -> PolicyConfig:

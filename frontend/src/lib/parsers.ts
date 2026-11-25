@@ -1112,3 +1112,15 @@ export function validateLoopbackBaseUrl(rawUrl: string): string {
   }
   throw new Error("Plaintext http:// is permitted only for loopback hosts (127.0.0.1, localhost, [::1]).");
 }
+
+const APPROVAL_DEEP_LINK_RE = /^\/approvals\/(apr_[A-Za-z0-9_-]{8,64})\/?$/;
+const APPROVALS_ROUTE_RE = /^\/approvals\/?$/;
+
+export function parseApprovalDeepLink(pathname: string): string | null {
+  const match = APPROVAL_DEEP_LINK_RE.exec(pathname.trim());
+  return match?.[1] ?? null;
+}
+
+export function isApprovalsRoute(pathname: string): boolean {
+  return APPROVALS_ROUTE_RE.test(pathname.trim()) || parseApprovalDeepLink(pathname) !== null;
+}

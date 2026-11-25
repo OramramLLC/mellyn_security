@@ -5,7 +5,9 @@ import {
   RawNumber,
   canonicalJsonString,
   canonicalNumberText,
+  isApprovalsRoute,
   parseAirlockInput,
+  parseApprovalDeepLink,
   parseAssuranceReportJson,
   parseGatewayAuditJsonl,
   parseJsonPreservingNumbers,
@@ -378,4 +380,27 @@ test("verifyGatewayAuditJsonl verifies chained gateway logs and detects tamperin
   assert.equal(resLegacy.chain_valid, null);
   assert.equal(resLegacy.chain_reason, null);
   assert.equal(resLegacy.events.length, 1);
+});
+
+test("parseApprovalDeepLink and isApprovalsRoute accept valid approval routes and reject traversal", () => {
+  assert.equal(parseApprovalDeepLink("/approvals/apr_demo12345678"), "apr_demo12345678");
+  assert.equal(parseApprovalDeepLink("/approvals/apr_A1b2-C3d4_ef/"), "apr_A1b2-C3d4_ef");
+  assert.equal(isApprovalsRoute("/approvals/apr_demo12345678"), true);
+  assert.equal(isApprovalsRoute("/approvals"), true);
+  assert.equal(isApprovalsRoute("/approvals/"), true);
+
+  for (const bad of [
+    "/",
+    "/gateway",
+    "/approvals/not_apr",
+    "/approvals/apr_short",
+    "/approvals/<script>",
+    "/approvals/apr_demo12345678/extra",
+    "/approvals/..",
+  ]) {
+    assert.equal(parseApprovalDeepLink(bad), null, `Expected null for ${bad}`);
+    if (bad !== "/approvals" && bad !== "/approvals/") {
+      assert.equal(isApprovalsRoute(bad), false, `Expected false for ${bad}`);
+    }
+  }
 });

@@ -537,6 +537,19 @@ def _serialize_unified_toml(data: Mapping[str, Any]) -> str:
                 "clock_skew_seconds",
             ),
         )
+    if "notifications" in data and isinstance(data["notifications"], Mapping):
+        _emit_flat_table(
+            lines,
+            "notifications",
+            data["notifications"],
+            (
+                "webhook_host",
+                "approval_webhook_url_env",
+                "webhook_format",
+                "console_base_url",
+                "timeout_seconds",
+            ),
+        )
     if "policy" in data and isinstance(data["policy"], Mapping):
         _serialize_policy_section(lines, data["policy"])
 

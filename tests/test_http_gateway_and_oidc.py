@@ -1209,15 +1209,16 @@ class TestUnifiedAuthConfigAndServeCli(unittest.TestCase):
             self.assertEqual(loaded.auth.mode, "oidc")
             self.assertEqual(loaded.auth.issuer, "https://idp.corp.example/oauth2")
             self.assertEqual(loaded.auth.allowed_origins, ("https://console.corp.example:8443",))
-            self.assertIn("idp.corp.example", loaded.policy.allowed_egress_domains)
-            self.assertIn("keys.corp.example", loaded.policy.allowed_egress_domains)
+            # Identity-provider hosts are for the gateway, not for tools.
+            self.assertEqual(loaded.gateway_egress_domains, frozenset({"idp.corp.example", "keys.corp.example"}))
+            self.assertNotIn("idp.corp.example", loaded.policy.allowed_egress_domains)
 
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = egress_main(["--policy", str(cfg_path), "--output", str(squid_path)])
             self.assertEqual(rc, 0)
             squid_text = squid_path.read_text(encoding="utf-8")
-            self.assertIn(".idp.corp.example", squid_text)
-            self.assertIn(".keys.corp.example", squid_text)
+            self.assertIn("acl gateway_domains dstdomain idp.corp.example", squid_text)
+            self.assertIn("acl gateway_domains dstdomain keys.corp.example", squid_text)
 
             # Pinning a server preserves [auth] cleanly.
             pin_res = GatewayPinResult(

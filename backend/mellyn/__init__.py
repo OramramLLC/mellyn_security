@@ -24,6 +24,13 @@ from mellyn.models import (
     TaintSource,
     ToolCallRequest,
 )
+from mellyn.notifications import (
+    ApprovalAlertSummary,
+    ApprovalWebhookNotifier,
+    NotificationsConfig,
+    build_approval_alert_summary,
+    format_webhook_payload,
+)
 from mellyn.oauth_client import OAuthClientConfig, OAuthError, OAuthToken, OAuthTokenProvider
 from mellyn.oauth_resource import (
     AuthConfig,
@@ -54,7 +61,9 @@ from mellyn.state_store import InMemoryStateStore, SessionLimitError, SqliteStat
 from mellyn.unified_config import UnifiedConfig, load_mellyn_config, load_unified_config
 
 __all__ = [
+    "ApprovalAlertSummary",
     "ApprovalGrant",
+    "ApprovalWebhookNotifier",
     "AuditChainError",
     "AuditEvent",
     "AuditLogger",
@@ -71,6 +80,7 @@ __all__ = [
     "GatewayPinResult",
     "InMemoryStateStore",
     "MCP_CAPABILITY_PRESETS",
+    "NotificationsConfig",
     "OAuthClientConfig",
     "OAuthError",
     "OAuthResourceError",
@@ -98,7 +108,9 @@ __all__ = [
     "ToolCapability",
     "UnifiedConfig",
     "WorkspacePathGuard",
+    "build_approval_alert_summary",
     "build_protected_resource_metadata",
+    "format_webhook_payload",
     "inspect_gateway_server",
     "inspect_remote_gateway_server",
     "load_mellyn_config",

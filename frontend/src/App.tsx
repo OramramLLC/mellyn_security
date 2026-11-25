@@ -21,13 +21,21 @@ import {
   fetchStatus,
   rejectPendingCall,
 } from "./lib/api.ts";
-import { parseAirlockInput, parseAssuranceReportJson, verifyGatewayAuditJsonl } from "./lib/parsers.ts";
+import {
+  isApprovalsRoute,
+  parseAirlockInput,
+  parseApprovalDeepLink,
+  parseAssuranceReportJson,
+  verifyGatewayAuditJsonl,
+} from "./lib/parsers.ts";
 import type { ControlAssuranceReport, GatewayAuditEvent, IncidentReport, PendingApproval } from "./types.ts";
 
 type TabId = "overview" | "airlock" | "gateway" | "approvals";
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<TabId>("overview");
+  const initialPathname = typeof window !== "undefined" ? window.location.pathname : "/";
+  const [activeTab, setActiveTab] = useState<TabId>(isApprovalsRoute(initialPathname) ? "approvals" : "overview");
+  const [focusedApprovalId, setFocusedApprovalId] = useState<string | null>(parseApprovalDeepLink(initialPathname));
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
 
   const [isLiveMode, setIsLiveMode] = useState<boolean>(false);
@@ -151,9 +159,15 @@ export function App() {
       });
       const res = await fetchPendingApprovals(baseUrl, approverKey);
       setPendingApprovals(res.pending);
+      if (focusedApprovalId === approvalId) {
+        setFocusedApprovalId(null);
+      }
       return;
     }
     setPendingApprovals((prev) => prev.filter((item) => item.approval_id !== approvalId));
+    if (focusedApprovalId === approvalId) {
+      setFocusedApprovalId(null);
+    }
   }
 
   async function handleReject(approvalId: string, approverKey: string) {
@@ -161,9 +175,15 @@ export function App() {
       await rejectPendingCall(baseUrl, approverKey, approvalId);
       const res = await fetchPendingApprovals(baseUrl, approverKey);
       setPendingApprovals(res.pending);
+      if (focusedApprovalId === approvalId) {
+        setFocusedApprovalId(null);
+      }
       return;
     }
     setPendingApprovals((prev) => prev.filter((item) => item.approval_id !== approvalId));
+    if (focusedApprovalId === approvalId) {
+      setFocusedApprovalId(null);
+    }
   }
 
   return (
@@ -247,6 +267,8 @@ export function App() {
           <ApprovalsTab
             pending={pendingApprovals}
             isLiveMode={isLiveMode}
+            focusedApprovalId={focusedApprovalId}
+            onClearFocus={() => setFocusedApprovalId(null)}
             onRefresh={async (approverKey: string) => {
               if (isLiveMode) {
                 const res = await fetchPendingApprovals(baseUrl, approverKey);
