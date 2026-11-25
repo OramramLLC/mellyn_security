@@ -25,6 +25,13 @@ from mellyn.models import (
     ToolCallRequest,
 )
 from mellyn.oauth_client import OAuthClientConfig, OAuthError, OAuthToken, OAuthTokenProvider
+from mellyn.oauth_resource import (
+    AuthConfig,
+    AuthenticatedPrincipal,
+    OAuthResourceError,
+    OAuthResourceValidator,
+    build_protected_resource_metadata,
+)
 from mellyn.pin_gateway import (
     GatewayPinError,
     GatewayPinResult,
@@ -51,6 +58,8 @@ __all__ = [
     "AuditChainError",
     "AuditEvent",
     "AuditLogger",
+    "AuthConfig",
+    "AuthenticatedPrincipal",
     "AuthorizationResult",
     "Authorizer",
     "ChainVerificationResult",
@@ -64,6 +73,8 @@ __all__ = [
     "MCP_CAPABILITY_PRESETS",
     "OAuthClientConfig",
     "OAuthError",
+    "OAuthResourceError",
+    "OAuthResourceValidator",
     "OAuthToken",
     "OAuthTokenProvider",
     "PolicyConfig",
@@ -87,6 +98,7 @@ __all__ = [
     "ToolCapability",
     "UnifiedConfig",
     "WorkspacePathGuard",
+    "build_protected_resource_metadata",
     "inspect_gateway_server",
     "inspect_remote_gateway_server",
     "load_mellyn_config",

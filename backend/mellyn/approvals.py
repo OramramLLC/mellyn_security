@@ -18,6 +18,7 @@ import secrets
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -33,6 +34,11 @@ from mellyn.models import (
     canonical_json,
     effective_mcp_method,
     utc_now,
+)
+from mellyn.oauth_resource import (
+    OAuthResourceError,
+    OAuthResourceValidator,
+    build_www_authenticate_challenge,
 )
 
 MAX_PENDING = 100
@@ -202,20 +208,40 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - signature fixed by the stdlib
         """Silence the default per-request stderr logging."""
 
-    def _send(self, status: HTTPStatus, body: dict[str, Any]) -> None:
+    def _send(self, status: int, body: dict[str, Any], *, extra_headers: Mapping[str, str] | None = None) -> None:
         payload = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for key, val in extra_headers.items():
+                self.send_header(key, val)
         self.end_headers()
         self.wfile.write(payload)
 
-    def _authorized(self) -> bool:
-        if not self.server.credentials.verify(self.headers.get(API_KEY_HEADER), Role.APPROVER):
-            self._send(HTTPStatus.FORBIDDEN, {"error": "An approver key is required."})
-            return False
-        return True
+    def _authenticate_approver(self) -> tuple[bool, str | None]:
+        auth_hdr = self.headers.get("Authorization") or ""
+        if auth_hdr.lower().startswith("bearer ") and self.server.oidc_validator is not None:
+            raw_token = auth_hdr[7:].strip()
+            try:
+                principal = self.server.oidc_validator.validate_token(raw_token, require_agent_scopes=False)
+            except OAuthResourceError as exc:
+                chal = build_www_authenticate_challenge(error=exc.oauth_error, scope=exc.required_scope)
+                self._send(exc.http_status, {"error": str(exc)}, extra_headers={"WWW-Authenticate": chal})
+                return (False, None)
+            if Role.APPROVER not in principal.roles:
+                self._send(HTTPStatus.FORBIDDEN, {"error": "Caller identity is not authorized to approve calls."})
+                return (False, None)
+            return (True, principal.display_identity)
+
+        if self.server.credentials is not None and self.server.credentials.verify(
+            self.headers.get(API_KEY_HEADER), Role.APPROVER
+        ):
+            return (True, None)
+
+        self._send(HTTPStatus.FORBIDDEN, {"error": "An approver key or OIDC approver bearer token is required."})
+        return (False, None)
 
     def _read_json(self) -> dict[str, Any] | None:
         try:
@@ -235,7 +261,8 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
         return body
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the stdlib
-        if not self._authorized():
+        allowed, _verified_identity = self._authenticate_approver()
+        if not allowed:
             return
         if parse_approval_route("GET", self.path) is None:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
@@ -243,26 +270,32 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.OK, {"pending": [p.to_json() for p in self.server.approvals.list()]})
 
     def do_POST(self) -> None:  # noqa: N802 - name fixed by the stdlib
-        if not self._authorized():
+        allowed, verified_identity = self._authenticate_approver()
+        if not allowed:
             return
         parsed_route = parse_approval_route("POST", self.path)
-        if parsed_route is None or parsed_route[0] is None:
+        approval_id, action = parsed_route if parsed_route is not None else (None, "")
+        if approval_id is None:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         body = self._read_json()
         if body is None:
             return
-        approval_id, action = parsed_route
         try:
             if action == "reject":
                 self.server.approvals.reject(approval_id)
                 self._send(HTTPStatus.OK, {"approval_id": approval_id, "rejected": True})
                 return
-            approved_by = body.get("approved_by")
+            if verified_identity is not None:
+                # Ignore any caller-supplied approved_by in OIDC mode: bind the verified IdP identity directly.
+                approved_by = verified_identity
+            else:
+                raw_approved_by = body.get("approved_by")
+                if not isinstance(raw_approved_by, str) or not 0 < len(raw_approved_by.strip()) <= 128:
+                    raise ValueError("'approved_by' must be a non-empty string of at most 128 characters.")
+                approved_by = raw_approved_by.strip()
             ttl_seconds = body.get("ttl_seconds", 900)
             max_uses = body.get("max_uses", 1)
-            if not isinstance(approved_by, str) or not 0 < len(approved_by.strip()) <= 128:
-                raise ValueError("'approved_by' must be a non-empty string of at most 128 characters.")
             for name, value, limit in (
                 ("ttl_seconds", ttl_seconds, MAX_GRANT_TTL_SECONDS),
                 ("max_uses", max_uses, MAX_GRANT_USES),
@@ -270,7 +303,7 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
                 if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= limit:
                     raise ValueError(f"'{name}' must be an integer between 1 and {limit}.")
             grant = self.server.approvals.approve(
-                approval_id, approved_by=approved_by.strip(), ttl_seconds=ttl_seconds, max_uses=max_uses
+                approval_id, approved_by=approved_by, ttl_seconds=ttl_seconds, max_uses=max_uses
             )
         except KeyError:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Unknown or expired approval ID."})
@@ -283,6 +316,7 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
             {
                 "approval_id": approval_id,
                 "grant_id": grant.grant_id,
+                "approved_by": grant.approved_by,
                 "max_uses": grant.max_uses,
                 "expires_at": grant.expires_at.isoformat(),
             },
@@ -299,18 +333,22 @@ class ApprovalHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         approvals: PendingApprovals,
-        credentials: CredentialConfig,
+        credentials: CredentialConfig | None = None,
         port: int = 0,
         *,
         host: str = "127.0.0.1",
+        oidc_validator: OAuthResourceValidator | None = None,
     ) -> None:
         # Loopback by default on bare metal; 0.0.0.0 is used only inside an internal-only container behind
         # mellyn-approval-relay. Either way, Role.APPROVER HMAC verification is what authorizes an approval.
         if host not in ALLOWED_BIND_HOSTS:
             raise ValueError(f"ApprovalHTTPServer host must be one of {sorted(ALLOWED_BIND_HOSTS)}, got '{host}'.")
+        if credentials is None and oidc_validator is None:
+            raise ValueError("ApprovalHTTPServer requires HMAC credentials or an oidc_validator (fail closed).")
         super().__init__((host, port), _ApprovalHandler)
         self.approvals = approvals
         self.credentials = credentials
+        self.oidc_validator = oidc_validator
 
     @property
     def url(self) -> str:

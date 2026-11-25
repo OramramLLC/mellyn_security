@@ -675,7 +675,13 @@ class MCPGateway:
         scanner_config: ScannerConfig | None = None,
         mode: Literal["enforce", "observe"] = "enforce",
         allow_observe_mode: bool = False,
+        on_aad: Callable[[], None] | None = None,
     ) -> None:
+        """
+        `on_aad` replaces stopping the downstream servers when AAD fires. A host whose servers are shared by other
+        sessions (the HTTP gateway) passes it to contain only the offending identity; this session is severed either
+        way.
+        """
         if not servers:
             raise ValueError("The gateway needs at least one downstream server.")
         for name in servers:
@@ -695,20 +701,32 @@ class MCPGateway:
         self.allow_observe_mode = allow_observe_mode
         self._quarantined_servers: set[str] = set()
         self._aad_tripped = False
+        self._on_aad = on_aad
         self._resource_owner: dict[str, str | None] = {}  # uri -> server (None when two servers claim it)
 
     # ---- AAD & Scanner helpers -------------------------------------------------------------------
+
+    def sever(self) -> None:
+        """Refuse every later downstream call in this session, without stopping any server."""
+        self._aad_tripped = True
+        self._quarantined_servers.update(self.servers)
 
     def _trigger_aad(self, server_name: str) -> None:
         """
         Sever the whole session, not just `server_name`, as the Airlock does.
 
         A canary in a request means the agent already holds it (response scanning missed it once), so every other
-        server is the obvious next way out. All servers are stopped and every later call is refused.
+        server is the obvious next way out. Every later call is refused, and all servers are stopped unless the host
+        passed `on_aad` (shared servers), in which case the host contains the identity instead.
         """
         del server_name  # the trigger is recorded in the audit log; containment covers every server
-        self._aad_tripped = True
-        self._quarantined_servers.update(self.servers)
+        self.sever()
+        if self._on_aad is not None:
+            try:
+                self._on_aad()
+            except Exception as exc:  # noqa: BLE001 - this session stays severed whatever the host's hook does
+                print(f"AAD: containment hook failed: {exc}", file=sys.stderr)
+            return
         for server in self.servers.values():
             kill_fn = getattr(server, "kill_now", None)
             try:
@@ -767,7 +785,7 @@ class MCPGateway:
             return _jsonrpc_error(
                 req_id,
                 MELLYN_AAD_CONTAINED,
-                "AAD containment severed this session: a canary was detected and every downstream server was stopped.",
+                "AAD containment severed this session: a canary was detected.",
                 {"decision": "aad_fire", "mcp_server": server_name},
             )
         return _jsonrpc_error(

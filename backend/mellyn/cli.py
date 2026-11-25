@@ -32,6 +32,7 @@ _GATEWAY_PIN_PREFIXES = ("--name=", "--config=", "--preset=", "--cwd=", "--url="
 
 _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),
+    "serve": ("mellyn.http_gateway", None),
     "approve": ("mellyn.approve", None),
     "viewer": ("mellyn.viewer_server", None),
     "sync-egress": ("mellyn.egress_proxy", None),
@@ -55,6 +56,7 @@ Setup & Control Plane:
   presets      List curated SMB MCP server presets (filesystem, fetch, github, linear, slack, postgres)
   up           Validate .env + the containers' policy, sync squid.conf from it, and run docker compose up
   proxy        Run the multi-server MCP stdio security gateway
+  serve        Run the upstream Streamable HTTP `/mcp` server (dual-mode HMAC & OIDC)
   approve      List, approve, or reject held gateway calls (Role.APPROVER)
   viewer       Launch the Plane 4 Posture, Audit & Approvals console backend
   sync-egress  Regenerate deploy/egress/squid.conf from a policy TOML/JSON file

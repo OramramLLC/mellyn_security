@@ -69,3 +69,15 @@ command = ["replace-with-your-github-mcp-server", "--read-only"]
 # client_id_env = "GITHUB_OAUTH_CLIENT_ID"
 # scopes = ["repo"]  # request only what the tools need
 # token_cache_path = "/var/lib/mellyn/oauth/remote-github.json"  # one per server, never inside the workspace
+
+# Optional OAuth 2.1 / OIDC authentication for upstream Streamable HTTP (`mellyn serve`; defaults to `hmac`):
+# [auth]
+# mode = "oidc"
+# issuer = "https://accounts.google.com"
+# audience = "https://mellyn.company.internal/mcp"
+# required_scopes = ["mellyn:tools"]  # the agent's token for /mcp
+# # Approvals need a separate token carrying an approver scope; /mcp refuses it, and the approval server refuses
+# # agent tokens. approver_subjects (matched on `sub`, never email) or approver_groups narrow who may hold one.
+# approver_scopes = ["mellyn:approve"]
+# approver_groups = ["security-approvers"]
+# allowed_origins = ["https://console.mellyn.company.internal"]

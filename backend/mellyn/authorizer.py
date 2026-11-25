@@ -32,7 +32,7 @@ from mellyn.policy import (
     ToolCapability,
     validate_argv,
 )
-from mellyn.state_store import AuthorizerStateStore, InMemoryStateStore
+from mellyn.state_store import AuthorizerStateStore, InMemoryStateStore, SessionSnapshot
 from mellyn.state_store import SessionLimitError as SessionLimitError
 
 # MCP resources/read is authorized as a pseudo-tool of this name, with arguments {"uri": ...}.
@@ -114,7 +114,7 @@ class Authorizer:
 
     # ---- Sessions & taint -------------------------------------------------------------------------
 
-    def create_session(self, *, now: datetime | None = None) -> str:
+    def create_session(self, *, now: datetime | None = None, owner_subject: str | None = None) -> str:
         """Issue a new, clean session ID. Only IDs issued here are accepted by authorize()."""
         created = now or utc_now()
         session_id = f"ses_{secrets.token_urlsafe(18)}"
@@ -124,6 +124,7 @@ class Authorizer:
                 now=created,
                 session_ttl_seconds=self.session_ttl_seconds,
                 max_sessions=self.max_sessions,
+                owner_subject=owner_subject,
             )
         return session_id
 
@@ -134,6 +135,23 @@ class Authorizer:
                 now=now or utc_now(),
                 session_ttl_seconds=self.session_ttl_seconds,
             )
+
+    def get_session_snapshot(self, session_id: str, *, now: datetime | None = None) -> SessionSnapshot | None:
+        """Return the immutable session snapshot if active and unexpired, else `None`."""
+        check_time = now or utc_now()
+        with self._lock:
+            if not self._state.has_session(
+                session_id,
+                now=check_time,
+                session_ttl_seconds=self.session_ttl_seconds,
+            ):
+                return None
+            return self._state.get_session_snapshot(session_id)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and any associated taints/grants."""
+        with self._lock:
+            return self._state.delete_session(session_id)
 
     def _safe_origin_for_request(self, request: ToolCallRequest) -> str:
         if request.mcp_server is None:

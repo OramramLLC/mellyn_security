@@ -117,8 +117,10 @@ V1/
 │       ├── legacy_env.py            # Refuses to start while pre-rename variables are still set
 │       ├── gateway_config.py        # Strict loader for the MCP gateway's downstream server list
 │       ├── oauth_client.py          # Stdlib OAuth 2.1 client (PKCE S256, client_credentials, RFC 9728/8414/8707)
+│       ├── oauth_resource.py        # Stdlib OAuth 2.1 Resource Server (JWT/JWKS validator & RFC 9728 metadata)
 │       ├── http_downstream.py       # Streamable HTTP MCP downstream transport (SSE, Mcp-Session-Id, OAuth)
 │       ├── mcp_gateway.py           # Single-session multi-server MCP gateway (stdio + HTTP) & pinned tool hashes
+│       ├── http_gateway.py          # Upstream Streamable HTTP `/mcp` server (`mellyn serve`, HMAC & OIDC)
 │       ├── approvals.py             # Pending approvals store + HTTP approval server
 │       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)

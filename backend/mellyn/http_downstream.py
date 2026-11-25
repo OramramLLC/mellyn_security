@@ -401,13 +401,17 @@ class StreamableHttpDownstream:
             except (OAuthError, urllib.error.URLError, TimeoutError, OSError):
                 return
 
-    def _best_effort_delete(self, session_id: str) -> None:
+    def _best_effort_delete(self, session_id: str, *, auth_header: str | None = None) -> None:
         headers = {"Mcp-Session-Id": session_id, "MCP-Protocol-Version": self._protocol_version}
+        if auth_header is not None:
+            headers["Authorization"] = auth_header
         req = urllib.request.Request(self.url, method="DELETE", headers=headers)  # noqa: S310 - validated URL
         try:
             with self._opener.open(req, timeout=_AAD_DELETE_TIMEOUT_SECONDS):  # noqa: S310 - validated URL
                 pass
-        except (OAuthError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        except urllib.error.HTTPError as exc:
+            exc.close()
+        except (OAuthError, urllib.error.URLError, TimeoutError, OSError):
             pass
 
     def _terminate(self, *, sever: bool) -> None:
@@ -418,13 +422,16 @@ class StreamableHttpDownstream:
                 self._closed = True
             sid = self._session_id
             self._session_id = None
+        delete_auth_header: str | None = None
         if self.oauth_provider is not None:
             if sever:
                 self.oauth_provider.clear_tokens()  # AAD: the cached credential goes too
             else:
+                if sid is not None:
+                    delete_auth_header = self.oauth_provider.peek_authorization_header()
                 self.oauth_provider.forget_in_memory()  # clean close: keep the cache for the next start
         if sid is not None:
-            self._best_effort_delete(sid)
+            self._best_effort_delete(sid, auth_header=delete_auth_header)
 
     def kill_now(self) -> None:
         """Immediately sever transport, wipe OAuth tokens, and terminate the remote session (AAD)."""

@@ -22,10 +22,15 @@ gateway = [
     "uvicorn>=0.32.0",
     "httpx>=0.28.0",
 ]
+# EC (ES256/384/512) and EdDSA ID-provider keys for `mellyn serve` OIDC; RSA keys need only the standard library.
+oidc = [
+    "cryptography>=50.0.2",
+]
 dev = [
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     "httpx>=0.28.0",
+    "cryptography>=50.0.2",
     "pytest>=8.3.0",
     "mypy>=1.13.0",
     "ruff>=0.8.0",

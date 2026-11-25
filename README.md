@@ -76,6 +76,7 @@ mellyn pin --name github --url https://api.githubcopilot.com/mcp/ --oauth-flow p
 mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
 mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
 mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl
+mellyn serve --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl  # optional HTTP `/mcp` (HMAC/OIDC)
 mellyn verify mellyn-audit.jsonl --json              # auto-detects Gateway or Airlock hash-chained ledgers
 ```
 

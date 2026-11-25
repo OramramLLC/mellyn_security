@@ -11,7 +11,7 @@ import json
 import re
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,6 +19,7 @@ from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME, GatewayConfig, ServerSpec, load_gateway_config
 from mellyn.models import RiskTier
 from mellyn.oauth_client import OAuthClientConfig, extract_url_host, validate_outbound_url
+from mellyn.oauth_resource import AuthConfig
 from mellyn.policy import (
     SMB_SERVER_PRESETS,
     PolicyConfig,
@@ -30,9 +31,28 @@ from mellyn.scanner import ScannerConfig
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
-_UNIFIED_TOP_KEYS = frozenset({"schema_version", "runtime", "egress", "policy", "scanner", "servers"})
+_UNIFIED_TOP_KEYS = frozenset({"schema_version", "runtime", "egress", "auth", "policy", "scanner", "servers"})
 _RUNTIME_KEYS = frozenset({"mode", "allow_observe_mode", "state_db", "audit_log"})
 _EGRESS_KEYS = frozenset({"allowed_domains", "auto_sync_squid"})
+_AUTH_KEYS = frozenset(
+    {
+        "mode",
+        "issuer",
+        "audience",
+        "resource",
+        "jwks_uri",
+        "required_scopes",
+        "approver_scopes",
+        "approver_subjects",
+        "approver_groups",
+        "allowed_origins",
+        "allowed_hosts",
+        "clock_skew_seconds",
+    }
+)
+_FORBIDDEN_AUTH_RAW_KEYS = frozenset(
+    {"client_secret", "hmac_secret", "pepper", "signing_key", "private_key", "jwt_secret"}
+)
 _SCANNER_KEYS = frozenset({"canary_tokens", "block_known_secrets", "aad_kill_on_leak", "blocked_patterns"})
 _SERVER_KEYS = frozenset({"name", "transport", "preset", "trusted", "command", "url", "oauth", "tools_sha256"})
 _OAUTH_KEYS = frozenset(
@@ -86,6 +106,7 @@ class UnifiedConfig:
     runtime: RuntimeConfig
     scanner: ScannerConfig
     auto_sync_squid: bool = True
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 def _require_mapping(raw: Any, label: str) -> Mapping[str, Any]:
@@ -171,6 +192,54 @@ def _parse_scanner_section(raw: Any) -> ScannerConfig:
         raise PolicyLoadError(f"[scanner] configuration invalid: {exc}") from exc
 
 
+def _parse_auth_section(raw: Any) -> AuthConfig:
+    if raw is None:
+        return AuthConfig()
+    sec = _require_mapping(raw, "auth")
+    forbidden = _FORBIDDEN_AUTH_RAW_KEYS & set(sec)
+    if forbidden:
+        raise PolicyLoadError(f"[auth] must not store raw secret fields {sorted(forbidden)}.")
+    unknown = set(sec) - _AUTH_KEYS
+    if unknown:
+        raise PolicyLoadError(f"[auth] contains unknown key(s): {sorted(unknown)}")
+
+    mode_raw = sec.get("mode", "hmac")
+    if not isinstance(mode_raw, str) or mode_raw.strip() not in ("hmac", "oidc"):
+        raise PolicyLoadError("[auth].mode must be 'hmac' or 'oidc'.")
+    mode_val: Literal["hmac", "oidc"] = "oidc" if mode_raw.strip() == "oidc" else "hmac"
+
+    def _opt_auth_str(key: str) -> str | None:
+        if key not in sec:
+            return None
+        val = sec[key]
+        if not isinstance(val, str) or not val.strip():
+            raise PolicyLoadError(f"[auth].{key} must be a non-empty string.")
+        return val.strip()
+
+    skew = sec.get("clock_skew_seconds", 60)
+    if isinstance(skew, bool) or not isinstance(skew, int):
+        raise PolicyLoadError("[auth].clock_skew_seconds must be an integer.")
+
+    try:
+        return AuthConfig(
+            mode=mode_val,
+            issuer=_opt_auth_str("issuer"),
+            audience=_opt_auth_str("audience"),
+            resource=_opt_auth_str("resource"),
+            jwks_uri=_opt_auth_str("jwks_uri"),
+            required_scopes=tuple(_require_str_list(sec, "required_scopes", "auth")),
+            approver_scopes=tuple(_require_str_list(sec, "approver_scopes", "auth")),
+            approver_subjects=tuple(_require_str_list(sec, "approver_subjects", "auth")),
+            approver_groups=tuple(_require_str_list(sec, "approver_groups", "auth")),
+            allowed_origins=tuple(_require_str_list(sec, "allowed_origins", "auth")),
+            allowed_hosts=tuple(_require_str_list(sec, "allowed_hosts", "auth")),
+            clock_skew_seconds=skew,
+            allow_insecure_loopback_for_tests=False,
+        )
+    except ValueError as exc:
+        raise PolicyLoadError(f"[auth] configuration invalid: {exc}") from exc
+
+
 def _add_domain_from_url(url: str, seen_domains: set[str], allowed_domains: list[str]) -> None:
     host = extract_url_host(url)
     norm = validate_egress_domain(host)
@@ -249,6 +318,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
 
     runtime = _parse_runtime_section(data.get("runtime"), base_dir=base_dir)
     scanner = _parse_scanner_section(data.get("scanner"))
+    auth = _parse_auth_section(data.get("auth"))
 
     egress_raw = data.get("egress")
     allowed_domains: list[str] = []
@@ -268,6 +338,10 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
             if norm not in seen_domains:
                 seen_domains.add(norm)
                 allowed_domains.append(norm)
+
+    if auth.mode == "oidc":
+        for auth_url in (*([auth.issuer] if auth.issuer else ()), *([auth.jwks_uri] if auth.jwks_uri else ())):
+            _add_domain_from_url(auth_url, seen_domains, allowed_domains)
 
     servers_raw = data.get("servers")
     if not isinstance(servers_raw, list) or not servers_raw:
@@ -443,6 +517,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
         runtime=runtime,
         scanner=scanner,
         auto_sync_squid=auto_sync_squid,
+        auth=auth,
     )
 
 

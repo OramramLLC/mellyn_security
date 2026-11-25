@@ -15,12 +15,17 @@ from typing import Any, Protocol
 
 from mellyn.models import ApprovalGrant, TaintSource
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 _UTC_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
+_V1_SESSION_COLUMNS: frozenset[str] = frozenset(
+    {"session_id", "created_at_us", "last_seen_at_us", "tainted", "taint_count"}
+)
 _REQUIRED_SCHEMA_COLUMNS: dict[str, frozenset[str]] = {
     "schema_meta": frozenset({"key", "value"}),
-    "sessions": frozenset({"session_id", "created_at_us", "last_seen_at_us", "tainted", "taint_count"}),
+    "sessions": frozenset(
+        {"session_id", "created_at_us", "last_seen_at_us", "tainted", "taint_count", "owner_subject"}
+    ),
     "session_taints": frozenset({"id", "session_id", "source_type", "origin", "recorded_at_us", "formatted_entry"}),
     "grants": frozenset(
         {
@@ -51,7 +56,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at_us INTEGER NOT NULL,
     last_seen_at_us INTEGER NOT NULL,
     tainted INTEGER NOT NULL CHECK (tainted IN (0, 1)),
-    taint_count INTEGER NOT NULL CHECK (taint_count >= 0)
+    taint_count INTEGER NOT NULL CHECK (taint_count >= 0),
+    owner_subject TEXT
 )
 """
 
@@ -126,6 +132,7 @@ class SessionSnapshot:
     taint_count: int
     taint_sample: tuple[TaintSource, ...]
     taint_entries: tuple[str, ...]
+    owner_subject: str | None = None
 
 
 def _dt_to_us(value: datetime) -> int:
@@ -149,7 +156,10 @@ class AuthorizerStateStore(Protocol):
         now: datetime,
         session_ttl_seconds: int | None,
         max_sessions: int,
+        owner_subject: str | None = None,
     ) -> None: ...
+
+    def delete_session(self, session_id: str) -> bool: ...
 
     def has_session(
         self,
@@ -206,6 +216,7 @@ class _InMemorySessionRecord:
     taint_count: int = 0
     taint_sample: deque[TaintSource] = field(default_factory=deque)
     taint_entries: deque[str] = field(default_factory=deque)
+    owner_subject: str | None = None
 
 
 class InMemoryStateStore:
@@ -247,6 +258,7 @@ class InMemoryStateStore:
             taint_count=state.taint_count,
             taint_sample=tuple(state.taint_sample),
             taint_entries=tuple(state.taint_entries),
+            owner_subject=state.owner_subject,
         )
 
     def create_session(
@@ -256,13 +268,24 @@ class InMemoryStateStore:
         now: datetime,
         session_ttl_seconds: int | None,
         max_sessions: int,
+        owner_subject: str | None = None,
     ) -> None:
         with self._lock:
             self._prune_sessions_locked(now, session_ttl_seconds)
             # Refuse rather than evict: evicting active sessions would enable DoS across callers.
             if len(self._sessions) >= max_sessions:
                 raise SessionLimitError(f"Session limit ({max_sessions}) reached; try again later.")
-            self._sessions[session_id] = _InMemorySessionRecord(created_at=now, last_seen_at=now)
+            self._sessions[session_id] = _InMemorySessionRecord(
+                created_at=now,
+                last_seen_at=now,
+                owner_subject=owner_subject,
+            )
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock:
+            existed = session_id in self._sessions
+            self._evict_session_locked(session_id)
+            return existed
 
     def has_session(
         self,
@@ -535,15 +558,31 @@ class SqliteStateStore:
             )
 
         version_row = conn.execute("SELECT value FROM schema_meta WHERE key = ?", ("schema_version",)).fetchone()
-        if version_row is None or version_row[0] != str(STATE_SCHEMA_VERSION):
-            found = None if version_row is None else version_row[0]
-            raise StateStoreError(f"Unsupported state schema_version {found!r}; expected '{STATE_SCHEMA_VERSION}'.")
-
-        self._verify_table_columns(conn)
+        version_str = None if version_row is None else version_row[0]
+        if version_str == "1":
+            self._verify_table_columns(conn, sessions_override=_V1_SESSION_COLUMNS)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "owner_subject" not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN owner_subject TEXT")
+            conn.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = ?",
+                (str(STATE_SCHEMA_VERSION), "schema_version"),
+            )
+            self._verify_table_columns(conn)
+        elif version_str == str(STATE_SCHEMA_VERSION):
+            self._verify_table_columns(conn)
+        else:
+            raise StateStoreError(
+                f"Unsupported state schema_version {version_str!r}; expected '{STATE_SCHEMA_VERSION}'."
+            )
         conn.execute("COMMIT")
 
     @staticmethod
-    def _verify_table_columns(conn: sqlite3.Connection) -> None:
+    def _verify_table_columns(
+        conn: sqlite3.Connection,
+        *,
+        sessions_override: frozenset[str] | None = None,
+    ) -> None:
         pragma_queries = (
             ("schema_meta", "PRAGMA table_info(schema_meta)"),
             ("sessions", "PRAGMA table_info(sessions)"),
@@ -552,7 +591,11 @@ class SqliteStateStore:
         )
         for table_name, pragma_sql in pragma_queries:
             cols = {row[1] for row in conn.execute(pragma_sql).fetchall()}
-            expected = _REQUIRED_SCHEMA_COLUMNS[table_name]
+            expected = (
+                sessions_override
+                if table_name == "sessions" and sessions_override is not None
+                else _REQUIRED_SCHEMA_COLUMNS[table_name]
+            )
             if not expected <= cols:
                 missing = sorted(expected - cols)
                 raise StateStoreError(f"State table '{table_name}' is missing required columns: {missing}")
@@ -587,7 +630,8 @@ class SqliteStateStore:
     @staticmethod
     def _load_snapshot_conn(conn: sqlite3.Connection, session_id: str) -> SessionSnapshot | None:
         row = conn.execute(
-            "SELECT created_at_us, last_seen_at_us, tainted, taint_count FROM sessions WHERE session_id = ?",
+            "SELECT created_at_us, last_seen_at_us, tainted, taint_count, owner_subject "
+            "FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
@@ -607,6 +651,7 @@ class SqliteStateStore:
             taint_count=int(row[3]),
             taint_sample=sample,
             taint_entries=entries,
+            owner_subject=None if row[4] is None else str(row[4]),
         )
 
     def create_session(
@@ -616,6 +661,7 @@ class SqliteStateStore:
         now: datetime,
         session_ttl_seconds: int | None,
         max_sessions: int,
+        owner_subject: str | None = None,
     ) -> None:
         now_us = _dt_to_us(now)
         with self._lock, self._write_tx() as conn:
@@ -625,10 +671,16 @@ class SqliteStateStore:
             if active >= max_sessions:
                 raise SessionLimitError(f"Session limit ({max_sessions}) reached; try again later.")
             conn.execute(
-                "INSERT INTO sessions (session_id, created_at_us, last_seen_at_us, tainted, taint_count) "
-                "VALUES (?, ?, ?, 0, 0)",
-                (session_id, now_us, now_us),
+                "INSERT INTO sessions "
+                "(session_id, created_at_us, last_seen_at_us, tainted, taint_count, owner_subject) "
+                "VALUES (?, ?, ?, 0, 0, ?)",
+                (session_id, now_us, now_us, owner_subject),
             )
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock, self._write_tx() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            return cur.rowcount == 1
 
     def has_session(
         self,

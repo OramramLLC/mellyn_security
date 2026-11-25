@@ -517,6 +517,26 @@ def _serialize_unified_toml(data: Mapping[str, Any]) -> str:
             data["scanner"],
             ("canary_tokens", "block_known_secrets", "aad_kill_on_leak", "blocked_patterns"),
         )
+    if "auth" in data and isinstance(data["auth"], Mapping):
+        _emit_flat_table(
+            lines,
+            "auth",
+            data["auth"],
+            (
+                "mode",
+                "issuer",
+                "audience",
+                "resource",
+                "jwks_uri",
+                "required_scopes",
+                "approver_scopes",
+                "approver_subjects",
+                "approver_groups",
+                "allowed_origins",
+                "allowed_hosts",
+                "clock_skew_seconds",
+            ),
+        )
     if "policy" in data and isinstance(data["policy"], Mapping):
         _serialize_policy_section(lines, data["policy"])
 

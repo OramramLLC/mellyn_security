@@ -1087,6 +1087,13 @@ class OAuthTokenProvider:
         with self._lock:
             self._token = None
 
+    def peek_authorization_header(self) -> str | None:
+        """Return an unexpired in-memory `"Bearer <token>"` without network I/O, or `None`."""
+        with self._lock:
+            if self._token is not None and not self._token.is_expired():
+                return f"Bearer {self._token.access_token}"
+            return None
+
 
 __all__ = [
     "DEFAULT_OAUTH_TIMEOUT_SECONDS",
