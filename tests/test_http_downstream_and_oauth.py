@@ -1115,16 +1115,18 @@ class TestUnifiedConfigAndRemotePin(unittest.TestCase):
             if srv.oauth is not None:
                 self.assertEqual(srv.oauth.flow, "client_credentials")
                 self.assertEqual(srv.oauth.scopes, ("repo:read",))
-            for expected_domain in ("api.github.com", "remote.example", "auth.example", "token.example"):
-                self.assertIn(expected_domain, loaded.policy.allowed_egress_domains)
+            # The preset's domain is for tools; the remote server and its OAuth hosts are for the gateway only.
+            self.assertIn("api.github.com", loaded.policy.allowed_egress_domains)
+            for gateway_domain in ("remote.example", "auth.example", "token.example"):
+                self.assertIn(gateway_domain, loaded.gateway_egress_domains)
+                self.assertNotIn(gateway_domain, loaded.policy.allowed_egress_domains)
 
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = egress_main(["--policy", str(cfg_path), "--output", str(squid_path)])
             self.assertEqual(rc, 0)
             squid_conf = squid_path.read_text(encoding="utf-8")
-            self.assertIn(".remote.example", squid_conf)
-            self.assertIn(".auth.example", squid_conf)
-            self.assertIn(".token.example", squid_conf)
+            for gateway_domain in ("remote.example", "auth.example", "token.example"):
+                self.assertIn(f"acl gateway_domains dstdomain {gateway_domain}", squid_conf)
 
     def test_unified_config_fail_closed_rejections(self) -> None:
         bad_server_blocks = [
@@ -1342,7 +1344,8 @@ client_secret_env = "MELLYN_SECRET"
                 self.assertNotIn("GH_CLIENT_ID", raw_text)
                 loaded2 = load_unified_config(cfg_path)
                 self.assertEqual(loaded2.policy.pinned_tool_hashes["remote-gh"], "b" * 64)
-                self.assertIn("auth2.example", loaded2.policy.allowed_egress_domains)
+                self.assertIn("auth2.example", loaded2.gateway_egress_domains)
+                self.assertNotIn("auth2.example", loaded2.policy.allowed_egress_domains)
 
                 # Fail-closed CLI flag and scheme rejections for `mellyn pin --url ...`
                 work_dir = str(root / "work")

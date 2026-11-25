@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Literal, Protocol, TextIO
 
@@ -140,14 +140,22 @@ _EOF = object()
 SECRET_ENV_PREFIXES = ("MELLYN_", LEGACY_ENV_PREFIX)
 
 
-def downstream_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+def downstream_environment(
+    environ: Mapping[str, str] | None = None, *, secret_names: Iterable[str] = ()
+) -> dict[str, str]:
     """
-    The environment for downstream MCP servers: the gateway's own, minus every MELLYN_* variable and every
-    variable with the pre-rename prefix. The pepper and key digests are the gateway's secrets; the servers it
-    launches are untrusted and must not see them, whichever name a deployment set them under.
+    The environment for downstream MCP servers: the gateway's own, minus every MELLYN_* variable, every variable
+    with the pre-rename prefix, and every variable the config names as a secret (`secret_names`: OAuth client
+    secrets and bearer tokens). The servers the gateway launches are untrusted and must not see the gateway's
+    credentials, whichever name a deployment set them under.
     """
     source = os.environ if environ is None else environ
-    return {key: value for key, value in source.items() if not key.upper().startswith(SECRET_ENV_PREFIXES)}
+    withheld = {name.upper() for name in secret_names}
+    return {
+        key: value
+        for key, value in source.items()
+        if not key.upper().startswith(SECRET_ENV_PREFIXES) and key.upper() not in withheld
+    }
 
 
 def _valid_request_id(req_id: Any) -> bool:
@@ -399,6 +407,7 @@ class StdioDownstream:
         max_inbox_bytes: int = DEFAULT_MAX_INBOX_BYTES,
         writer: Callable[[bytes], None] | None = None,
         env: Mapping[str, str] | None = None,
+        secret_env_names: Iterable[str] = (),
     ) -> None:
         if not argv:
             raise ValueError(f"Server '{name}' requires a non-empty command argv.")
@@ -412,7 +421,7 @@ class StdioDownstream:
         self._writer_thread: threading.Thread | None = None
         self._closed = False
 
-        child_env = downstream_environment(env)
+        child_env = downstream_environment(env, secret_names=secret_env_names)
         if child_home is not None:
             child_env["HOME"] = child_home
         if child_username is not None:
@@ -1419,6 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                     child_home=ds_home,
                     child_username=ds_name,
                     on_notification=on_notification,
+                    secret_env_names=unified.secret_env_names,
                 )
         if args.gateway_user is not None:
             _drop_gateway_privileges(args.gateway_user)
@@ -1430,7 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
                     spec.name,
                     spec.url,
                     oauth_config=spec.oauth,
-                    allowed_domains=policy.allowed_egress_domains,
+                    allowed_domains=policy.allowed_egress_domains | unified.gateway_egress_domains,
                     on_notification=on_notification,
                 )
 

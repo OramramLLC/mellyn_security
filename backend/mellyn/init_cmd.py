@@ -19,7 +19,12 @@ from mellyn.legacy_env import check_no_legacy_env
 from mellyn.models import RiskTier
 from mellyn.policy import SMB_SERVER_PRESETS, ServerPresetProfile
 from mellyn.policy_loader import PolicyLoadError, load_policy_file, parse_policy_dict
-from mellyn.unified_config import load_policy_any, load_unified_config, render_unified_config
+from mellyn.unified_config import (
+    load_gateway_egress_domains_any,
+    load_policy_any,
+    load_unified_config,
+    render_unified_config,
+)
 
 
 class InitError(RuntimeError):
@@ -336,7 +341,9 @@ def init_workspace(
         unified_text = render_unified_config(presets, extra_domains=extra_domains, canary_tokens=canary_tokens)
         mellyn_cfg_path.write_text(unified_text, encoding="utf-8", newline="\n")
         # Round-trip load generated config so fail-closed errors surface immediately.
-        loaded_policy = load_unified_config(mellyn_cfg_path).policy
+        loaded_unified = load_unified_config(mellyn_cfg_path)
+        loaded_policy = loaded_unified.policy
+        gateway_domains: frozenset[str] = loaded_unified.gateway_egress_domains
         result_policy: Path | None = None
         result_gateway: Path | None = None
         result_unified: Path | None = mellyn_cfg_path
@@ -347,6 +354,7 @@ def init_workspace(
         gateway_path.write_text(gateway_text, encoding="utf-8", newline="\n")
         # Round-trip load generated files so fail-closed errors surface immediately.
         loaded_policy = load_policy_file(policy_path)
+        gateway_domains = frozenset()
         load_gateway_config(gateway_path)
         result_policy = policy_path
         result_gateway = gateway_path
@@ -354,7 +362,9 @@ def init_workspace(
 
     if effective_squid_path is not None:
         effective_squid_path.parent.mkdir(parents=True, exist_ok=True)
-        effective_squid_path.write_text(generate_squid_config(loaded_policy), encoding="utf-8", newline="\n")
+        effective_squid_path.write_text(
+            generate_squid_config(loaded_policy, gateway_domains=gateway_domains), encoding="utf-8", newline="\n"
+        )
 
     return InitResult(
         env_path=env_path,
@@ -464,9 +474,10 @@ def run_up(
         )
     try:
         policy = load_policy_any(stack_policy)
+        gateway_domains = load_gateway_egress_domains_any(stack_policy)
     except PolicyLoadError as exc:
         raise InitError(f"Policy rejected: {exc}") from exc
-    squid_text = generate_squid_config(policy)
+    squid_text = generate_squid_config(policy, gateway_domains=gateway_domains)
 
     argv: list[str] = ["docker", "compose"]
     if env_file is not None:

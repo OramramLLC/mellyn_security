@@ -86,6 +86,20 @@ class UnifiedConfig:
     runtime: RuntimeConfig
     scanner: ScannerConfig
     auto_sync_squid: bool = True
+    # Hosts only the gateway process contacts: remote MCP servers and their OAuth authorization servers and token
+    # endpoints. Kept out of `policy.allowed_egress_domains`, which bounds where tools may send data: a shared host
+    # such as github.com there would let any tool send data to an attacker's own account on it. Squid still allows
+    # them (see egress_proxy).
+    gateway_egress_domains: frozenset[str] = frozenset()
+
+    @property
+    def secret_env_names(self) -> tuple[str, ...]:
+        """Environment variables this config names as secrets; downstream MCP servers must not inherit them."""
+        names: list[str] = []
+        for spec in self.gateway.servers:
+            if spec.oauth is not None:
+                names.extend(n for n in (spec.oauth.client_secret_env, spec.oauth.bearer_token_env) if n)
+        return tuple(dict.fromkeys(names))
 
 
 def _require_mapping(raw: Any, label: str) -> Mapping[str, Any]:
@@ -269,6 +283,9 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                 seen_domains.add(norm)
                 allowed_domains.append(norm)
 
+    gateway_domains: list[str] = []
+    seen_gateway_domains: set[str] = set()
+
     servers_raw = data.get("servers")
     if not isinstance(servers_raw, list) or not servers_raw:
         raise PolicyLoadError("Unified config requires at least one [[servers]] entry.")
@@ -331,7 +348,9 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                 server_url = validate_outbound_url(url_raw, allow_loopback_http=False)
             except ValueError as exc:
                 raise PolicyLoadError(f"servers[{idx}] ({name}).url rejected: {exc}") from exc
-            _add_domain_from_url(server_url, seen_domains, allowed_domains)
+            # The gateway connects to remote servers and their authorization servers itself; tools never need
+            # to. In the tool policy, a shared host (github.com, a cloud IdP) would be open to every tool.
+            _add_domain_from_url(server_url, seen_gateway_domains, gateway_domains)
 
             oauth_raw = entry.get("oauth")
             if oauth_raw is not None:
@@ -342,7 +361,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                     *([oauth_cfg.token_endpoint] if oauth_cfg.token_endpoint else ()),
                     *([oauth_cfg.authorization_endpoint] if oauth_cfg.authorization_endpoint else ()),
                 ):
-                    _add_domain_from_url(oauth_url, seen_domains, allowed_domains)
+                    _add_domain_from_url(oauth_url, seen_gateway_domains, gateway_domains)
 
         trusted = _require_bool(entry, "trusted", False, f"servers[{idx}]")
 
@@ -443,6 +462,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
         runtime=runtime,
         scanner=scanner,
         auto_sync_squid=auto_sync_squid,
+        gateway_egress_domains=frozenset(gateway_domains),
     )
 
 
@@ -482,6 +502,15 @@ def load_mellyn_config(path: Path) -> UnifiedConfig:
         scanner=ScannerConfig(),
         auto_sync_squid=True,
     )
+
+
+def load_gateway_egress_domains_any(path: Path) -> frozenset[str]:
+    """Hosts the gateway itself contacts, from a `schema_version = 2` `mellyn.toml` (empty for v1 policy files)."""
+    if path.suffix.lower() == ".toml":
+        data = _read_toml_checked(path)
+        if data.get("schema_version") == 2:
+            return parse_unified_dict(data, base_dir=path.parent.resolve(), config_path=path).gateway_egress_domains
+    return frozenset()
 
 
 def load_policy_any(path: Path) -> PolicyConfig:
