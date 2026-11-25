@@ -95,6 +95,23 @@ def compute_audit_entry_hash(event_dict: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Characters Python's str.splitlines() treats as line breaks but json.dumps(ensure_ascii=False) leaves raw. Written
+# unescaped, one of them inside a logged string split that record in two on read, so the whole ledger failed
+# verification and the next start refused. They are escaped on write, and ledgers are split on "\n" only.
+_LINE_BREAK_ESCAPES = str.maketrans({"\u0085": "\\u0085", " ": "\\u2028", " ": "\\u2029"})
+_CHAIN_FIELDS = ("seq", "prev_hash", "entry_hash")
+
+
+def _dump_audit_line(record: Mapping[str, Any]) -> str:
+    """One JSON line for the ledger. Escaping the line-break characters changes the text, not the parsed value."""
+    return json.dumps(record, sort_keys=True, ensure_ascii=False).translate(_LINE_BREAK_ESCAPES)
+
+
+def split_audit_lines(text: str) -> list[str]:
+    """Split a ledger into records on "\\n" only; the verifier strips any trailing "\\r"."""
+    return text.split("\n")
+
+
 def _strict_json_loads(raw_line: str) -> Any:
     def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -193,10 +210,49 @@ def verify_gateway_audit_file(path: Path) -> ChainVerificationResult:
     if not path.is_file():
         raise AuditChainError(f"Audit log file does not exist: '{path}'.")
     try:
-        raw_lines = path.read_bytes().decode("utf-8").splitlines()
+        raw_lines = split_audit_lines(path.read_bytes().decode("utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         raise AuditChainError(f"Unable to read audit log '{path}': {exc}") from exc
     return verify_gateway_audit_lines(raw_lines)
+
+
+def _is_legacy_unchained_log(path: Path) -> bool:
+    """
+    True only for a log written before the hash chain existed: every record is a JSON object and none carries any
+    chain field. A file with even one chained record, or anything unparseable, is not legacy.
+    """
+    try:
+        lines = split_audit_lines(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return False
+    records = 0
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            obj = _strict_json_loads(stripped)
+        except (ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(obj, dict) or any(field in obj for field in _CHAIN_FIELDS):
+            return False
+        records += 1
+    return records > 0
+
+
+def _rotate_legacy_log(path: Path) -> Path:
+    """Rename a legacy log to `<name>.pre-chain-<UTC time>[-N]` in the same folder, never overwriting anything."""
+    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    target = path.with_name(f"{path.name}.pre-chain-{stamp}")
+    counter = 1
+    while target.exists() or target.is_symlink():
+        target = path.with_name(f"{path.name}.pre-chain-{stamp}-{counter}")
+        counter += 1
+    try:
+        path.rename(target)
+    except OSError as exc:
+        raise AuditChainError(f"Could not move the unchained audit log '{path}' aside: {exc}") from exc
+    return target
 
 
 @dataclass(frozen=True)
@@ -248,6 +304,8 @@ class AuditLogger:
         self._next_seq = start_seq
         self._last_hash = prev_hash
         self._enforcement_mode = enforcement_mode
+        # Set by open_chained() when it moved an unchained 1.0.0 log aside; callers report it to the operator.
+        self.rotated_legacy_path: Path | None = None
 
     @classmethod
     def open_chained(
@@ -267,11 +325,16 @@ class AuditLogger:
 
         start_seq = 0
         prev_hash = GENESIS_PREV_HASH
+        rotated_from: Path | None = None
         if path.exists():
             res = verify_gateway_audit_file(path)
             if not res.valid:
-                raise AuditChainError(res.reason or f"Existing audit log '{path}' failed hash-chain check.")
-            if res.last_seq is not None:
+                if not _is_legacy_unchained_log(path):
+                    raise AuditChainError(res.reason or f"Existing audit log '{path}' failed hash-chain check.")
+                # A 1.0.0 log has no chain to verify, so it cannot be appended to. Keep it, unchanged, beside the new
+                # ledger. Anything partly chained is not legacy and still fails closed above.
+                rotated_from = _rotate_legacy_log(path)
+            elif res.last_seq is not None:
                 start_seq = res.last_seq + 1
                 prev_hash = res.last_hash
 
@@ -280,16 +343,38 @@ class AuditLogger:
         handle = os.fdopen(fd, "a", encoding="utf-8")
         if os.name == "posix" and path.exists() and not path.is_symlink():
             os.chmod(path, 0o600)
-        return (
-            cls(
-                sink=handle,
-                canary_tokens=canary_tokens,
-                start_seq=start_seq,
-                prev_hash=prev_hash,
-                enforcement_mode=enforcement_mode,
-            ),
-            handle,
+        logger = cls(
+            sink=handle,
+            canary_tokens=canary_tokens,
+            start_seq=start_seq,
+            prev_hash=prev_hash,
+            enforcement_mode=enforcement_mode,
         )
+        logger.rotated_legacy_path = rotated_from
+        if rotated_from is not None:
+            # First record of the new chain, so the move itself is tamper-evident.
+            logger._emit(
+                AuditEvent(
+                    audit_id=f"aud_{secrets.token_hex(12)}",
+                    timestamp=utc_now().isoformat(),
+                    session_id="system",
+                    tool_name="audit/ledger",
+                    mcp_server=None,
+                    decision="legacy_log_rotated",
+                    risk_tier=RiskTier.LOW.value,
+                    tainted=False,
+                    taint_sources=[],
+                    args_sha256=EMPTY_ARGS_SHA256,
+                    reasons=[
+                        f"Moved the unchained pre-1.1 audit log to '{rotated_from.name}' and started a new chain."
+                    ],
+                    policy_id="audit.migration",
+                    grant_id=None,
+                    event_type="ledger_rotated",
+                    enforcement_mode=enforcement_mode,
+                )
+            )
+        return logger, handle
 
     @property
     def events(self) -> tuple[AuditEvent, ...]:
@@ -328,7 +413,7 @@ class AuditLogger:
             self._last_hash = entry_hash
             self._events.append(final)
             if self._sink is not None:
-                self._sink.write(json.dumps(asdict(final), sort_keys=True, ensure_ascii=False) + "\n")
+                self._sink.write(_dump_audit_line(asdict(final)) + "\n")
                 self._sink.flush()
             return final
 
@@ -454,4 +539,4 @@ class AuditLogger:
 
     def to_jsonl(self) -> str:
         """Export all recorded audit events as newline-delimited JSON."""
-        return "\n".join(json.dumps(asdict(event), sort_keys=True, ensure_ascii=False) for event in self._events)
+        return "\n".join(_dump_audit_line(asdict(event)) for event in self._events)

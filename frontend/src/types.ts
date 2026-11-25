@@ -102,6 +102,10 @@ export interface GatewayAuditEvent {
   grant_id: string | null;
   event_type: string;
   taint_count: number;
+  seq?: number;
+  prev_hash?: string;
+  entry_hash?: string;
+  enforcement_mode?: string;
 }
 
 export interface GatewayAuditPayload {
@@ -109,6 +113,8 @@ export interface GatewayAuditPayload {
   total_lines: number;
   returned_count: number;
   malformed_lines: number;
+  chain_valid?: boolean | null;
+  chain_reason?: string | null;
 }
 
 export interface AssuranceCaseRecord {

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import tomllib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,8 +21,9 @@ from mellyn.egress import check_workspace_root
 from mellyn.legacy_env import check_no_legacy_env
 from mellyn.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
 from mellyn.policy import PolicyConfig
+from mellyn.policy_loader import MAX_POLICY_BYTES
 from mellyn.state_store import AuthorizerStateStore, SqliteStateStore, StateStoreError
-from mellyn.unified_config import load_policy_any
+from mellyn.unified_config import load_policy_any, load_unified_config
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 _STRICT = ConfigDict(extra="forbid", strict=True)
@@ -208,6 +211,22 @@ def create_app(
     return app
 
 
+def _load_policy_and_canaries(policy_path: Path) -> tuple[PolicyConfig, tuple[str, ...]]:
+    """Load policy and (when configured via v2 `mellyn.toml`) scanner canary tokens for audit redaction."""
+    if policy_path.suffix.lower() == ".toml" and not policy_path.is_symlink() and not policy_path.parent.is_symlink():
+        if policy_path.is_file():
+            raw = policy_path.read_bytes()
+            if len(raw) <= MAX_POLICY_BYTES:
+                try:
+                    parsed = tomllib.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+                    parsed = {}
+                if isinstance(parsed, dict) and parsed.get("schema_version") == 2:
+                    unified = load_unified_config(policy_path)
+                    return unified.policy, unified.scanner.canary_tokens
+    return load_policy_any(policy_path), ()
+
+
 def create_app_from_env() -> FastAPI:
     """
     Uvicorn ASGI factory for self-hosted container deployments.
@@ -223,8 +242,11 @@ def create_app_from_env() -> FastAPI:
     """
     check_no_legacy_env()  # a half-migrated deployment must not start with its old settings silently ignored
     policy_path_raw = os.environ.get("MELLYN_POLICY_PATH", "").strip()
-    # Either a v1 policy file or a v2 mellyn.toml: `mellyn init --unified` points MELLYN_POLICY_PATH at the latter.
-    policy_config = load_policy_any(Path(policy_path_raw)) if policy_path_raw else None
+    policy_config: PolicyConfig | None = None
+    canary_tokens: tuple[str, ...] = ()
+    if policy_path_raw:
+        # Either a v1 policy file or a v2 mellyn.toml: `mellyn init --unified` points MELLYN_POLICY_PATH at the latter.
+        policy_config, canary_tokens = _load_policy_and_canaries(Path(policy_path_raw))
 
     workspace_raw = os.environ.get("MELLYN_WORKSPACE_ROOT", "").strip()
     workspace_root = Path(workspace_raw) if workspace_raw else Path.cwd()
@@ -235,10 +257,13 @@ def create_app_from_env() -> FastAPI:
     sink: IO[str] | None = None
     state_store: SqliteStateStore | None = None
     if audit_path_raw:
-        audit_path = Path(audit_path_raw)
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        sink = audit_path.open("a", encoding="utf-8")
-        audit_logger = AuditLogger(sink=sink)
+        audit_logger, sink = AuditLogger.open_chained(Path(audit_path_raw), canary_tokens=canary_tokens)
+        if audit_logger.rotated_legacy_path is not None:
+            print(
+                f"mellyn: moved the unchained pre-1.1 audit log to {audit_logger.rotated_legacy_path} "
+                "and started a new hash-chained log.",
+                file=sys.stderr,
+            )
 
     try:
         state_db_raw = os.environ.get("MELLYN_STATE_DB_PATH", "").strip()

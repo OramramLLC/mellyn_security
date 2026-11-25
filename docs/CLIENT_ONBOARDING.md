@@ -83,4 +83,7 @@ pre-commit run --all-files
 
 ## 4. Next Step: Runtime MCP Tool-Call Protection
 
-Once your repositories are protected at commit and PR time, deploy Mellyn Security's **Self-Hosted MCP Tool-Call Authorizer & Network Egress Proxy** inside your own VPC or developer host—see [deploy/README.md](../deploy/README.md).
+Once your repositories are protected at commit and PR time, deploy Mellyn Security's **Self-Hosted MCP Tool-Call Authorizer & Network Egress Proxy** inside your own VPC or developer host:
+
+- **Turn-key local & unified setup**: install with `pip install -e .`, scaffold with `mellyn init --unified --preset mcp-filesystem --preset github`, pin each server's `tools/list` digest with `mellyn pin --name ... --config config/mellyn.toml -- <cmd>`, run locally with `mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl`, and audit chains with `mellyn verify mellyn-audit.jsonl --json`.
+- **Hardened team container stack**: see [deploy/README.md](../deploy/README.md) (`mellyn up`).

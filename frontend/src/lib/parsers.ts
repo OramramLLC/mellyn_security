@@ -378,6 +378,31 @@ function serializeCanonical(value: unknown): string {
   throw new Error(`Unsupported JSON value type: ${typeof value}`);
 }
 
+/** Exact sorted JSON without NFKC normalization, matching Python `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. */
+export function serializeExactSorted(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (value instanceof RawNumber || typeof value === "number") {
+    return canonicalNumberText(value);
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => serializeExactSorted(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const sorted = Object.entries(value as Record<string, unknown>).sort(([ka], [kb]) => compareCodePoints(ka, kb));
+    const parts = sorted.map(([k, v]) => `${JSON.stringify(k)}:${serializeExactSorted(v)}`);
+    return `{${parts.join(",")}}`;
+  }
+  throw new Error(`Unsupported JSON value type: ${typeof value}`);
+}
+
 /** Canonical JSON exactly as `mcp_airlock.core.normalize.canonical_json_bytes` writes it (as a string). */
 export function canonicalJsonString(value: unknown): string {
   return serializeCanonical(normalizeCanonicalValue(value));
@@ -865,19 +890,73 @@ export async function parseAirlockInput(text: string, filename = "audit.jsonl"):
   return verifyAndReconstructAirlockJsonl(text, filename);
 }
 
-export function parseGatewayAuditJsonl(text: string): GatewayAuditPayload {
+function extractGatewayEvent(obj: Record<string, unknown>): GatewayAuditEvent {
+  const ev: GatewayAuditEvent = {
+    audit_id: String(obj.audit_id),
+    timestamp: String(obj.timestamp),
+    session_id: String(obj.session_id),
+    tool_name: String(obj.tool_name),
+    mcp_server: typeof obj.mcp_server === "string" ? obj.mcp_server : null,
+    decision: String(obj.decision),
+    risk_tier: typeof obj.risk_tier === "string" ? obj.risk_tier : "HIGH",
+    tainted: Boolean(obj.tainted),
+    taint_sources: Array.isArray(obj.taint_sources) ? obj.taint_sources.map(String) : [],
+    args_sha256: typeof obj.args_sha256 === "string" ? obj.args_sha256 : "",
+    reasons: Array.isArray(obj.reasons) ? obj.reasons.map(String) : [],
+    policy_id: typeof obj.policy_id === "string" ? obj.policy_id : null,
+    grant_id: typeof obj.grant_id === "string" ? obj.grant_id : null,
+    event_type: typeof obj.event_type === "string" ? obj.event_type : "authorization",
+    taint_count:
+      obj.taint_count instanceof RawNumber
+        ? obj.taint_count.value
+        : typeof obj.taint_count === "number"
+          ? obj.taint_count
+          : 0,
+  };
+  if (obj.seq instanceof RawNumber && obj.seq.isInteger) {
+    ev.seq = obj.seq.value;
+  } else if (typeof obj.seq === "number" && Number.isInteger(obj.seq)) {
+    ev.seq = obj.seq;
+  }
+  if (typeof obj.prev_hash === "string") {
+    ev.prev_hash = obj.prev_hash;
+  }
+  if (typeof obj.entry_hash === "string") {
+    ev.entry_hash = obj.entry_hash;
+  }
+  if (typeof obj.enforcement_mode === "string") {
+    ev.enforcement_mode = obj.enforcement_mode;
+  }
+  return ev;
+}
+
+interface ParsedGatewayLine {
+  lineNo: number;
+  rawObj: Record<string, unknown> | null;
+  parseError: string | null;
+}
+
+function scanGatewayAuditLines(text: string): {
+  events: GatewayAuditEvent[];
+  rows: ParsedGatewayLine[];
+  totalLines: number;
+  malformedLines: number;
+} {
   const events: GatewayAuditEvent[] = [];
+  const rows: ParsedGatewayLine[] = [];
   let totalLines = 0;
   let malformedLines = 0;
 
-  for (const rawLine of text.split(/\r?\n/)) {
-    const trimmed = rawLine.trim();
+  const rawLines = text.split(/\r?\n/);
+  for (let i = 0; i < rawLines.length; i += 1) {
+    const lineNo = i + 1;
+    const trimmed = (rawLines[i] ?? "").trim();
     if (!trimmed) {
       continue;
     }
     totalLines += 1;
     try {
-      const obj: unknown = JSON.parse(trimmed);
+      const obj = parseJsonPreservingNumbers(trimmed);
       if (
         isPlainRecord(obj) &&
         typeof obj.audit_id === "string" &&
@@ -886,29 +965,103 @@ export function parseGatewayAuditJsonl(text: string): GatewayAuditPayload {
         typeof obj.tool_name === "string" &&
         typeof obj.decision === "string"
       ) {
-        events.push({
-          audit_id: obj.audit_id,
-          timestamp: obj.timestamp,
-          session_id: obj.session_id,
-          tool_name: obj.tool_name,
-          mcp_server: typeof obj.mcp_server === "string" ? obj.mcp_server : null,
-          decision: obj.decision,
-          risk_tier: typeof obj.risk_tier === "string" ? obj.risk_tier : "HIGH",
-          tainted: Boolean(obj.tainted),
-          taint_sources: Array.isArray(obj.taint_sources) ? obj.taint_sources.map(String) : [],
-          args_sha256: typeof obj.args_sha256 === "string" ? obj.args_sha256 : "",
-          reasons: Array.isArray(obj.reasons) ? obj.reasons.map(String) : [],
-          policy_id: typeof obj.policy_id === "string" ? obj.policy_id : null,
-          grant_id: typeof obj.grant_id === "string" ? obj.grant_id : null,
-          event_type: typeof obj.event_type === "string" ? obj.event_type : "authorization",
-          taint_count: typeof obj.taint_count === "number" ? obj.taint_count : 0,
-        });
+        events.push(extractGatewayEvent(obj));
+        rows.push({ lineNo, rawObj: obj, parseError: null });
       } else {
         malformedLines += 1;
+        rows.push({ lineNo, rawObj: null, parseError: `Audit entry on line ${lineNo} is missing required fields.` });
       }
-    } catch {
+    } catch (err) {
       malformedLines += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      rows.push({ lineNo, rawObj: null, parseError: `Malformed JSON or duplicate key on line ${lineNo}: ${msg}` });
     }
+  }
+
+  return { events, rows, totalLines, malformedLines };
+}
+
+export function parseGatewayAuditJsonl(text: string): GatewayAuditPayload {
+  const { events, totalLines, malformedLines } = scanGatewayAuditLines(text);
+  return {
+    events,
+    total_lines: totalLines,
+    returned_count: events.length,
+    malformed_lines: malformedLines,
+  };
+}
+
+export async function verifyGatewayAuditJsonl(text: string): Promise<GatewayAuditPayload> {
+  const { events, rows, totalLines, malformedLines } = scanGatewayAuditLines(text);
+  const hasChain = rows.some((row) => row.rawObj !== null && Object.prototype.hasOwnProperty.call(row.rawObj, "entry_hash"));
+  if (!hasChain) {
+    const firstErr = rows.find((row) => row.parseError !== null)?.parseError ?? null;
+    if (firstErr !== null && text.includes('"entry_hash"')) {
+      return {
+        events,
+        total_lines: totalLines,
+        returned_count: events.length,
+        malformed_lines: malformedLines,
+        chain_valid: false,
+        chain_reason: firstErr,
+      };
+    }
+    return {
+      events,
+      total_lines: totalLines,
+      returned_count: events.length,
+      malformed_lines: malformedLines,
+      chain_valid: null,
+      chain_reason: null,
+    };
+  }
+
+  let expectedSeq = 0;
+  let expectedPrev = GENESIS_PREV_HASH;
+  let chainValid = true;
+  let chainReason: string | null = null;
+
+  for (const row of rows) {
+    if (row.parseError !== null || row.rawObj === null) {
+      chainValid = false;
+      chainReason = row.parseError ?? `Malformed JSON entry on line ${row.lineNo}.`;
+      break;
+    }
+    const obj = row.rawObj;
+    const seqVal = obj.seq;
+    if (!(seqVal instanceof RawNumber) || !seqVal.isInteger || seqVal.value !== expectedSeq) {
+      chainValid = false;
+      chainReason = `Sequence mismatch on line ${row.lineNo}: expected seq=${expectedSeq}.`;
+      break;
+    }
+    const prevHash = obj.prev_hash;
+    if (typeof prevHash !== "string" || prevHash !== expectedPrev) {
+      chainValid = false;
+      chainReason = `Chain link mismatch on line ${row.lineNo}: prev_hash does not match previous entry_hash.`;
+      break;
+    }
+    const entryHash = obj.entry_hash;
+    if (typeof entryHash !== "string" || !SHA256_HEX_RE.test(entryHash)) {
+      chainValid = false;
+      chainReason = `Missing or malformed entry_hash on line ${row.lineNo}.`;
+      break;
+    }
+
+    const bodyWithoutHash = Object.create(null) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (k !== "entry_hash") {
+        defineOwn(bodyWithoutHash, k, v);
+      }
+    }
+    const expectedHash = await sha256Hex(serializeExactSorted(bodyWithoutHash));
+    if (entryHash !== expectedHash) {
+      chainValid = false;
+      chainReason = `Entry digest mismatch on line ${row.lineNo} (tampered record).`;
+      break;
+    }
+
+    expectedSeq += 1;
+    expectedPrev = entryHash;
   }
 
   return {
@@ -916,6 +1069,8 @@ export function parseGatewayAuditJsonl(text: string): GatewayAuditPayload {
     total_lines: totalLines,
     returned_count: events.length,
     malformed_lines: malformedLines,
+    chain_valid: chainValid,
+    chain_reason: chainReason,
   };
 }
 

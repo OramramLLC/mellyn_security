@@ -10,8 +10,10 @@ import {
   parseGatewayAuditJsonl,
   parseJsonPreservingNumbers,
   pythonFloatRepr,
+  serializeExactSorted,
   validateLoopbackBaseUrl,
   verifyAndReconstructAirlockJsonl,
+  verifyGatewayAuditJsonl,
 } from "../src/lib/parsers.ts";
 
 function canonicalHash(obj: unknown): string {
@@ -286,4 +288,94 @@ test("verifyAndReconstructAirlockJsonl tracks observe-mode sessions and observed
   assert.equal(report.observed_block_count, 1);
   assert.equal(report.observed_aad_count, 1);
   assert.equal(report.sessions[0]?.enforcement_mode, "observe");
+});
+
+function buildGatewayChain(rows: Array<Record<string, unknown>>): string {
+  let prev = "0".repeat(64);
+  const out: string[] = [];
+  rows.forEach((row, seq) => {
+    const draft = { ...row, seq, prev_hash: prev };
+    const entryHash = createHash("sha256").update(serializeExactSorted(draft), "utf-8").digest("hex");
+    out.push(serializeExactSorted({ ...draft, entry_hash: entryHash }));
+    prev = entryHash;
+  });
+  return `${out.join("\n")}\n`;
+}
+
+test("verifyGatewayAuditJsonl verifies chained gateway logs and detects tampering, swaps, gaps, and dup keys", async () => {
+  const row0 = {
+    args_sha256: "a".repeat(64),
+    audit_id: "aud_0001",
+    decision: "allow",
+    enforcement_mode: "enforce",
+    event_type: "authorization",
+    grant_id: null,
+    mcp_server: "github",
+    policy_id: "github-read",
+    reasons: ["Allowed by preset github", "NFKC-raw \uff2d check"],
+    risk_tier: "low",
+    session_id: "ses_abc",
+    taint_count: 0,
+    taint_sources: [],
+    tainted: false,
+    timestamp: "2026-11-24T15:00:00+00:00",
+    tool_name: "get_issue",
+  };
+  const row1 = {
+    args_sha256: "b".repeat(64),
+    audit_id: "aud_0002",
+    decision: "aad_fire",
+    enforcement_mode: "enforce",
+    event_type: "containment",
+    grant_id: null,
+    mcp_server: "github",
+    policy_id: "scanner.egress",
+    reasons: ["Blocked canary [REDACTED_CANARY]"],
+    risk_tier: "high",
+    session_id: "ses_abc",
+    taint_count: 1,
+    taint_sources: ["mcp:github"],
+    tainted: true,
+    timestamp: "2026-11-24T15:00:01+00:00",
+    tool_name: "post_issue",
+  };
+
+  const chainedJsonl = buildGatewayChain([row0, row1]);
+  const valid = await verifyGatewayAuditJsonl(chainedJsonl);
+  assert.equal(valid.chain_valid, true, valid.chain_reason ?? "");
+  assert.equal(valid.chain_reason, null);
+  assert.equal(valid.events.length, 2);
+  assert.equal(valid.events[0]?.seq, 0);
+  assert.equal(valid.events[1]?.enforcement_mode, "enforce");
+
+  // 1) Tampered field
+  const tamperedField = chainedJsonl.replace('"decision":"aad_fire"', '"decision":"allow"');
+  const resTamper = await verifyGatewayAuditJsonl(tamperedField);
+  assert.equal(resTamper.chain_valid, false);
+  assert.match(resTamper.chain_reason ?? "", /line 2/);
+
+  // 2) Swapped lines
+  const lines = chainedJsonl.trimEnd().split("\n");
+  const swapped = `${lines[1]}\n${lines[0]}\n`;
+  const resSwap = await verifyGatewayAuditJsonl(swapped);
+  assert.equal(resSwap.chain_valid, false);
+
+  // 3) Sequence gap (deleted line 0 -> starts at seq=1)
+  const gapped = `${lines[1]}\n`;
+  const resGap = await verifyGatewayAuditJsonl(gapped);
+  assert.equal(resGap.chain_valid, false);
+
+  // 4) Duplicate JSON key
+  const dupKey = `${lines[0].replace('"seq":0', '"seq":0,"seq":0')}\n`;
+  const resDup = await verifyGatewayAuditJsonl(dupKey);
+  assert.equal(resDup.chain_valid, false);
+  assert.match(resDup.chain_reason ?? "", /Duplicate key/);
+
+  // 5) Legacy pre-chain JSONL returns chain_valid === null
+  const legacyJsonl =
+    '{"audit_id":"aud_legacy","timestamp":"2026-11-23T00:00:00Z","session_id":"s1","tool_name":"t","decision":"DENY"}\n';
+  const resLegacy = await verifyGatewayAuditJsonl(legacyJsonl);
+  assert.equal(resLegacy.chain_valid, null);
+  assert.equal(resLegacy.chain_reason, null);
+  assert.equal(resLegacy.events.length, 1);
 });

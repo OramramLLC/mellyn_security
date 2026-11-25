@@ -6,6 +6,7 @@ interface OverviewTabProps {
   assurance: ControlAssuranceReport;
   airlockReport: IncidentReport;
   gatewayCount: number;
+  gatewayChainValid: boolean | null;
   pendingCount: number;
   modeLabel: string;
 }
@@ -14,6 +15,7 @@ export function OverviewTab({
   assurance,
   airlockReport,
   gatewayCount,
+  gatewayChainValid,
   pendingCount,
   modeLabel,
 }: OverviewTabProps) {
@@ -54,9 +56,15 @@ export function OverviewTab({
           <div className="kpi-label">Control Plane Audit Events</div>
           <div className="kpi-value-row">
             <span className="kpi-number">{gatewayCount}</span>
-            <StatusBadge tone="info">{modeLabel}</StatusBadge>
+            {gatewayChainValid === true && <StatusBadge tone="pass">CHAIN VERIFIED</StatusBadge>}
+            {gatewayChainValid === false && <StatusBadge tone="aad">INTEGRITY COMPROMISED</StatusBadge>}
+            {gatewayChainValid === null && <StatusBadge tone="info">{modeLabel}</StatusBadge>}
           </div>
-          <div className="kpi-sub">Redacted args SHA-256 + taint provenance ledger</div>
+          <div className="kpi-sub">
+            {gatewayChainValid === false
+              ? "Gateway hash-chain tampering or truncation detected"
+              : "Redacted args SHA-256, taint provenance & hash chain"}
+          </div>
         </div>
 
         <div className="card kpi-card">

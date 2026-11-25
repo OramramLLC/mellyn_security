@@ -33,7 +33,7 @@ from typing import Any
 
 from mellyn.approval_relay import forward_approval_request, validate_upstream
 from mellyn.approvals import API_KEY_HEADER, MAX_BODY_BYTES, parse_approval_route
-from mellyn.audit import verify_gateway_audit_lines
+from mellyn.audit import split_audit_lines, verify_gateway_audit_lines
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.legacy_env import check_no_legacy_env
 
@@ -116,7 +116,8 @@ def _load_gateway_audit(audit_path: Path, *, limit: int) -> dict[str, Any]:
     non_empty_lines: list[str] = []
     total_lines = 0
     malformed_lines = 0
-    for line in raw_text.splitlines():
+    # "\n" only: str.splitlines() also breaks on U+2028/U+2029/U+0085, which can sit inside a logged string.
+    for line in split_audit_lines(raw_text):
         stripped = line.strip()
         if not stripped:
             continue

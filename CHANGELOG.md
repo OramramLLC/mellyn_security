@@ -4,6 +4,17 @@ All notable changes to **Mellyn Security** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Hash-chained audit logs.** The authorizer's and gateway's audit logs are now hash-chained JSONL, verified before
+  every append. On upgrade, an existing log in the old unchained format is moved aside, unchanged, as
+  `<name>.pre-chain-<UTC time>`, and a new chain starts with a `ledger_rotated` record. A log that is partly chained
+  or otherwise fails verification still stops the service (fail closed).
+- **`mellyn pin --name … --config mellyn.toml`** records a server's tool hash in the unified config. It refuses tool
+  definitions containing invisible Unicode, edits only that server's block so comments survive, and writes
+  atomically. The gateway also blocks any listing with invisible Unicode, pinned or not.
+
 ## [1.0.0] - 2026-11-24
 
 First general release uniting all four security planes for self-hosted MCP tool execution and AI-assisted development.

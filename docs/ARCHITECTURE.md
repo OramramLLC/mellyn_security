@@ -122,9 +122,11 @@ V1/
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)
 │       ├── viewer_server.py         # Fail-closed loopback BFF + SPA (VIEWER reads, APPROVER approvals)
 │       ├── api.py                   # FastAPI HTTP adapter (/healthz, /v1/sessions, /v1/agent/authorize, grants)
+│       ├── pin_gateway.py           # Guided AgBOM pinning CLI (`mellyn pin`) for unified mellyn.toml
 │       ├── init_cmd.py              # Turn-key workspace bootstrap (`mellyn init`) & Compose runner (`mellyn up`)
 │       └── cli.py                   # Unified `mellyn` CLI dispatching gateway, setup & Airlock commands
 ├── config/
+│   ├── mellyn.example.toml          # Example unified schema_version=2 config (runtime, egress, scanner, policy, servers)
 │   ├── mellyn-policy.example.toml   # Starter policy for client workspaces
 │   ├── mellyn-self-policy.toml      # Dogfooding policy protecting this repository's own core
 │   └── mellyn-gateway.example.toml  # Example multi-server MCP gateway config

@@ -69,6 +69,8 @@ pip install -e .
 mellyn presets                                       # inspect built-in SMB presets (filesystem, fetch, github, linear, slack, postgres)
 mellyn init --unified --preset mcp-filesystem --preset github --workspace /abs/path/to/agent/workspace
                                                      # digest-only .env + single schema_version=2 config/mellyn.toml (omit --unified for v1 split files)
+mellyn pin --name workspace --preset mcp-filesystem --config config/mellyn.toml -- my-mcp-server --root .
+                                                     # inspect tools/list in a minimal env & pin exact tools_sha256 into mellyn.toml
 mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
 mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
 mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl
@@ -78,7 +80,8 @@ mellyn verify mellyn-audit.jsonl --json              # auto-detects Gateway or A
 `mellyn init` keeps `.env` outside `config/`, because compose mounts `config/` read-only into the containers. It
 also records `MELLYN_CONFIG_DIR`, `MELLYN_POLICY_FILE` and `MELLYN_GATEWAY_CONFIG_FILE` in `.env`, and `mellyn up`
 passes `.env` to compose, so the containers enforce the generated policy rather than the checked-in example. Replace
-the placeholder server commands in `config/mellyn-gateway.toml` before connecting a client.
+any placeholder commands in `config/mellyn.toml` (or run `mellyn pin --name ... --config config/mellyn.toml -- <cmd>`)
+before connecting a client.
 
 1. **Pin a downstream MCP server manifest (`mellyn-pin`)**:
 

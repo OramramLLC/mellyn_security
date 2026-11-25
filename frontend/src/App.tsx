@@ -21,7 +21,7 @@ import {
   fetchStatus,
   rejectPendingCall,
 } from "./lib/api.ts";
-import { parseAirlockInput, parseAssuranceReportJson, parseGatewayAuditJsonl } from "./lib/parsers.ts";
+import { parseAirlockInput, parseAssuranceReportJson, verifyGatewayAuditJsonl } from "./lib/parsers.ts";
 import type { ControlAssuranceReport, GatewayAuditEvent, IncidentReport, PendingApproval } from "./types.ts";
 
 type TabId = "overview" | "airlock" | "gateway" | "approvals";
@@ -42,6 +42,8 @@ export function App() {
   const [gatewayEvents, setGatewayEvents] = useState<GatewayAuditEvent[]>(SAMPLE_GATEWAY_EVENTS);
   const [gatewayTotalLines, setGatewayTotalLines] = useState<number>(SAMPLE_GATEWAY_EVENTS.length);
   const [gatewayMalformed, setGatewayMalformed] = useState<number>(0);
+  const [gatewayChainValid, setGatewayChainValid] = useState<boolean | null>(null);
+  const [gatewayChainReason, setGatewayChainReason] = useState<string | null>(null);
   const [assuranceReport, setAssuranceReport] = useState<ControlAssuranceReport>(SAMPLE_ASSURANCE_REPORT);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>(SAMPLE_PENDING_APPROVALS);
 
@@ -59,6 +61,8 @@ export function App() {
       setGatewayEvents(gw.events);
       setGatewayTotalLines(gw.total_lines);
       setGatewayMalformed(gw.malformed_lines);
+      setGatewayChainValid(gw.chain_valid ?? null);
+      setGatewayChainReason(gw.chain_reason ?? null);
       loadedParts.push("Gateway audit");
     }
     if (status.assurance_report_configured) {
@@ -93,6 +97,8 @@ export function App() {
     setGatewayEvents(SAMPLE_GATEWAY_EVENTS);
     setGatewayTotalLines(SAMPLE_GATEWAY_EVENTS.length);
     setGatewayMalformed(0);
+    setGatewayChainValid(null);
+    setGatewayChainReason(null);
     setAssuranceReport(SAMPLE_ASSURANCE_REPORT);
     setPendingApprovals(SAMPLE_PENDING_APPROVALS);
     setErrorMessage(null);
@@ -108,14 +114,18 @@ export function App() {
     setActiveTab("airlock");
   }
 
-  function handleLoadGatewayText(text: string) {
-    const gw = parseGatewayAuditJsonl(text);
+  async function handleLoadGatewayText(text: string) {
+    const gw = await verifyGatewayAuditJsonl(text);
     setGatewayEvents(gw.events);
     setGatewayTotalLines(gw.total_lines);
     setGatewayMalformed(gw.malformed_lines);
+    setGatewayChainValid(gw.chain_valid ?? null);
+    setGatewayChainReason(gw.chain_reason ?? null);
     setIsLiveMode(false);
     setSourceLabel("Local Gateway Audit");
-    setStatusMessage(`Loaded ${gw.returned_count} gateway audit events.`);
+    const chainLabel =
+      gw.chain_valid === true ? "chain verified" : gw.chain_valid === false ? "INTEGRITY COMPROMISED" : "legacy";
+    setStatusMessage(`Loaded ${gw.returned_count} gateway audit events (${chainLabel}).`);
     setActiveTab("gateway");
   }
 
@@ -218,6 +228,7 @@ export function App() {
             assurance={assuranceReport}
             airlockReport={airlockReport}
             gatewayCount={gatewayEvents.length}
+            gatewayChainValid={gatewayChainValid}
             pendingCount={pendingApprovals.length}
             modeLabel={sourceLabel}
           />
@@ -228,6 +239,8 @@ export function App() {
             events={gatewayEvents}
             totalLines={gatewayTotalLines}
             malformedLines={gatewayMalformed}
+            chainValid={gatewayChainValid}
+            chainReason={gatewayChainReason}
           />
         )}
         {activeTab === "approvals" && (
