@@ -9,6 +9,9 @@ secrets/
 credentials.json
 # Audit ledgers and reports mounted into mellyn-viewer (deploy/docker-compose.yml, MELLYN_EVIDENCE_DIR)
 evidence/
+# Local configs written by `mellyn init` (the checked-in examples stay tracked)
+config/mellyn-policy.toml
+config/mellyn-gateway.toml
 
 # Python
 __pycache__/

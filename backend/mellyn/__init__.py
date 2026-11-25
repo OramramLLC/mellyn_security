@@ -16,7 +16,15 @@ from mellyn.models import (
     TaintSource,
     ToolCallRequest,
 )
-from mellyn.policy import MCP_CAPABILITY_PRESETS, PolicyConfig, PolicyEngine, ScopedRule, ToolCapability
+from mellyn.policy import (
+    MCP_CAPABILITY_PRESETS,
+    SMB_SERVER_PRESETS,
+    PolicyConfig,
+    PolicyEngine,
+    ScopedRule,
+    ServerPresetProfile,
+    ToolCapability,
+)
 from mellyn.policy_loader import PolicyLoadError, load_policy_file, parse_policy_dict
 from mellyn.state_store import InMemoryStateStore, SessionLimitError, SqliteStateStore, StateStoreError
 
@@ -38,7 +46,9 @@ __all__ = [
     "RiskSignals",
     "RiskTier",
     "Role",
+    "SMB_SERVER_PRESETS",
     "ScopedRule",
+    "ServerPresetProfile",
     "SessionLimitError",
     "SqliteStateStore",
     "StateStoreError",

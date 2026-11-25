@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 # Secret file patterns that must NEVER be read or written by an agent tool.
 SENSITIVE_FILENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\.env(?:\..+)?$", re.IGNORECASE),
+    re.compile(r"^\.env(?:\..*)?$", re.IGNORECASE),
     re.compile(r"\.(?:pem|key|p12|pfx|jks|kdbx)$", re.IGNORECASE),
     re.compile(r"^credentials\.json$", re.IGNORECASE),
     re.compile(r"^id_(?:rsa|ed25519|ecdsa|dsa)$", re.IGNORECASE),
