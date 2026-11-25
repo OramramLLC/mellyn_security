@@ -116,7 +116,9 @@ V1/
 │       ├── credentials.py           # Role-separated agent/approver/viewer keys as HMAC-SHA256(pepper, key) digests
 │       ├── legacy_env.py            # Refuses to start while pre-rename variables are still set
 │       ├── gateway_config.py        # Strict loader for the MCP gateway's downstream server list
-│       ├── mcp_gateway.py           # Single-session multi-server stdio MCP gateway + pinned tool hashes
+│       ├── oauth_client.py          # Stdlib OAuth 2.1 client (PKCE S256, client_credentials, RFC 9728/8414/8707)
+│       ├── http_downstream.py       # Streamable HTTP MCP downstream transport (SSE, Mcp-Session-Id, OAuth)
+│       ├── mcp_gateway.py           # Single-session multi-server MCP gateway (stdio + HTTP) & pinned tool hashes
 │       ├── approvals.py             # Pending approvals store + HTTP approval server
 │       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)

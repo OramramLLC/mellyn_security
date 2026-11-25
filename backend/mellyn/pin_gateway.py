@@ -22,11 +22,13 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME
+from mellyn.http_downstream import StreamableHttpDownstream
 from mellyn.legacy_env import LEGACY_ENV_PREFIX
+from mellyn.oauth_client import OAuthClientConfig, OAuthError, extract_url_host, validate_outbound_url
 from mellyn.policy import SMB_SERVER_PRESETS, validate_argv
 from mellyn.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
 from mellyn.scanner import _INVISIBLE_UNICODE_RE, invisible_unicode_tools
@@ -60,12 +62,15 @@ class GatewayPinResult:
     """Structured result from inspecting and hashing a downstream MCP server's `tools/list`."""
 
     server_name: str
-    command: tuple[str, ...]
-    preset: str | None
-    trusted: bool
-    tools: tuple[dict[str, Any], ...]
-    tools_sha256: str
-    warnings: tuple[str, ...]
+    command: tuple[str, ...] = ()
+    preset: str | None = None
+    trusted: bool = False
+    tools: tuple[dict[str, Any], ...] = ()
+    tools_sha256: str = ""
+    warnings: tuple[str, ...] = ()
+    transport: Literal["stdio", "streamable-http"] = "stdio"
+    url: str | None = None
+    oauth: OAuthClientConfig | None = None
 
 
 def build_pin_env(allowed_env_keys: Sequence[str] = ()) -> dict[str, str]:
@@ -135,73 +140,16 @@ def _scan_tool_warnings(tools: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     return tuple(warnings)
 
 
-def inspect_gateway_server(
-    name: str,
-    command: Sequence[str],
-    *,
-    preset: str | None = None,
-    trusted: bool | None = None,
-    allowed_env_keys: Sequence[str] = (),
-    timeout_seconds: float = DEFAULT_PIN_TIMEOUT_SECONDS,
-    cwd: Path | None = None,
-) -> GatewayPinResult:
-    """
-    Launch `command` briefly inside a quarantined minimal environment, run `initialize` and strict paginated
-    `tools/list`, kill the child immediately, and compute the canonical `tools_sha256` digest.
-    """
-    # Lazy import avoids importing `mellyn.mcp_gateway` during `mellyn.__init__` so
-    # `python -m mellyn.mcp_gateway` does not import the module twice.
+def _inspect_downstream_tools(
+    server: Any, *, name: str, timeout_seconds: float
+) -> tuple[tuple[dict[str, Any], ...], str, tuple[str, ...]]:
     from mellyn.mcp_gateway import (
         MAX_LIST_PAGES,
-        StdioDownstream,
         _valid_jsonrpc_response,
         _valid_name,
         compute_tools_hash,
         initialize_downstream,
     )
-
-    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name):
-        raise GatewayPinError(f"Server name '{name}' must use lowercase letters, digits, and single hyphens.")
-    if not command:
-        raise GatewayPinError("Downstream MCP server command must not be empty.")
-    argv_list = list(command)
-    argv_ok, argv_reason = validate_argv({"argv": argv_list})
-    if not argv_ok:
-        raise GatewayPinError(f"Server '{name}' command rejected: {argv_reason}")
-
-    clean_preset: str | None = None
-    if preset is not None:
-        clean_preset = preset.strip().lower()
-        if clean_preset not in SMB_SERVER_PRESETS:
-            known = ", ".join(sorted(SMB_SERVER_PRESETS))
-            raise GatewayPinError(f"Unknown preset '{preset}'. Known presets: {known}.")
-
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise GatewayPinError("timeout_seconds must be a finite positive number.")
-
-    effective_trusted = (
-        trusted
-        if trusted is not None
-        else (SMB_SERVER_PRESETS[clean_preset].trusted if clean_preset is not None else False)
-    )
-    pin_env = build_pin_env(allowed_env_keys)
-
-    effective_cwd: Path | None = None
-    if cwd is not None:
-        if cwd.is_symlink() or not cwd.is_dir():
-            raise GatewayPinError(f"Working directory '{cwd}' does not exist or is a symlink.")
-        effective_cwd = cwd.resolve()
-
-    try:
-        server = StdioDownstream(
-            name,
-            argv_list,
-            cwd=effective_cwd,
-            env=pin_env,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, ValueError) as exc:
-        raise GatewayPinError(f"Failed to start MCP server '{name}': {exc}") from exc
 
     tools: list[dict[str, Any]] = []
     seen_names: set[str] = set()
@@ -269,14 +217,134 @@ def inspect_gateway_server(
             "(potential pre-poisoned server); refusing to pin."
         )
     warnings = _scan_tool_warnings(tools)
+    return tuple(tools), tools_sha256, warnings
+
+
+def _validate_pin_common(
+    name: str, *, preset: str | None, trusted: bool | None, timeout_seconds: float
+) -> tuple[str | None, bool]:
+    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name):
+        raise GatewayPinError(f"Server name '{name}' must use lowercase letters, digits, and single hyphens.")
+    clean_preset: str | None = None
+    if preset is not None:
+        clean_preset = preset.strip().lower()
+        if clean_preset not in SMB_SERVER_PRESETS:
+            known = ", ".join(sorted(SMB_SERVER_PRESETS))
+            raise GatewayPinError(f"Unknown preset '{preset}'. Known presets: {known}.")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise GatewayPinError("timeout_seconds must be a finite positive number.")
+    effective_trusted = (
+        trusted
+        if trusted is not None
+        else (SMB_SERVER_PRESETS[clean_preset].trusted if clean_preset is not None else False)
+    )
+    return clean_preset, effective_trusted
+
+
+def inspect_gateway_server(
+    name: str,
+    command: Sequence[str],
+    *,
+    preset: str | None = None,
+    trusted: bool | None = None,
+    allowed_env_keys: Sequence[str] = (),
+    timeout_seconds: float = DEFAULT_PIN_TIMEOUT_SECONDS,
+    cwd: Path | None = None,
+) -> GatewayPinResult:
+    """
+    Launch `command` briefly inside a quarantined minimal environment, run `initialize` and strict paginated
+    `tools/list`, kill the child immediately, and compute the canonical `tools_sha256` digest.
+    """
+    # Lazy import avoids importing `mellyn.mcp_gateway` during `mellyn.__init__` so
+    # `python -m mellyn.mcp_gateway` does not import the module twice.
+    from mellyn.mcp_gateway import StdioDownstream
+
+    clean_preset, effective_trusted = _validate_pin_common(
+        name, preset=preset, trusted=trusted, timeout_seconds=timeout_seconds
+    )
+    if not command:
+        raise GatewayPinError("Downstream MCP server command must not be empty.")
+    argv_list = list(command)
+    argv_ok, argv_reason = validate_argv({"argv": argv_list})
+    if not argv_ok:
+        raise GatewayPinError(f"Server '{name}' command rejected: {argv_reason}")
+
+    pin_env = build_pin_env(allowed_env_keys)
+
+    effective_cwd: Path | None = None
+    if cwd is not None:
+        if cwd.is_symlink() or not cwd.is_dir():
+            raise GatewayPinError(f"Working directory '{cwd}' does not exist or is a symlink.")
+        effective_cwd = cwd.resolve()
+
+    try:
+        server = StdioDownstream(
+            name,
+            argv_list,
+            cwd=effective_cwd,
+            env=pin_env,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError) as exc:
+        raise GatewayPinError(f"Failed to start MCP server '{name}': {exc}") from exc
+
+    tools, tools_sha256, warnings = _inspect_downstream_tools(server, name=name, timeout_seconds=timeout_seconds)
     return GatewayPinResult(
         server_name=name,
         command=tuple(argv_list),
         preset=clean_preset,
         trusted=effective_trusted,
-        tools=tuple(tools),
+        tools=tools,
         tools_sha256=tools_sha256,
         warnings=warnings,
+        transport="stdio",
+    )
+
+
+def inspect_remote_gateway_server(
+    name: str,
+    url: str,
+    *,
+    preset: str | None = None,
+    trusted: bool | None = None,
+    oauth: OAuthClientConfig | None = None,
+    allowed_domains: frozenset[str] | None = None,
+    timeout_seconds: float = DEFAULT_PIN_TIMEOUT_SECONDS,
+    _allow_loopback_http: bool = False,
+) -> GatewayPinResult:
+    """
+    Connect briefly to a remote `streamable-http` MCP server (with optional OAuth 2.1), run `initialize`
+    and strict paginated `tools/list`, terminate the remote session cleanly, and compute `tools_sha256`.
+    """
+    clean_preset, effective_trusted = _validate_pin_common(
+        name, preset=preset, trusted=trusted, timeout_seconds=timeout_seconds
+    )
+    try:
+        clean_url = validate_outbound_url(
+            url, allowed_domains=allowed_domains, allow_loopback_http=_allow_loopback_http
+        )
+        server = StreamableHttpDownstream(
+            name,
+            clean_url,
+            oauth_config=oauth,
+            allowed_domains=allowed_domains,
+            _allow_loopback_http=_allow_loopback_http,
+        )
+    except (OSError, ValueError, OAuthError) as exc:
+        raise GatewayPinError(f"Remote MCP server '{name}' URL or OAuth config rejected: {exc}") from exc
+
+    tools, tools_sha256, warnings = _inspect_downstream_tools(server, name=name, timeout_seconds=timeout_seconds)
+    return GatewayPinResult(
+        server_name=name,
+        command=(),
+        preset=clean_preset,
+        trusted=effective_trusted,
+        tools=tools,
+        tools_sha256=tools_sha256,
+        warnings=warnings,
+        transport="streamable-http",
+        url=clean_url,
+        oauth=oauth,
     )
 
 
@@ -300,15 +368,62 @@ def _toml_value(val: Any) -> str:
     raise GatewayPinError(f"Unsupported TOML value type: {type(val).__name__}")
 
 
+_OAUTH_KEY_ORDER: tuple[str, ...] = (
+    "flow",
+    "allowed_authorization_servers",
+    "client_id",
+    "client_id_env",
+    "client_secret_env",
+    "bearer_token_env",
+    "scopes",
+    "resource",
+    "token_endpoint",
+    "authorization_endpoint",
+    "token_cache_path",
+)
+
+
+def _oauth_dict(oauth: OAuthClientConfig) -> dict[str, Any]:
+    out: dict[str, Any] = {"flow": oauth.flow}
+    if oauth.allowed_authorization_servers:
+        out["allowed_authorization_servers"] = list(oauth.allowed_authorization_servers)
+    if oauth.client_id is not None:
+        out["client_id"] = oauth.client_id
+    if oauth.client_id_env is not None:
+        out["client_id_env"] = oauth.client_id_env
+    if oauth.client_secret_env is not None:
+        out["client_secret_env"] = oauth.client_secret_env
+    if oauth.bearer_token_env is not None:
+        out["bearer_token_env"] = oauth.bearer_token_env
+    if oauth.scopes:
+        out["scopes"] = list(oauth.scopes)
+    if oauth.resource is not None:
+        out["resource"] = oauth.resource
+    if oauth.token_endpoint is not None:
+        out["token_endpoint"] = oauth.token_endpoint
+    if oauth.authorization_endpoint is not None:
+        out["authorization_endpoint"] = oauth.authorization_endpoint
+    if oauth.token_cache_path is not None:
+        out["token_cache_path"] = str(oauth.token_cache_path)
+    return out
+
+
 def _server_entry_dict(result: GatewayPinResult) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "name": result.server_name,
-        "transport": "stdio",
+        "transport": result.transport,
     }
     if result.preset is not None:
         entry["preset"] = result.preset
     entry["trusted"] = result.trusted
-    entry["command"] = list(result.command)
+    if result.transport == "streamable-http":
+        if result.url is None:
+            raise GatewayPinError("Remote server pin result requires 'url'.")
+        entry["url"] = result.url
+        if result.oauth is not None:
+            entry["oauth"] = _oauth_dict(result.oauth)
+    else:
+        entry["command"] = list(result.command)
     entry["tools_sha256"] = result.tools_sha256
     return entry
 
@@ -317,10 +432,13 @@ def render_server_block(result: GatewayPinResult) -> str:
     """Render a standalone `[[servers]]` TOML block ready for inclusion in `mellyn.toml`."""
     entry = _server_entry_dict(result)
     lines = ["[[servers]]"]
-    for key in ("name", "transport", "preset", "trusted", "command", "tools_sha256"):
+    for key in ("name", "transport", "preset", "trusted", "command", "url", "tools_sha256"):
         if key in entry:
             lines.append(f"{key} = {_toml_value(entry[key])}")
-    return "\n".join(lines) + "\n"
+    if "oauth" in entry and isinstance(entry["oauth"], Mapping):
+        lines.append("")
+        _emit_flat_table(lines, "servers.oauth", entry["oauth"], _OAUTH_KEY_ORDER)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _emit_flat_table(
@@ -404,7 +522,7 @@ def _serialize_unified_toml(data: Mapping[str, Any]) -> str:
 
     servers = data.get("servers", [])
     if isinstance(servers, list):
-        srv_order = ("name", "transport", "preset", "trusted", "command", "tools_sha256")
+        srv_order = ("name", "transport", "preset", "trusted", "command", "url", "tools_sha256")
         for srv in servers:
             if not isinstance(srv, Mapping):
                 continue
@@ -415,11 +533,22 @@ def _serialize_unified_toml(data: Mapping[str, Any]) -> str:
                     lines.append(f"{key} = {_toml_value(srv[key])}")
                     emitted.add(key)
             for key in sorted(srv):
-                if key not in emitted:
+                if key not in emitted and key != "oauth":
                     lines.append(f"{_toml_key(key)} = {_toml_value(srv[key])}")
             lines.append("")
+            if isinstance(srv.get("oauth"), Mapping):
+                _emit_flat_table(lines, "servers.oauth", srv["oauth"], _OAUTH_KEY_ORDER)
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _add_public_url_domain(url: str, domains: list[str]) -> None:
+    try:
+        norm = validate_egress_domain(extract_url_host(url))
+    except ValueError:
+        return
+    if norm not in domains:
+        domains.append(norm)
 
 
 def _starter_unified_dict(result: GatewayPinResult) -> dict[str, Any]:
@@ -429,6 +558,16 @@ def _starter_unified_dict(result: GatewayPinResult) -> dict[str, Any]:
             norm = validate_egress_domain(dom)
             if norm not in domains:
                 domains.append(norm)
+    if result.url is not None:
+        _add_public_url_domain(result.url, domains)
+    if result.oauth is not None:
+        for oauth_url in (
+            *result.oauth.allowed_authorization_servers,
+            *([result.oauth.resource] if result.oauth.resource else ()),
+            *([result.oauth.token_endpoint] if result.oauth.token_endpoint else ()),
+            *([result.oauth.authorization_endpoint] if result.oauth.authorization_endpoint else ()),
+        ):
+            _add_public_url_domain(oauth_url, domains)
     return {
         "schema_version": 2,
         "runtime": {
@@ -533,7 +672,13 @@ def _splice_server_block(text: str, server_name: str, block: str) -> str:
     for position, start in enumerate(headers):
         if lines[start].strip() != "[[servers]]":
             continue
-        end = headers[position + 1] if position + 1 < len(headers) else len(lines)
+        end = len(lines)
+        for next_hdr in headers[position + 1 :]:
+            stripped_hdr = lines[next_hdr].strip()
+            if stripped_hdr.startswith("[servers.") and not stripped_hdr.startswith("[["):
+                continue
+            end = next_hdr
+            break
         try:
             parsed = tomllib.loads("\n".join(lines[start:end]))
         except tomllib.TOMLDecodeError:
@@ -605,9 +750,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Overall inspection timeout in seconds (default: {DEFAULT_PIN_TIMEOUT_SECONDS})",
     )
     parser.add_argument("--cwd", type=Path, default=None, help="Working directory for spawning the MCP server")
+    parser.add_argument("--url", default=None, help="Remote Streamable HTTP MCP server URL (https://...)")
+    parser.add_argument(
+        "--oauth-flow",
+        choices=("client_credentials", "pkce", "bearer_env"),
+        default=None,
+        help="OAuth 2.1 flow for remote Streamable HTTP MCP servers",
+    )
+    parser.add_argument(
+        "--oauth-as",
+        action="append",
+        dest="oauth_as",
+        default=[],
+        help="Policy-pinned OAuth Authorization Server issuer URL (repeatable or comma-separated)",
+    )
+    parser.add_argument(
+        "--bearer-token-env",
+        default=None,
+        help="Environment variable name holding a pre-provisioned bearer token (for --oauth-flow bearer_env)",
+    )
+    parser.add_argument("--client-id", default=None, help="Static OAuth client_id")
+    parser.add_argument("--client-id-env", default=None, help="Environment variable name holding OAuth client_id")
+    parser.add_argument(
+        "--client-secret-env",
+        default=None,
+        help="Environment variable name holding OAuth client_secret",
+    )
+    parser.add_argument(
+        "--scope",
+        action="append",
+        dest="scopes",
+        default=[],
+        help="OAuth scope to request (repeatable or comma-separated)",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON pin output")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Downstream MCP server command argv (after `--`)")
     return parser
+
+
+def _split_csv_list(raw_entries: Sequence[str]) -> tuple[str, ...]:
+    items: list[str] = []
+    for raw in raw_entries:
+        for part in raw.split(","):
+            clean = part.strip()
+            if clean:
+                items.append(clean)
+    return tuple(items)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -621,32 +809,85 @@ def main(argv: Sequence[str] | None = None) -> int:
     cmd = list(args.command)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if not cmd:
-        print("mellyn pin failed: downstream MCP server command is required (e.g. `-- npx ...`).", file=sys.stderr)
+
+    oauth_as = _split_csv_list(args.oauth_as)
+    oauth_scopes = _split_csv_list(args.scopes)
+    has_oauth_flags = any(
+        [
+            args.oauth_flow,
+            oauth_as,
+            args.bearer_token_env,
+            args.client_id,
+            args.client_id_env,
+            args.client_secret_env,
+            oauth_scopes,
+        ]
+    )
+
+    if args.url is not None and cmd:
+        print("mellyn pin failed: specify either --url or a stdio command after `--`, not both.", file=sys.stderr)
         return 2
 
+    if args.url is None:
+        if has_oauth_flags:
+            print("mellyn pin failed: --oauth-* flags require --url (streamable-http transport).", file=sys.stderr)
+            return 2
+        if not cmd:
+            print("mellyn pin failed: downstream MCP server command or --url is required.", file=sys.stderr)
+            return 2
+    else:
+        if args.cwd is not None or args.allow_env:
+            print("mellyn pin failed: --cwd and --allow-env apply only to local stdio commands.", file=sys.stderr)
+            return 2
+        if has_oauth_flags and args.oauth_flow is None:
+            print("mellyn pin failed: --oauth-flow is required when passing OAuth flags.", file=sys.stderr)
+            return 2
+
     try:
-        result = inspect_gateway_server(
-            args.name,
-            cmd,
-            preset=args.preset,
-            trusted=args.trusted,
-            allowed_env_keys=args.allow_env,
-            timeout_seconds=args.timeout,
-            cwd=args.cwd,
-        )
+        if args.url is not None:
+            oauth_cfg: OAuthClientConfig | None = None
+            if args.oauth_flow is not None:
+                oauth_cfg = OAuthClientConfig(
+                    flow=args.oauth_flow,
+                    allowed_authorization_servers=oauth_as,
+                    client_id=args.client_id,
+                    client_id_env=args.client_id_env,
+                    client_secret_env=args.client_secret_env,
+                    bearer_token_env=args.bearer_token_env,
+                    scopes=oauth_scopes,
+                )
+            result = inspect_remote_gateway_server(
+                args.name,
+                args.url,
+                preset=args.preset,
+                trusted=args.trusted,
+                oauth=oauth_cfg,
+                timeout_seconds=args.timeout,
+            )
+        else:
+            result = inspect_gateway_server(
+                args.name,
+                cmd,
+                preset=args.preset,
+                trusted=args.trusted,
+                allowed_env_keys=args.allow_env,
+                timeout_seconds=args.timeout,
+                cwd=args.cwd,
+            )
         for warning in result.warnings:
             print(warning, file=sys.stderr)
         if args.config is not None:
             upsert_server_in_unified_toml(args.config, result)
-    except (GatewayPinError, PolicyLoadError, ValueError, OSError, RuntimeError) as exc:
+    except (GatewayPinError, PolicyLoadError, OAuthError, ValueError, OSError, RuntimeError) as exc:
         print(f"mellyn pin failed (fail-closed): {exc}", file=sys.stderr)
         return 2
 
     if args.json:
-        payload = {
+        payload: dict[str, Any] = {
             "server_name": result.server_name,
+            "transport": result.transport,
             "command": list(result.command),
+            "url": result.url,
             "preset": result.preset,
             "trusted": result.trusted,
             "tools_count": len(result.tools),
@@ -657,7 +898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
     else:
         print(
-            f"Pinned MCP server '{result.server_name}' ({len(result.tools)} tools, "
+            f"Pinned MCP server '{result.server_name}' ({result.transport}, {len(result.tools)} tools, "
             f"trusted={str(result.trusted).lower()}, tools_sha256={result.tools_sha256})"
         )
         if args.config is not None:
@@ -674,6 +915,7 @@ __all__ = [
     "GatewayPinResult",
     "build_pin_env",
     "inspect_gateway_server",
+    "inspect_remote_gateway_server",
     "main",
     "render_server_block",
     "upsert_server_in_unified_toml",

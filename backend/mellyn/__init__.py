@@ -11,6 +11,7 @@ from mellyn.audit import (
 from mellyn.authorizer import Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import EgressValidator, WorkspacePathGuard
+from mellyn.http_downstream import StreamableHttpDownstream
 
 # MCPGateway is not re-exported here: `python -m mellyn.mcp_gateway` would otherwise import the module twice
 # (once via this package, once as __main__). Import it from mellyn.mcp_gateway.
@@ -23,10 +24,12 @@ from mellyn.models import (
     TaintSource,
     ToolCallRequest,
 )
+from mellyn.oauth_client import OAuthClientConfig, OAuthError, OAuthToken, OAuthTokenProvider
 from mellyn.pin_gateway import (
     GatewayPinError,
     GatewayPinResult,
     inspect_gateway_server,
+    inspect_remote_gateway_server,
     upsert_server_in_unified_toml,
 )
 from mellyn.policy import (
@@ -59,6 +62,10 @@ __all__ = [
     "GatewayPinResult",
     "InMemoryStateStore",
     "MCP_CAPABILITY_PRESETS",
+    "OAuthClientConfig",
+    "OAuthError",
+    "OAuthToken",
+    "OAuthTokenProvider",
     "PolicyConfig",
     "PolicyEngine",
     "PolicyLoadError",
@@ -74,12 +81,14 @@ __all__ = [
     "SessionLimitError",
     "SqliteStateStore",
     "StateStoreError",
+    "StreamableHttpDownstream",
     "TaintSource",
     "ToolCallRequest",
     "ToolCapability",
     "UnifiedConfig",
     "WorkspacePathGuard",
     "inspect_gateway_server",
+    "inspect_remote_gateway_server",
     "load_mellyn_config",
     "load_policy_file",
     "load_unified_config",

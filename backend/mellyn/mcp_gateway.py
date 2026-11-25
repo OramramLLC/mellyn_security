@@ -47,22 +47,33 @@ from mellyn.audit import AuditChainError, AuditLogger
 from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import WorkspaceConfigError, check_workspace_root
+from mellyn.http_downstream import StreamableHttpDownstream
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
-from mellyn.models import Decision, TaintSource, ToolCallRequest, canonical_json
+from mellyn.models import (
+    DOWNSTREAM_ERROR,
+    DOWNSTREAM_TIMEOUT_SECONDS,
+    MAX_LINE_BYTES,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    Decision,
+    GatewayLocalError,
+    TaintSource,
+    ToolCallRequest,
+    canonical_json,
+    jsonrpc_error,
+    local_downstream_error,
+)
+from mellyn.oauth_client import OAuthError
 from mellyn.policy_loader import PolicyLoadError
 from mellyn.scanner import ScannerConfig, ScanResult, invisible_unicode_tools, scan_value
 from mellyn.state_store import SqliteStateStore, StateStoreError
 from mellyn.unified_config import load_mellyn_config
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
-MAX_LINE_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_INBOX_MESSAGES = 256
 DEFAULT_MAX_INBOX_BYTES = 8 * 1024 * 1024
 MAX_LIST_PAGES = 20
-DOWNSTREAM_TIMEOUT_SECONDS = 60.0
 INIT_TIMEOUT_SECONDS = 30.0
 TOOL_SEPARATOR = "__"
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 GATEWAY_INFO = {"name": "mellyn-gateway", "version": "1.0.0"}
 
 # JSON-RPC 2.0 standard and Mellyn Security gateway error codes
@@ -71,7 +82,6 @@ JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
-DOWNSTREAM_ERROR = -32000
 MELLYN_APPROVAL_REQUIRED = -32001
 MELLYN_POLICY_DENIED = -32003
 MELLYN_AAD_CONTAINED = -32099
@@ -81,31 +91,13 @@ _DOWNSTREAM_METHODS = frozenset({"tools/list", "tools/call", "resources/list", "
 # Content-free notifications that are safe to pass from a downstream server to the client.
 FORWARDED_SERVER_NOTIFICATIONS = frozenset({"notifications/tools/list_changed", "notifications/resources/list_changed"})
 
-
-class GatewayLocalError(dict):
-    """
-    A JSON-RPC error the gateway generated itself because a downstream server never answered (timeout,
-    closed pipe, refused input). It carries no server-written text, so it does not taint the session.
-
-    Replies a server actually sent are parsed with json.loads into plain `dict`s, so a server cannot make
-    its own reply look like one of these, whatever fields it includes.
-    """
-
-
-def _local_downstream_error(req_id: Any, message: str) -> GatewayLocalError:
-    return GatewayLocalError(_jsonrpc_error(req_id, DOWNSTREAM_ERROR, message))
+_local_downstream_error = local_downstream_error
+_jsonrpc_error = jsonrpc_error
 
 
 def _came_from_server(response: Mapping[str, Any]) -> bool:
     """True when a downstream server wrote this reply (a result OR an error), so its text reaches the agent."""
     return not isinstance(response, GatewayLocalError)
-
-
-def _jsonrpc_error(req_id: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
-    error_body: dict[str, Any] = {"code": code, "message": message}
-    if data is not None:
-        error_body["data"] = data
-    return {"jsonrpc": "2.0", "id": req_id, "error": error_body}
 
 
 def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
@@ -1255,6 +1247,23 @@ def _inside(path: Path, root: Path) -> str | None:
         return None
 
 
+def check_token_caches_outside_workspace(servers: Sequence[Any], workspace_root: Path) -> None:
+    """
+    Refuse an OAuth token cache inside the agent's workspace.
+
+    Protected paths only stop the agent writing a file, not reading it, and a cache holds live access and refresh
+    tokens: an agent that can read one can call the downstream server directly, around the gateway.
+    """
+    for spec in servers:
+        oauth = getattr(spec, "oauth", None)
+        cache = getattr(oauth, "token_cache_path", None) if oauth is not None else None
+        if cache is not None and _inside(Path(cache), workspace_root) is not None:
+            raise ValueError(
+                f"Server '{spec.name}' keeps its OAuth token cache inside the workspace ('{cache}'), where the "
+                "agent's tools could read it. Move oauth.token_cache_path outside the workspace."
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mellyn Security — MCP stdio JSON-RPC gateway")
     parser.add_argument("--config", type=Path, required=True, help="Gateway or unified config (.toml)")
@@ -1369,6 +1378,11 @@ def main(argv: list[str] | None = None) -> int:
                 state_db_path.with_name(f"{state_db_path.name}-shm"),
             ]
         )
+    try:
+        check_token_caches_outside_workspace(config.servers, workspace_root)
+    except ValueError as exc:
+        print(f"Gateway config rejected (fail-closed): {exc}", file=sys.stderr)
+        return 2
     own_files = [_inside(p, workspace_root) for p in protected_inputs]
     policy = dataclasses.replace(policy, protected_paths=(*policy.protected_paths, *[p for p in own_files if p]))
 
@@ -1379,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Approvals disabled ({exc}); calls needing approval will be denied.", file=sys.stderr)
 
     approval_server: ApprovalHTTPServer | None = None
-    servers: dict[str, StdioDownstream] = {}
+    servers: dict[str, Downstream] = {}
     audit_file: IO[str] | None = None
     state_store: SqliteStateStore | None = None
     gateway: MCPGateway | None = None
@@ -1394,19 +1408,31 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         for spec in config.servers:
-            servers[spec.name] = StdioDownstream(
-                spec.name,
-                spec.command,
-                cwd=workspace_root,
-                launcher_cwd=launcher_cwd,
-                user=ds_uid,
-                group=ds_gid,
-                child_home=ds_home,
-                child_username=ds_name,
-                on_notification=on_notification,
-            )
+            if spec.transport == "stdio":
+                servers[spec.name] = StdioDownstream(
+                    spec.name,
+                    spec.command,
+                    cwd=workspace_root,
+                    launcher_cwd=launcher_cwd,
+                    user=ds_uid,
+                    group=ds_gid,
+                    child_home=ds_home,
+                    child_username=ds_name,
+                    on_notification=on_notification,
+                )
         if args.gateway_user is not None:
             _drop_gateway_privileges(args.gateway_user)
+        for spec in config.servers:
+            if spec.transport == "streamable-http":
+                if spec.url is None:
+                    raise RuntimeError(f"Server '{spec.name}' missing URL for streamable-http transport.")
+                servers[spec.name] = StreamableHttpDownstream(
+                    spec.name,
+                    spec.url,
+                    oauth_config=spec.oauth,
+                    allowed_domains=policy.allowed_egress_domains,
+                    on_notification=on_notification,
+                )
 
         audit_logger, audit_file = AuditLogger.open_chained(
             audit_log_path,
@@ -1460,7 +1486,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_observe_mode=unified.runtime.allow_observe_mode,
         )
         return run_stdio_proxy(gateway=gateway, client_in=sys.stdin, client_out=sys.stdout)
-    except (OSError, RuntimeError, ValueError, AuditChainError, StateStoreError) as exc:
+    except (OSError, RuntimeError, ValueError, AuditChainError, StateStoreError, OAuthError) as exc:
         print(f"Gateway stopped (fail-closed): {exc}", file=sys.stderr)
         return 2
     finally:
