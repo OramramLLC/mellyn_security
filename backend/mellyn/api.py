@@ -97,7 +97,7 @@ def create_app(
                 if _owned_sink is not None and not _owned_sink.closed:
                     _owned_sink.close()
 
-    app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="0.1.0", lifespan=_lifespan)
+    app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="1.0.0", lifespan=_lifespan)
     authorizer = Authorizer(
         workspace_root=workspace_root or Path.cwd(),
         policy_config=policy_config,

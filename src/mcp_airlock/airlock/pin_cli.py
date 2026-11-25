@@ -148,7 +148,7 @@ async def inspect_mcp_server(
                     "params": {
                         "protocolVersion": "2025-06-18",
                         "capabilities": {},
-                        "clientInfo": {"name": "mellyn-pin", "version": "0.1.0"},
+                        "clientInfo": {"name": "mellyn-pin", "version": "1.0.0"},
                     },
                 },
             )

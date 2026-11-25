@@ -61,7 +61,7 @@ DOWNSTREAM_TIMEOUT_SECONDS = 60.0
 INIT_TIMEOUT_SECONDS = 30.0
 TOOL_SEPARATOR = "__"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-GATEWAY_INFO = {"name": "mellyn-gateway", "version": "0.1.0"}
+GATEWAY_INFO = {"name": "mellyn-gateway", "version": "1.0.0"}
 
 # JSON-RPC 2.0 standard and Mellyn Security gateway error codes
 JSONRPC_PARSE_ERROR = -32700

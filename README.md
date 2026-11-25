@@ -123,6 +123,9 @@ PYTHONPATH=backend python -m mellyn.viewer_server \
 - [**OWASP AI-Assisted & Agentic Coding Security Synthesis**](docs/OWASP_AI_CODING_SECURITY.md)
 - [**System & B2B Reference Architecture**](docs/ARCHITECTURE.md)
 - [**Runtime Gateway Threat Model**](docs/THREAT_MODEL.md)
+- [**Security Policy & Coordinated Disclosure**](SECURITY.md)
+- [**Release Changelog**](CHANGELOG.md)
+- [**License: Apache-2.0**](LICENSE) (see also [`NOTICE`](NOTICE))
 
 ---
 
