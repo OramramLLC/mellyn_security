@@ -7,6 +7,8 @@
 *.crt
 secrets/
 credentials.json
+# Audit ledgers and reports mounted into mellyn-viewer (deploy/docker-compose.yml, MELLYN_EVIDENCE_DIR)
+evidence/
 
 # Python
 __pycache__/
