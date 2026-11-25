@@ -1,6 +1,13 @@
 """Mellyn Security — Authorization-First MCP Tool-Call Security Engine."""
 
-from mellyn.audit import AuditEvent, AuditLogger
+from mellyn.audit import (
+    AuditChainError,
+    AuditEvent,
+    AuditLogger,
+    ChainVerificationResult,
+    verify_gateway_audit_file,
+    verify_gateway_audit_lines,
+)
 from mellyn.authorizer import Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import EgressValidator, WorkspacePathGuard
@@ -26,14 +33,18 @@ from mellyn.policy import (
     ToolCapability,
 )
 from mellyn.policy_loader import PolicyLoadError, load_policy_file, parse_policy_dict
+from mellyn.scanner import ScanFinding, ScannerConfig, ScanResult, scan_value
 from mellyn.state_store import InMemoryStateStore, SessionLimitError, SqliteStateStore, StateStoreError
+from mellyn.unified_config import UnifiedConfig, load_mellyn_config, load_unified_config
 
 __all__ = [
     "ApprovalGrant",
+    "AuditChainError",
     "AuditEvent",
     "AuditLogger",
     "AuthorizationResult",
     "Authorizer",
+    "ChainVerificationResult",
     "CredentialConfig",
     "CredentialConfigError",
     "Decision",
@@ -47,6 +58,9 @@ __all__ = [
     "RiskTier",
     "Role",
     "SMB_SERVER_PRESETS",
+    "ScanFinding",
+    "ScanResult",
+    "ScannerConfig",
     "ScopedRule",
     "ServerPresetProfile",
     "SessionLimitError",
@@ -55,7 +69,13 @@ __all__ = [
     "TaintSource",
     "ToolCallRequest",
     "ToolCapability",
+    "UnifiedConfig",
     "WorkspacePathGuard",
+    "load_mellyn_config",
     "load_policy_file",
+    "load_unified_config",
     "parse_policy_dict",
+    "scan_value",
+    "verify_gateway_audit_file",
+    "verify_gateway_audit_lines",
 ]

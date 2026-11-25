@@ -40,17 +40,19 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import IO, Any, BinaryIO, Protocol, TextIO
+from typing import IO, Any, BinaryIO, Literal, Protocol, TextIO
 
 from mellyn.approvals import ApprovalHTTPServer, PendingApprovals
-from mellyn.audit import AuditLogger
+from mellyn.audit import AuditChainError, AuditLogger
 from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import WorkspaceConfigError, check_workspace_root
-from mellyn.gateway_config import load_gateway_config
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
 from mellyn.models import Decision, TaintSource, ToolCallRequest, canonical_json
-from mellyn.policy_loader import PolicyLoadError, load_policy_file
+from mellyn.policy_loader import PolicyLoadError
+from mellyn.scanner import ScannerConfig, ScanResult, scan_value
+from mellyn.state_store import SqliteStateStore, StateStoreError
+from mellyn.unified_config import load_mellyn_config
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 MAX_LINE_BYTES = 4 * 1024 * 1024
@@ -72,6 +74,9 @@ JSONRPC_INTERNAL_ERROR = -32603
 DOWNSTREAM_ERROR = -32000
 MELLYN_APPROVAL_REQUIRED = -32001
 MELLYN_POLICY_DENIED = -32003
+MELLYN_AAD_CONTAINED = -32099
+# Methods that reach a downstream server; all are refused once AAD containment has severed the session.
+_DOWNSTREAM_METHODS = frozenset({"tools/list", "tools/call", "resources/list", "resources/read"})
 
 # Content-free notifications that are safe to pass from a downstream server to the client.
 FORWARDED_SERVER_NOTIFICATIONS = frozenset({"notifications/tools/list_changed", "notifications/resources/list_changed"})
@@ -620,6 +625,33 @@ class StdioDownstream:
         if self.proc.stdout is not None and not self._reader.is_alive():
             self.proc.stdout.close()
 
+    def kill_now(self) -> None:
+        """Immediately sever stdin/inbox and terminate the downstream process for AAD containment."""
+        self._closed = True
+        inbox = getattr(self, "_inbox", None)
+        if inbox is not None:
+            inbox.close()
+        writer_thread = getattr(self, "_writer_thread", None)
+        writer_stuck = writer_thread is not None and writer_thread.is_alive()
+        try:
+            if self.proc.stdin is not None and not writer_stuck:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=2)
+        except (PermissionError, OSError, subprocess.TimeoutExpired):
+            pass
+        reader = getattr(self, "_reader", None)
+        if reader is not None:
+            reader.join(timeout=2)
+            if self.proc.stdout is not None and not reader.is_alive():
+                try:
+                    self.proc.stdout.close()
+                except OSError:
+                    pass
+
 
 def initialize_downstream(server: Downstream, timeout: float = INIT_TIMEOUT_SECONDS) -> None:
     """Run the MCP handshake with a downstream server. Raises RuntimeError if it fails."""
@@ -647,18 +679,110 @@ class MCPGateway:
         approvals: PendingApprovals | None = None,
         notify_client: Callable[[dict[str, Any]], None] | None = None,
         session_id: str | None = None,
+        scanner_config: ScannerConfig | None = None,
+        mode: Literal["enforce", "observe"] = "enforce",
+        allow_observe_mode: bool = False,
     ) -> None:
         if not servers:
             raise ValueError("The gateway needs at least one downstream server.")
         for name in servers:
             if TOOL_SEPARATOR in name or not name:
                 raise ValueError(f"Server name '{name}' must not be empty or contain '{TOOL_SEPARATOR}'.")
+        if mode not in ("enforce", "observe"):
+            raise ValueError(f"Unsupported gateway mode {mode!r}; expected 'enforce' or 'observe'.")
+        if mode == "observe" and not allow_observe_mode:
+            raise ValueError("Observe mode requires explicit allow_observe_mode = true (fail closed).")
         self.authorizer = authorizer
         self.servers = dict(servers)
         self.approvals = approvals
         self.notify_client = notify_client or (lambda _msg: None)
         self.session_id = session_id or authorizer.create_session()
+        self.scanner_config = scanner_config
+        self.mode: Literal["enforce", "observe"] = mode
+        self.allow_observe_mode = allow_observe_mode
+        self._quarantined_servers: set[str] = set()
+        self._aad_tripped = False
         self._resource_owner: dict[str, str | None] = {}  # uri -> server (None when two servers claim it)
+
+    # ---- AAD & Scanner helpers -------------------------------------------------------------------
+
+    def _trigger_aad(self, server_name: str) -> None:
+        """
+        Sever the whole session, not just `server_name`, as the Airlock does.
+
+        A canary in a request means the agent already holds it (response scanning missed it once), so every other
+        server is the obvious next way out. All servers are stopped and every later call is refused.
+        """
+        del server_name  # the trigger is recorded in the audit log; containment covers every server
+        self._aad_tripped = True
+        self._quarantined_servers.update(self.servers)
+        for server in self.servers.values():
+            kill_fn = getattr(server, "kill_now", None)
+            try:
+                if callable(kill_fn):
+                    kill_fn()
+                else:
+                    server.close()
+            except Exception as exc:  # noqa: BLE001 - one server failing to stop must not leave the others running
+                print(f"AAD: could not stop downstream server '{server.name}': {exc}", file=sys.stderr)
+
+    def _apply_scanner(
+        self,
+        req_id: Any,
+        *,
+        server_name: str,
+        tool_name: str,
+        payload: Any,
+        direction: Literal["request", "response"],
+    ) -> dict[str, Any] | None:
+        if self.scanner_config is None:
+            return None
+        scan: ScanResult = scan_value(payload, self.scanner_config)
+        if scan.clean:
+            return None
+
+        is_aad = scan.canary_matched and self.scanner_config.aad_kill_on_leak
+        if self.mode == "observe":
+            decision_label = "observed_aad" if is_aad else "observed_block"
+        elif is_aad:
+            decision_label = "aad_fire"
+        else:
+            decision_label = "blocked_egress"
+
+        # Rule IDs only. A hash of the matched value would let anyone holding the log confirm a guessed canary or
+        # secret, and field paths include dict keys, which are attacker-controlled text.
+        rule_summary = ", ".join(sorted({f"{f.kind}:{f.rule_id}" for f in scan.findings}))
+        snap = self.authorizer._state.get_session_snapshot(self.session_id)
+        self.authorizer.audit.record_containment(
+            session_id=self.session_id,
+            tool_name=tool_name,
+            mcp_server=server_name,
+            decision=decision_label,
+            reasons=(f"Egress scanner {direction} match ({rule_summary}).",),
+            payload=payload,
+            tainted=bool(snap and snap.tainted),
+            taint_count=snap.taint_count if snap else 0,
+            taint_sources=snap.taint_entries if snap else (),
+            enforcement_mode=self.mode,
+        )
+
+        if self.mode == "observe":
+            return None
+
+        if is_aad:
+            self._trigger_aad(server_name)
+            return _jsonrpc_error(
+                req_id,
+                MELLYN_AAD_CONTAINED,
+                "AAD containment severed this session: a canary was detected and every downstream server was stopped.",
+                {"decision": "aad_fire", "mcp_server": server_name},
+            )
+        return _jsonrpc_error(
+            req_id,
+            MELLYN_POLICY_DENIED,
+            f"Tool {direction} blocked by Mellyn Security egress scanner.",
+            {"decision": Decision.DENY.value, "mcp_server": server_name},
+        )
 
     # ---- Taint helpers --------------------------------------------------------------------------
 
@@ -710,6 +834,10 @@ class MCPGateway:
         if handler is None:
             return _jsonrpc_error(
                 req_id, JSONRPC_METHOD_NOT_FOUND, f"Method '{method}' is not permitted by the gateway."
+            )
+        if self._aad_tripped and method in _DOWNSTREAM_METHODS:
+            return _jsonrpc_error(
+                req_id, MELLYN_AAD_CONTAINED, "This session was severed by AAD containment; start a new session."
             )
         return handler(req_id, params)
 
@@ -809,6 +937,12 @@ class MCPGateway:
                     )
             else:
                 listed = [t for t in self._list_all(server, "tools/list", "tools") if _valid_name(t.get("name"))]
+            # Tool names and descriptions are server-written text the agent reads, so they are scanned like results.
+            listing_err = self._apply_scanner(
+                req_id, server_name=name, tool_name="tools/list", payload=listed, direction="response"
+            )
+            if listing_err is not None:
+                return listing_err
             for tool in listed:
                 tools.append({**tool, "name": f"{name}{TOOL_SEPARATOR}{tool['name']}"})
             if listed and name not in pinned:
@@ -820,6 +954,11 @@ class MCPGateway:
         owners: dict[str, str | None] = {}
         for name, server in self.servers.items():
             listed = [r for r in self._list_all(server, "resources/list", "resources") if isinstance(r.get("uri"), str)]
+            listing_err = self._apply_scanner(
+                req_id, server_name=name, tool_name="resources/list", payload=listed, direction="response"
+            )
+            if listing_err is not None:
+                return listing_err
             for resource in listed:
                 uri = resource["uri"]
                 owners[uri] = None if uri in owners and owners[uri] != name else name
@@ -836,6 +975,12 @@ class MCPGateway:
         server_name, _, tool_name = exposed.partition(TOOL_SEPARATOR)
         if server_name not in self.servers or not _valid_name(tool_name):
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, f"Unknown tool '{exposed}'.")
+        if server_name in self._quarantined_servers:
+            return _jsonrpc_error(
+                req_id,
+                MELLYN_AAD_CONTAINED,
+                f"Downstream server '{server_name}' is quarantined after AAD containment.",
+            )
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "tools/call 'arguments' must be a JSON object.")
@@ -845,6 +990,16 @@ class MCPGateway:
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, f"Invalid tool arguments: {exc}")
         if len(encoded_args) > MAX_ARGUMENTS_BYTES:
             return _jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "tools/call 'arguments' exceed 64 KiB.")
+
+        scan_err = self._apply_scanner(
+            req_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            payload=arguments,
+            direction="request",
+        )
+        if scan_err is not None:
+            return scan_err
 
         request = ToolCallRequest(
             self.session_id,
@@ -873,6 +1028,15 @@ class MCPGateway:
         # so an injection delivered as an error must taint just like one delivered as a result.
         if _came_from_server(response):
             self.authorizer.record_tool_result_taint(request)
+        resp_scan_err = self._apply_scanner(
+            req_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            payload=response,
+            direction="response",
+        )
+        if resp_scan_err is not None:
+            return resp_scan_err
         return _relay(req_id, response)
 
     def _resources_read(self, req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -884,6 +1048,21 @@ class MCPGateway:
             return _jsonrpc_error(
                 req_id, JSONRPC_INVALID_PARAMS, "Unknown or ambiguous resource URI; call resources/list first."
             )
+        if server_name in self._quarantined_servers:
+            return _jsonrpc_error(
+                req_id,
+                MELLYN_AAD_CONTAINED,
+                f"Downstream server '{server_name}' is quarantined after AAD containment.",
+            )
+        scan_err = self._apply_scanner(
+            req_id,
+            server_name=server_name,
+            tool_name=RESOURCE_READ_TOOL,
+            payload={"uri": uri},
+            direction="request",
+        )
+        if scan_err is not None:
+            return scan_err
         request = ToolCallRequest(
             self.session_id,
             RESOURCE_READ_TOOL,
@@ -901,6 +1080,15 @@ class MCPGateway:
         # so an injection delivered as an error must taint just like one delivered as a result.
         if _came_from_server(response):
             self.authorizer.record_tool_result_taint(request)
+        resp_scan_err = self._apply_scanner(
+            req_id,
+            server_name=server_name,
+            tool_name=RESOURCE_READ_TOOL,
+            payload=response,
+            direction="response",
+        )
+        if resp_scan_err is not None:
+            return resp_scan_err
         return _relay(req_id, response)
 
     def _authorize(
@@ -909,6 +1097,25 @@ class MCPGateway:
         """Return None when the call may proceed, otherwise the JSON-RPC error to send back."""
         result = self.authorizer.authorize(request, record_taint_on_allow=False, denial_reason=denial_reason)
         if result.decision == Decision.ALLOW:
+            return None
+        if self.mode == "observe" and result.decision == Decision.REQUIRE_APPROVAL:
+            # Observe mode lets a call that would wait for approval run, and records that it ran. It never relaxes
+            # DENY: denials cover the gateway's own config, audit log and state, secret files, and destructive
+            # commands, and one let through could change what is enforced long after the observe session ends.
+            snap = self.authorizer._state.get_session_snapshot(self.session_id)
+            self.authorizer.audit.record_containment(
+                session_id=self.session_id,
+                tool_name=request.tool_name,
+                mcp_server=request.mcp_server,
+                decision="observed_require_approval",
+                reasons=("Observe mode ran a call that needs human approval without waiting for it.",),
+                payload=request.arguments,
+                tainted=bool(snap and snap.tainted),
+                taint_count=snap.taint_count if snap else 0,
+                taint_sources=snap.taint_entries if snap else (),
+                enforcement_mode=self.mode,
+                policy_id="gateway.observe",
+            )
             return None
         # Full reasons go to the audit log and the approver, not to the agent: they would tell an injected
         # model exactly which rule to work around.
@@ -927,6 +1134,24 @@ class MCPGateway:
             f"Tool call is waiting for human approval ({pending.approval_id}). Retry the same call once approved.",
             data,
         )
+
+
+def resolve_gateway_mode(
+    cli_mode: str | None, *, config_mode: str, allow_observe_mode: bool
+) -> Literal["enforce", "observe"]:
+    """
+    Decide the gateway mode. Observe takes two separate opt-ins, as in the Airlock: the config must permit it
+    (`allow_observe_mode = true`) and the operator must pass `--mode observe`. The config alone never switches
+    enforcement off, so `config_mode` only matters for the warning the caller prints.
+    """
+    del config_mode
+    if cli_mode not in (None, "enforce", "observe"):
+        raise ValueError(f"Unsupported mode {cli_mode!r}; expected 'enforce' or 'observe'.")
+    if cli_mode == "observe":
+        if not allow_observe_mode:
+            raise ValueError("--mode observe requires [runtime].allow_observe_mode = true in the config.")
+        return "observe"
+    return "enforce"
 
 
 def _valid_name(name: Any) -> bool:
@@ -991,9 +1216,23 @@ def _inside(path: Path, root: Path) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mellyn Security — MCP stdio JSON-RPC gateway")
-    parser.add_argument("--config", type=Path, required=True, help="Gateway config (.toml) listing the servers")
+    parser.add_argument("--config", type=Path, required=True, help="Gateway or unified config (.toml)")
     parser.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace root directory")
-    parser.add_argument("--audit-log", type=Path, required=True, help="Append-only JSONL audit file")
+    parser.add_argument(
+        "--audit-log",
+        type=Path,
+        default=None,
+        help="Append-only hash-chained JSONL audit file (optional if runtime.audit_log is set in mellyn.toml)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("enforce", "observe"),
+        default=None,
+        help=(
+            "Execution mode (default: enforce). Observe needs this flag AND [runtime].allow_observe_mode = true; "
+            "it lets approval-required calls and scanner hits through and logs them, but never relaxes a DENY"
+        ),
+    )
     parser.add_argument("--approval-port", type=int, default=0, help="Local approval server port (0 = any free)")
     parser.add_argument(
         "--approval-host",
@@ -1016,12 +1255,32 @@ def main(argv: list[str] | None = None) -> int:
     launcher_cwd = Path.cwd()
     try:
         check_no_legacy_env()
-        config = load_gateway_config(args.config)
-        policy = load_policy_file(config.policy_path)
+        unified = load_mellyn_config(args.config)
+        config = unified.gateway
+        policy = unified.policy
         check_workspace_root(args.workspace, require_mount=os.environ.get("MELLYN_REQUIRE_WORKSPACE_MOUNT") == "1")
     except (PolicyLoadError, WorkspaceConfigError, LegacyConfigError) as exc:
         print(f"Gateway config, policy or workspace rejected (fail-closed): {exc}", file=sys.stderr)
         return 2
+
+    try:
+        effective_mode = resolve_gateway_mode(
+            args.mode, config_mode=unified.runtime.mode, allow_observe_mode=unified.runtime.allow_observe_mode
+        )
+    except ValueError as exc:
+        print(f"Observe mode rejected (fail-closed): {exc}", file=sys.stderr)
+        return 2
+    if unified.runtime.mode == "observe" and effective_mode == "enforce":
+        print(
+            "Config sets [runtime].mode = 'observe', but observe mode also needs --mode observe; running in enforce.",
+            file=sys.stderr,
+        )
+
+    raw_audit_path = args.audit_log or unified.runtime.audit_log
+    if raw_audit_path is None:
+        print("Gateway requires --audit-log (or [runtime].audit_log in mellyn.toml).", file=sys.stderr)
+        return 2
+
     if policy.allowed_mcp_servers is None:
         print("Gateway mode requires 'allowed_mcp_servers' in the policy (fail-closed).", file=sys.stderr)
         return 2
@@ -1031,7 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     workspace_root = args.workspace.resolve()
-    audit_log_path = args.audit_log.resolve()
+    audit_log_path = raw_audit_path.resolve()
 
     ds_uid: int | None = None
     ds_gid: int | None = None
@@ -1059,7 +1318,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # The agent must never be able to edit the files that control or record its own enforcement.
-    own_files = [_inside(p, workspace_root) for p in (config.path, config.policy_path, audit_log_path)]
+    protected_inputs: list[Path] = [config.path, config.policy_path, audit_log_path]
+    if unified.runtime.state_db is not None:
+        state_db_path = unified.runtime.state_db
+        protected_inputs.extend(
+            [
+                state_db_path,
+                state_db_path.with_name(f"{state_db_path.name}-wal"),
+                state_db_path.with_name(f"{state_db_path.name}-shm"),
+            ]
+        )
+    own_files = [_inside(p, workspace_root) for p in protected_inputs]
     policy = dataclasses.replace(policy, protected_paths=(*policy.protected_paths, *[p for p in own_files if p]))
 
     credentials: CredentialConfig | None = None
@@ -1071,6 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
     approval_server: ApprovalHTTPServer | None = None
     servers: dict[str, StdioDownstream] = {}
     audit_file: IO[str] | None = None
+    state_store: SqliteStateStore | None = None
     gateway: MCPGateway | None = None
 
     def notify_client(message: dict[str, Any]) -> None:
@@ -1097,8 +1367,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.gateway_user is not None:
             _drop_gateway_privileges(args.gateway_user)
 
-        audit_fd = os.open(audit_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        audit_file = os.fdopen(audit_fd, "a", encoding="utf-8")
+        audit_logger, audit_file = AuditLogger.open_chained(
+            audit_log_path,
+            canary_tokens=unified.scanner.canary_tokens,
+            enforcement_mode=effective_mode,
+        )
+        if unified.runtime.state_db is not None:
+            state_store = SqliteStateStore(unified.runtime.state_db)
 
         # One session for the life of the process: no idle expiry, or a client left open overnight would be
         # locked out (the expired session fails closed and the gateway cannot mint a clean one without
@@ -1106,8 +1381,9 @@ def main(argv: list[str] | None = None) -> int:
         authorizer = Authorizer(
             workspace_root=workspace_root,
             policy_config=policy,
-            audit_logger=AuditLogger(audit_file),
+            audit_logger=audit_logger,
             session_ttl_seconds=None,
+            state_store=state_store,
         )
         approvals: PendingApprovals | None = None
         if credentials is not None:
@@ -1118,11 +1394,26 @@ def main(argv: list[str] | None = None) -> int:
             approval_server.start_in_background()
             print(f"Approvals: python -m mellyn.approve --url {approval_server.url} list", file=sys.stderr)
 
+        if effective_mode == "observe":
+            print(
+                "WARNING: mellyn-gateway running in --mode observe "
+                "(policy/scanner violations are forwarded and logged, not blocked).",
+                file=sys.stderr,
+            )
+
         for srv in servers.values():
             initialize_downstream(srv)
-        gateway = MCPGateway(authorizer=authorizer, servers=servers, approvals=approvals, notify_client=notify_client)
+        gateway = MCPGateway(
+            authorizer=authorizer,
+            servers=servers,
+            approvals=approvals,
+            notify_client=notify_client,
+            scanner_config=unified.scanner,
+            mode=effective_mode,
+            allow_observe_mode=unified.runtime.allow_observe_mode,
+        )
         return run_stdio_proxy(gateway=gateway, client_in=sys.stdin, client_out=sys.stdout)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, AuditChainError, StateStoreError) as exc:
         print(f"Gateway stopped (fail-closed): {exc}", file=sys.stderr)
         return 2
     finally:
@@ -1131,6 +1422,8 @@ def main(argv: list[str] | None = None) -> int:
         if approval_server is not None:
             approval_server.shutdown()
             approval_server.server_close()
+        if state_store is not None:
+            state_store.close()
         if audit_file is not None and not audit_file.closed:
             audit_file.close()
 

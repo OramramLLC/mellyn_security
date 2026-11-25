@@ -108,9 +108,11 @@ V1/
 │       ├── egress_proxy.py          # Policy-synced Squid forward-proxy config generator (TM-02)
 │       ├── policy.py                # Capability bindings, presets, type-strict rules & argv evaluator guard
 │       ├── policy_loader.py         # Fail-closed TOML/JSON policy loader
+│       ├── unified_config.py        # Unified schema_version=2 mellyn.toml loader/renderer + v1 compatibility
+│       ├── scanner.py               # Stdlib obfuscated canary, secret & custom regex scanner
 │       ├── authorizer.py            # Core Authorizer: sessions, taint, capabilities, policy, grants & audit
 │       ├── state_store.py           # Fail-closed SQLite & in-memory state backends for sessions, taint & grants
-│       ├── audit.py                 # Redacted structured JSONL audit logger
+│       ├── audit.py                 # Redacted, hash-chained structured JSONL audit logger & verifier
 │       ├── credentials.py           # Role-separated agent/approver/viewer keys as HMAC-SHA256(pepper, key) digests
 │       ├── legacy_env.py            # Refuses to start while pre-rename variables are still set
 │       ├── gateway_config.py        # Strict loader for the MCP gateway's downstream server list

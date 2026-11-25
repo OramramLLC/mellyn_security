@@ -19,8 +19,8 @@ from mellyn.egress import check_workspace_root
 from mellyn.legacy_env import check_no_legacy_env
 from mellyn.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
 from mellyn.policy import PolicyConfig
-from mellyn.policy_loader import load_policy_file
 from mellyn.state_store import AuthorizerStateStore, SqliteStateStore, StateStoreError
+from mellyn.unified_config import load_policy_any
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
 _STRICT = ConfigDict(extra="forbid", strict=True)
@@ -223,7 +223,8 @@ def create_app_from_env() -> FastAPI:
     """
     check_no_legacy_env()  # a half-migrated deployment must not start with its old settings silently ignored
     policy_path_raw = os.environ.get("MELLYN_POLICY_PATH", "").strip()
-    policy_config = load_policy_file(Path(policy_path_raw)) if policy_path_raw else None
+    # Either a v1 policy file or a v2 mellyn.toml: `mellyn init --unified` points MELLYN_POLICY_PATH at the latter.
+    policy_config = load_policy_any(Path(policy_path_raw)) if policy_path_raw else None
 
     workspace_raw = os.environ.get("MELLYN_WORKSPACE_ROOT", "").strip()
     workspace_root = Path(workspace_raw) if workspace_raw else Path.cwd()
