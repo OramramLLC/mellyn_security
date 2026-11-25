@@ -18,6 +18,7 @@ from mellyn.models import (
 )
 from mellyn.policy import MCP_CAPABILITY_PRESETS, PolicyConfig, PolicyEngine, ScopedRule, ToolCapability
 from mellyn.policy_loader import PolicyLoadError, load_policy_file, parse_policy_dict
+from mellyn.state_store import InMemoryStateStore, SessionLimitError, SqliteStateStore, StateStoreError
 
 __all__ = [
     "ApprovalGrant",
@@ -29,6 +30,7 @@ __all__ = [
     "CredentialConfigError",
     "Decision",
     "EgressValidator",
+    "InMemoryStateStore",
     "MCP_CAPABILITY_PRESETS",
     "PolicyConfig",
     "PolicyEngine",
@@ -37,6 +39,9 @@ __all__ = [
     "RiskTier",
     "Role",
     "ScopedRule",
+    "SessionLimitError",
+    "SqliteStateStore",
+    "StateStoreError",
     "TaintSource",
     "ToolCallRequest",
     "ToolCapability",

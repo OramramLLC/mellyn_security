@@ -41,6 +41,7 @@ services:
       MELLYN_WORKSPACE_ROOT: /workspace
       MELLYN_REQUIRE_WORKSPACE_MOUNT: "1"
       MELLYN_AUDIT_LOG_PATH: /var/log/mellyn/audit.jsonl
+      MELLYN_STATE_DB_PATH: /var/lib/mellyn/state.db
     ports:
       # Loopback only; put an internal TLS reverse proxy in front if other hosts must reach it.
       - "127.0.0.1:8000:8000"
@@ -49,6 +50,7 @@ services:
       - ${MELLYN_WORKSPACE:?Set MELLYN_WORKSPACE to the absolute path of the agent workspace}:/workspace:ro
       - ../config:/etc/mellyn:ro
       - mellyn-authorizer-audit-logs:/var/log/mellyn
+      - mellyn-authorizer-state:/var/lib/mellyn
     networks:
       - mellyn-frontend
     tmpfs:
@@ -207,4 +209,5 @@ networks:
 
 volumes:
   mellyn-authorizer-audit-logs:
+  mellyn-authorizer-state:
   mellyn-gateway-audit-logs:

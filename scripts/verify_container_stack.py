@@ -71,6 +71,7 @@ SQUID_CONTAINER = "mellyn-ci-squid"
 AUTH_CONTAINER = "mellyn-ci-authorizer"
 VIEWER_CONTAINER = "mellyn-ci-viewer"
 OUTSIDE_TARGET_CONTAINER = "mellyn-ci-outside-target"
+AUTH_STATE_VOLUME = "mellyn-ci-auth-state"
 GW_AUDIT_VOLUME = "mellyn-ci-gw-audit"
 VIEWER_EVIDENCE_VOLUME = "mellyn-ci-viewer-evidence"
 
@@ -347,7 +348,7 @@ def cleanup() -> None:
         run_cmd(["docker", "rm", "-f", name], check=False)
     for net in (INTERNAL_NET, EXT_NET):
         run_cmd(["docker", "network", "rm", net], check=False)
-    for vol in (GW_AUDIT_VOLUME, VIEWER_EVIDENCE_VOLUME):
+    for vol in (AUTH_STATE_VOLUME, GW_AUDIT_VOLUME, VIEWER_EVIDENCE_VOLUME):
         run_cmd(["docker", "volume", "rm", "-f", vol], check=False)
 
 
@@ -573,11 +574,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             os.chmod(squid_conf, 0o644)
 
-            print("[3/5] Verifying mellyn-authorizer healthz and role-separated credentials...")
+            print("[3/5] Verifying mellyn-authorizer healthz, role separation, and persistence across restart...")
             pepper = secrets.token_urlsafe(32)
             agent_key = secrets.token_urlsafe(32)
             approver_key = secrets.token_urlsafe(32)
 
+            run_cmd(["docker", "volume", "create", AUTH_STATE_VOLUME])
             run_cmd(
                 [
                     "docker",
@@ -600,6 +602,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{ws_dir}:/workspace:ro",
                     "-v",
                     f"{REPO_ROOT / 'config' / 'mellyn-policy.example.toml'}:/etc/mellyn/policy.toml:ro",
+                    "-v",
+                    f"{AUTH_STATE_VOLUME}:/var/lib/mellyn",
                     "-e",
                     f"MELLYN_API_KEY_PEPPER={pepper}",
                     "-e",
@@ -612,15 +616,27 @@ def main(argv: list[str] | None = None) -> int:
             wait_for_healthz("http://127.0.0.1:18000/healthz")
 
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            req_ok = urllib.request.Request(
-                "http://127.0.0.1:18000/v1/sessions",
-                method="POST",
-                headers={"X-Mellyn-API-Key": agent_key},
-            )
-            with opener.open(req_ok, timeout=5) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                if resp.status != 201 or not str(body.get("session_id", "")).startswith("ses_"):
-                    raise RuntimeError(f"Agent key did not create a session: {resp.status} {body}")
+
+            def _auth_post(
+                path: str, api_key: str, payload: dict[str, object] | None = None
+            ) -> tuple[int, dict[str, object]]:
+                data = None if payload is None else json.dumps(payload).encode("utf-8")
+                headers = {"X-Mellyn-API-Key": api_key}
+                if data is not None:
+                    headers["Content-Type"] = "application/json"
+                req = urllib.request.Request(  # noqa: S310
+                    f"http://127.0.0.1:18000{path}",
+                    data=data,
+                    method="POST",
+                    headers=headers,
+                )
+                with opener.open(req, timeout=5) as resp:
+                    return int(resp.status), json.loads(resp.read().decode("utf-8"))
+
+            status_code, body = _auth_post("/v1/sessions", agent_key)
+            sid = str(body.get("session_id", ""))
+            if status_code != 201 or not sid.startswith("ses_"):
+                raise RuntimeError(f"Agent key did not create a session: {status_code} {body}")
 
             req_forbidden = urllib.request.Request(
                 "http://127.0.0.1:18000/v1/sessions",
@@ -633,6 +649,53 @@ def main(argv: list[str] | None = None) -> int:
             except urllib.error.HTTPError as exc:
                 if exc.code != 403:
                     raise RuntimeError(f"Expected 403 for approver key on /v1/sessions, got {exc.code}") from exc
+
+            taint_status, _ = _auth_post(
+                f"/v1/sessions/{sid}/taint",
+                agent_key,
+                {"source_type": "web_page", "origin": "https://docs.python.org"},
+            )
+            if taint_status != 200:
+                raise RuntimeError(f"Expected 200 tainting session, got {taint_status}")
+
+            grant_status, _ = _auth_post(
+                f"/v1/sessions/{sid}/grants",
+                approver_key,
+                {
+                    "tool_name": "git_push",
+                    "arguments": {"branch": "feature/persist"},
+                    "approved_by": "ci-verifier@mellyn.security",
+                    "max_uses": 1,
+                },
+            )
+            if grant_status != 201:
+                raise RuntimeError(f"Expected 201 issuing grant, got {grant_status}")
+
+            run_cmd(["docker", "restart", AUTH_CONTAINER])
+            wait_for_healthz("http://127.0.0.1:18000/healthz")
+
+            _, write_res = _auth_post(
+                "/v1/agent/authorize",
+                agent_key,
+                {"session_id": sid, "tool_name": "workspace_write", "arguments": {"path": "hello.py"}},
+            )
+            if write_res.get("decision") != "require_approval" or write_res.get("tainted") is not True:
+                raise RuntimeError(f"Taint did not persist across authorizer restart: {write_res}")
+
+            _, push_first = _auth_post(
+                "/v1/agent/authorize",
+                agent_key,
+                {"session_id": sid, "tool_name": "git_push", "arguments": {"branch": "feature/persist"}},
+            )
+            _, push_retry = _auth_post(
+                "/v1/agent/authorize",
+                agent_key,
+                {"session_id": sid, "tool_name": "git_push", "arguments": {"branch": "feature/persist"}},
+            )
+            if push_first.get("decision") != "allow" or push_retry.get("decision") != "require_approval":
+                raise RuntimeError(
+                    f"Single-use grant failed persistence check across restart: first={push_first}, retry={push_retry}"
+                )
 
             print("[3b/5] Verifying downstream MCP UID isolation from /var/log/mellyn and workspace cwd...")
             marker_file = ws_dir / "marker.txt"

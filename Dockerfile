@@ -17,20 +17,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MELLYN_POLICY_PATH=/etc/mellyn/policy.toml \
     MELLYN_WORKSPACE_ROOT=/workspace \
     MELLYN_REQUIRE_WORKSPACE_MOUNT=1 \
-    MELLYN_AUDIT_LOG_PATH=/var/log/mellyn/audit.jsonl
+    MELLYN_AUDIT_LOG_PATH=/var/log/mellyn/audit.jsonl \
+    MELLYN_STATE_DB_PATH=/var/lib/mellyn/state.db
 
 WORKDIR /app
 
 # Dedicated non-root identities:
-#   - mellyn (10001): runs the authorizer/gateway and owns /var/log/mellyn (mode 0700)
-#   - mellyn-mcp (10002): unprivileged identity for downstream MCP child servers (zero access to /var/log/mellyn)
+#   - mellyn (10001): runs the authorizer/gateway and owns /var/log/mellyn and /var/lib/mellyn (mode 0700)
+#   - mellyn-mcp (10002): unprivileged identity for downstream MCP child servers (zero access to /var/log/mellyn or state)
 RUN groupadd --gid 10001 mellyn \
     && useradd --uid 10001 --gid 10001 --shell /usr/sbin/nologin --create-home mellyn \
     && groupadd --gid 10002 mellyn-mcp \
     && useradd --uid 10002 --gid 10002 --shell /usr/sbin/nologin --create-home mellyn-mcp \
-    && mkdir -p /var/log/mellyn /etc/mellyn /workspace \
-    && chown mellyn:mellyn /var/log/mellyn \
-    && chmod 0700 /var/log/mellyn
+    && mkdir -p /var/log/mellyn /var/lib/mellyn /etc/mellyn /workspace \
+    && chown mellyn:mellyn /var/log/mellyn /var/lib/mellyn \
+    && chmod 0700 /var/log/mellyn \
+    && chmod 0700 /var/lib/mellyn
 
 COPY deploy/requirements.lock /tmp/requirements.lock
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --require-hashes --no-deps \

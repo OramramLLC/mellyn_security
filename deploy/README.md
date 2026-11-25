@@ -88,6 +88,10 @@ docker compose -f deploy/docker-compose.yml up -d --build
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
+`mellyn-authorizer` stores durable SQLite session, taint, and single-use grant state in `MELLYN_STATE_DB_PATH`
+(`/var/lib/mellyn/state.db`), backed by the dedicated `mellyn-authorizer-state` volume (`0700` owned by `mellyn`
+UID `10001`, separate from audit log volumes and never mounted on `mellyn-gateway` or `mellyn-viewer`).
+
 ### 5. Run the MCP gateway from your MCP client
 
 Build an image that adds your MCP servers to the base image, and list their commands in

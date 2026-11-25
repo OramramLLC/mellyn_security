@@ -10,7 +10,7 @@ An **OWASP-aligned AI Security Engineering Reference Architecture** and **B2B Se
 | :--- | :--- |
 | 1–2. Secure AI-assisted coding (agent rules, pre-commit, CI gate, CODEOWNERS) | **Implemented & Tested** |
 | 3a. MCP Airlock & Red-Team Flight Recorder (`src/mcp_airlock/`) | **Implemented & Tested** (`mellyn-pin`, `mellyn-airlock`, `mellyn-ir`, `mellyn-bench`, AgBOM pinning, AAD kill switch, `--mode observe` harness) |
-| 3b. Self-hosted MCP Control Plane (`backend/mellyn/`) | **Core, HTTP API, stdio MCP gateway & container deployment with egress proxy implemented & tested** (stack built and run; see `deploy/README.md`); persistent state planned |
+| 3b. Self-hosted MCP Control Plane (`backend/mellyn/`) | **Implemented & Tested** (core, HTTP API with durable SQLite session/taint/grant state via `MELLYN_STATE_DB_PATH`, stdio MCP gateway & container deployment with Squid egress proxy; see `deploy/README.md`) |
 | 4. B2B posture & audit viewer (`frontend/` + `backend/mellyn/viewer_server.py`) | **Implemented & Tested** (loopback fail-closed BFF, Control Assurance matrix, Airlock hash-chain verifier, Control Plane audit stream & live human approvals UI) |
 
 Self-hosted deployment (control-plane authorizer, gateway, Squid egress proxy): [`deploy/README.md`](deploy/README.md).
