@@ -1,14 +1,13 @@
 """
-Runnable 5-minute end-to-end Mellyn Airlock + Forensic Viewer walkthrough.
+Runnable 5-minute end-to-end Mellyn Airlock + Forensic Flight Recorder walkthrough.
 
 Executes a real `mellyn-airlock` stdio proxy session over `examples/airlock_demo/sample_mcp_server.py`
 using `examples/airlock_demo/reviewed_policy.toml`:
   1. Verifies pinned `tools/list` AgBOM SHA-256 digests.
   2. Executes one ALLOWED tool call (`read_status_note`).
   3. Blocks one disallowed tool call (`export_diagnostics`) with JSON-RPC `-32000`.
-  4. Verifies the hash-chained `audit.jsonl` ledger with `mellyn-ir` (`reconstruct_incident`).
-  5. Starts the fail-closed Plane 4 Viewer (`mellyn.viewer_server`) with an ephemeral in-memory
-     `Role.VIEWER` key so you can inspect the ledger in the browser UI.
+  4. Verifies the hash-chained `audit.jsonl` ledger with `mellyn-ir` (`reconstruct_incident`)
+     and prints the reconstructed incident timeline (`render_markdown`) to stdout.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
 import subprocess
 import sys
 import tempfile
@@ -28,17 +26,14 @@ DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parents[1]
 SRC_DIR = REPO_ROOT / "src"
 BACKEND_DIR = REPO_ROOT / "backend"
-FRONTEND_DIST_DIR = REPO_ROOT / "frontend" / "dist"
 
 for _import_dir in (SRC_DIR, BACKEND_DIR):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 
-from mellyn.credentials import CredentialConfig, Role, key_digest  # noqa: E402
 from mellyn.legacy_env import check_no_legacy_env  # noqa: E402
-from mellyn.viewer_server import ViewerHTTPServer  # noqa: E402
 
-from mcp_airlock.ir_lab.reconstruct import IncidentReport, reconstruct_incident  # noqa: E402
+from mcp_airlock.ir_lab.reconstruct import IncidentReport, reconstruct_incident, render_markdown  # noqa: E402
 
 POLICY_PATH = DEMO_DIR / "reviewed_policy.toml"
 SERVER_PATH = DEMO_DIR / "sample_mcp_server.py"
@@ -252,28 +247,19 @@ def _print_walkthrough(result: DemoResult) -> None:
     print(f"  Tail Hash    : {report.verification.last_hash}")
     print(f"  Saved Report : {result.report_path}")
     print()
+    print("=== Reconstructed Incident Timeline (mellyn-ir) ===")
+    print(render_markdown(report))
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the 5-minute Mellyn Airlock demo and open the ledger in the Plane 4 viewer.",
+        description="Run the 5-minute Mellyn Airlock demo and print the verified mellyn-ir timeline.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help="Directory for generated audit.jsonl and incident_report.json (default: fresh temp dir).",
-    )
-    parser.add_argument(
-        "--no-viewer",
-        action="store_true",
-        help="Run the airlock session and forensic verification, then exit without starting the HTTP viewer.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="Loopback port for the viewer HTTP server (default: 8080).",
     )
     return parser
 
@@ -285,49 +271,6 @@ def main(argv: list[str] | None = None) -> int:
 
     result = run_demo_session(output_dir)
     _print_walkthrough(result)
-
-    if args.no_viewer:
-        return 0
-
-    pepper = secrets.token_urlsafe(32)
-    viewer_key = secrets.token_urlsafe(24)
-    viewer_creds = CredentialConfig(
-        pepper=pepper,
-        digests={Role.VIEWER: key_digest(viewer_key, pepper)},
-        roles=frozenset({Role.VIEWER}),
-    )
-    static_dir = FRONTEND_DIST_DIR if FRONTEND_DIST_DIR.is_dir() else None
-
-    server = ViewerHTTPServer(
-        host="127.0.0.1",
-        port=args.port,
-        viewer_credentials=viewer_creds,
-        approver_credentials=None,
-        airlock_audit_path=result.audit_path,
-        static_dir=static_dir,
-    )
-
-    print("=== Open Ledger in Plane 4 Viewer ===")
-    if static_dir is None:
-        print(f"Viewer API listening at: {server.url}")
-        print("Note: frontend/dist is not built yet. Build it with:")
-        print("  npm --prefix frontend install && npm --prefix frontend run build")
-    else:
-        print(f"1. Open in your browser : {server.url}")
-        print("2. Option A (Live API)  : Click 'Data Sources & Key', paste the ephemeral Role.VIEWER key below,")
-        print("                          click 'Connect & Fetch Live Telemetry', then open 'Airlock Forensics'.")
-        print(f"   Ephemeral Viewer Key : {viewer_key}")
-        print("3. Option B (No Key)    : Click 'Data Sources & Key' and upload the audit.jsonl file below")
-        print("                          for client-side Web Crypto SHA-256 verification:")
-        print(f"   Audit Ledger Path    : {result.audit_path}")
-    print("\nPress Ctrl+C to stop the demo viewer.")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nDemo viewer stopped.")
-    finally:
-        server.server_close()
     return 0
 
 

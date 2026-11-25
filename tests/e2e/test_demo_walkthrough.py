@@ -1,24 +1,20 @@
-"""E2E regression tests for the 5-minute Mellyn Airlock + Plane 4 Viewer demo walkthrough."""
+"""E2E regression tests for the 5-minute Mellyn Airlock + Forensic Flight Recorder demo walkthrough."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
-import json
+import io
 import os
-import secrets
 import sys
 import tempfile
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
 BACKEND_DIR = REPO_ROOT / "backend"
-DEMO_DIR = REPO_ROOT / "examples" / "airlock_demo"
 
 for _path in (REPO_ROOT, SRC_DIR, BACKEND_DIR):
     if str(_path) not in sys.path:
@@ -27,26 +23,11 @@ for _path in (REPO_ROOT, SRC_DIR, BACKEND_DIR):
 if importlib.util.find_spec("pydantic") is None and os.environ.get("MELLYN_REQUIRE_API_TESTS") != "1":
     raise unittest.SkipTest("pydantic is not installed; demo walkthrough tests skipped")
 
-from mellyn.approvals import API_KEY_HEADER, build_approval_opener  # noqa: E402
-from mellyn.credentials import CredentialConfig, Role, key_digest  # noqa: E402
-from mellyn.viewer_server import ViewerHTTPServer  # noqa: E402
-
 from examples.airlock_demo.run_demo import POLICY_PATH, SERVER_PATH, run_demo_session  # noqa: E402
+from examples.airlock_demo.run_demo import main as demo_main  # noqa: E402
 from mcp_airlock.airlock.models import parse_airlock_policy_toml  # noqa: E402
 from mcp_airlock.airlock.pin_cli import inspect_mcp_server  # noqa: E402
 from mcp_airlock.airlock.proxy import JSONRPC_POLICY_VIOLATION  # noqa: E402
-
-
-def _http_get(url: str, *, api_key: str | None = None) -> tuple[int, dict[str, Any]]:
-    headers = {API_KEY_HEADER: api_key} if api_key is not None else {}
-    req = urllib.request.Request(url, method="GET", headers=headers)  # noqa: S310 - test loopback only
-    opener = build_approval_opener()
-    try:
-        with opener.open(req, timeout=5) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        with exc:
-            return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 class TestDemoWalkthrough(unittest.TestCase):
@@ -59,7 +40,7 @@ class TestDemoWalkthrough(unittest.TestCase):
         self.assertEqual(inspection.tool_pins, policy.agbom_pins)
         self.assertEqual(policy.allowed_tools, ["read_status_note"])
 
-    def test_demo_session_allows_blocks_verifies_and_serves_in_viewer(self) -> None:
+    def test_demo_session_allows_blocks_verifies_and_prints_timeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_demo_session(Path(tmp))
 
@@ -91,31 +72,18 @@ class TestDemoWalkthrough(unittest.TestCase):
                 )
             )
 
-            # Viewer server exposes the reconstructed ledger with Role.VIEWER auth only.
-            pepper = secrets.token_urlsafe(32)
-            viewer_key = secrets.token_urlsafe(24)
-            viewer_creds = CredentialConfig(
-                pepper=pepper,
-                digests={Role.VIEWER: key_digest(viewer_key, pepper)},
-                roles=frozenset({Role.VIEWER}),
-            )
-            server = ViewerHTTPServer(
-                host="127.0.0.1",
-                port=0,
-                viewer_credentials=viewer_creds,
-                approver_credentials=None,
-                airlock_audit_path=result.audit_path,
-            )
-            server.start_in_background()
-            # Register server_close before shutdown so LIFO teardown stops serve_forever first.
-            self.addCleanup(server.server_close)
-            self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as tmp_cli:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = demo_main(["--output-dir", tmp_cli])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("Chain Valid  : True", out)
+            self.assertIn("BLOCKED_ACTIVITY", out)
+            self.assertIn("read_status_note", out)
+            self.assertIn("export_diagnostics", out)
+            self.assertIn("Reconstructed Incident Timeline (mellyn-ir)", out)
 
-            unauth_code, _ = _http_get(f"{server.url}/api/v1/airlock/report")
-            self.assertEqual(unauth_code, 401)
 
-            ok_code, payload = _http_get(f"{server.url}/api/v1/airlock/report", api_key=viewer_key)
-            self.assertEqual(ok_code, 200)
-            self.assertTrue(payload["chain_valid"])
-            self.assertEqual(payload["status"], "BLOCKED_ACTIVITY")
-            self.assertEqual(payload["verification"]["ledger_path"], "audit.jsonl")
+if __name__ == "__main__":
+    unittest.main()

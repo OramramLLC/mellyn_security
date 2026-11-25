@@ -33,7 +33,6 @@ _GATEWAY_PIN_PREFIXES = ("--name=", "--config=", "--preset=", "--cwd=", "--url="
 _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),
     "approve": ("mellyn.approve", None),
-    "viewer": ("mellyn.viewer_server", None),
     "sync-egress": ("mellyn.egress_proxy", None),
     "airlock": (
         "mcp_airlock.airlock.proxy",
@@ -56,7 +55,6 @@ Setup & Control Plane:
   up           Validate .env + the containers' policy, sync squid.conf from it, and run docker compose up
   proxy        Run the multi-server MCP stdio security gateway
   approve      List, approve, or reject held gateway calls (Role.APPROVER)
-  viewer       Launch the Plane 4 Posture, Audit & Approvals console backend
   sync-egress  Regenerate deploy/egress/squid.conf from a policy TOML/JSON file
   version      Print the Mellyn Security version
 
@@ -176,7 +174,6 @@ def _cmd_init(argv: list[str]) -> int:
         print("\nOne-time API keys (store safely; only their HMAC-SHA256 digests were saved in .env):")
         print(f"  MELLYN_AGENT_KEY    = {res.credentials.agent_key}")
         print(f"  MELLYN_APPROVER_KEY = {res.credentials.approver_key}")
-        print(f"  MELLYN_VIEWER_KEY   = {res.credentials.viewer_key}")
 
     print("\nNext steps (replace the placeholder server commands in the config first):")
     print(f"  Local:      mellyn proxy --config {cfg_for_next} --workspace . --audit-log mellyn-audit.jsonl")
@@ -241,7 +238,7 @@ def _cmd_up(argv: list[str]) -> int:
         action="append",
         dest="profiles",
         default=[],
-        help="Compose profile to enable (repeatable, e.g. --profile viewer)",
+        help="Compose profile to enable (repeatable, e.g. --profile relay)",
     )
     parser.add_argument(
         "--dry-run",

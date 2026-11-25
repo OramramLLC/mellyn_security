@@ -18,10 +18,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   endpoints are no longer added to the tool egress allowlist (`policy.allowed_egress_domains`). The gateway's own
   clients still reach them, and Squid still allows them. A tool that relied on reaching one of these hosts now needs
   it listed in `[egress].allowed_domains`.
+- **Breaking: `--profile viewer` is now `--profile relay`.** The approval relay (`mellyn-approval-relay`) runs in the
+  `gateway` and `relay` profiles. Compose still accepts `--profile viewer`, but it now starts neither the relay nor a
+  console, so update scripts and `mellyn up --profile …` calls.
+- **`mellyn init` no longer creates a viewer key.** It writes only the agent and approver digests. `Role.VIEWER` and
+  `MELLYN_VIEWER_KEY_DIGEST` still work for integrations that set one themselves.
+- **`examples/airlock_demo/run_demo.py`** prints the verified `mellyn-ir` timeline instead of starting the console;
+  its `--no-viewer` and `--port` options are gone.
+- **Contributors:** the pre-commit secret scan (`mellyn-gitleaks` from `mellyn-guardrails`) uses a locally installed
+  `gitleaks` binary and fails the commit if none is found.
 
 ### Security
 - **OAuth secrets stay out of downstream servers.** Variables named by `client_secret_env` and `bearer_token_env` are
   now withheld from the MCP servers the gateway launches, like every `MELLYN_*` variable.
+
+### Removed
+Focused `mellyn_security` on the core runtime (MCP Airlock, Runtime Authorization Engine, Forensic Flight Recorder, and optional container/Squid egress stack):
+- **Guardrail authoring pack** (`.semgrep/`, `.gitleaks.toml`, `.pre-commit-hooks.yaml`, `.mellyn-allowlist.toml`, `scripts/sync_agent_rules.py`, `scripts/verify_dependencies.py`, `scripts/ci_guardrails.py`, `.github/workflows/mellyn-reusable-ai-security-gate.yml`, `deploy/requirements-ci-scanners.lock`, `docs/OWASP_AI_CODING_SECURITY.md`, `docs/CLIENT_ONBOARDING.md`, and guardrail tests) -> extracted to the standalone `OramramLLC/mellyn-guardrails` repository (consumed here by commit SHA in `.pre-commit-config.yaml` and `.github/workflows/ai-security-gate.yml`, with `deploy/requirements-ci-lint.lock` holding the Ruff lock block).
+- **Plane 4 Posture, Audit & Approval Console** (`frontend/`, `backend/mellyn/viewer_server.py`, `deploy/viewer/`, `mellyn-viewer` Compose service and `--profile viewer`, `mellyn viewer` subcommand, viewer credential generation in `mellyn init`, viewer tests) -> parked at tag `archive/v1-monolith-full` alongside PR #29 and PR #30 (`Role.VIEWER` remains in `credentials.py`; `mellyn-approval-relay` moved to `profiles: ["gateway", "relay"]` with `--profile relay`; `examples/airlock_demo/run_demo.py` prints the `mellyn-ir` timeline to stdout).
+- **Red-team harness & conformance suite** (`examples/adversarial_eval/`, `examples/observe_redteam/`, `tests/conformance/`, `scripts/run_conformance_report.py`, and their tests) -> split out to the standalone `mellyn-redteam` repository (`mellyn-bench` stays in core until Phase 2 consolidation).
 
 ## [1.0.0] - 2026-11-24
 

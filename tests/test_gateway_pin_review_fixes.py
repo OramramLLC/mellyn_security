@@ -21,7 +21,13 @@ for _import_dir in (REPO_ROOT, REPO_ROOT / "backend", REPO_ROOT / "src"):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 
-from mellyn.audit import AuditChainError, AuditLogger, verify_gateway_audit_file  # noqa: E402
+from mellyn.audit import (  # noqa: E402
+    AuditChainError,
+    AuditLogger,
+    split_audit_lines,
+    verify_gateway_audit_file,
+    verify_gateway_audit_lines,
+)
 from mellyn.authorizer import Authorizer  # noqa: E402
 from mellyn.mcp_gateway import MELLYN_POLICY_DENIED, MCPGateway, compute_tools_hash  # noqa: E402
 from mellyn.models import TaintSource, utc_now  # noqa: E402
@@ -32,7 +38,6 @@ from mellyn.pin_gateway import (  # noqa: E402
     upsert_server_in_unified_toml,
 )
 from mellyn.policy_loader import parse_policy_dict  # noqa: E402
-from mellyn.viewer_server import _load_gateway_audit  # noqa: E402
 
 from tests.test_unified_engine import _FakeDownstream  # noqa: E402
 
@@ -103,9 +108,11 @@ class TestLedgerSurvivesLineBreakCharacters(_TmpCase):
         path.write_text(path.read_text(encoding="utf-8").replace("\\u2028", " "), encoding="utf-8")
         self.assertIn(" ", path.read_text(encoding="utf-8"))
         self.assertTrue(verify_gateway_audit_file(path).valid)
-        payload = _load_gateway_audit(path, limit=10)
-        self.assertEqual(payload.get("malformed_lines", 0), 0)
-        self.assertEqual(len(payload["events"]), 1)
+        raw_lines = split_audit_lines(path.read_text(encoding="utf-8"))
+        non_empty = [line for line in raw_lines if line.strip()]
+        self.assertTrue(verify_gateway_audit_lines(non_empty).valid)
+        self.assertEqual(len(non_empty), 1)
+        self.assertEqual(json.loads(non_empty[0])["taint_sources"], ["web_page:a\u2028b"])
 
 
 class TestPinRefusesHiddenText(_TmpCase):

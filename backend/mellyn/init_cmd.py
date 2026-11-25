@@ -54,10 +54,8 @@ class CredentialsBundle:
     pepper: str
     agent_key: str
     approver_key: str
-    viewer_key: str
     agent_digest: str
     approver_digest: str
-    viewer_digest: str
 
 
 @dataclass(frozen=True)
@@ -78,14 +76,11 @@ def generate_credentials_bundle() -> CredentialsBundle:
     pepper = secrets.token_urlsafe(32)
     agent_key = secrets.token_urlsafe(32)
     approver_key = secrets.token_urlsafe(32)
-    viewer_key = secrets.token_urlsafe(32)
-    while len({agent_key, approver_key, viewer_key}) < 3:
+    while approver_key == agent_key:
         approver_key = secrets.token_urlsafe(32)
-        viewer_key = secrets.token_urlsafe(32)
 
     agent_digest = key_digest(agent_key, pepper)
     approver_digest = key_digest(approver_key, pepper)
-    viewer_digest = key_digest(viewer_key, pepper)
 
     # Validate through CredentialConfig itself so role separation invariants match runtime startup.
     CredentialConfig.from_env(
@@ -93,18 +88,15 @@ def generate_credentials_bundle() -> CredentialsBundle:
             PEPPER_ENV: pepper,
             DIGEST_ENV["agent"]: agent_digest,
             DIGEST_ENV["approver"]: approver_digest,
-            DIGEST_ENV["viewer"]: viewer_digest,
         },
-        roles=frozenset(Role),
+        roles=frozenset({Role.AGENT, Role.APPROVER}),
     )
     return CredentialsBundle(
         pepper=pepper,
         agent_key=agent_key,
         approver_key=approver_key,
-        viewer_key=viewer_key,
         agent_digest=agent_digest,
         approver_digest=approver_digest,
-        viewer_digest=viewer_digest,
     )
 
 
@@ -146,7 +138,6 @@ def render_env_file(
         f"{PEPPER_ENV}={bundle.pepper}",
         f"{DIGEST_ENV['agent']}={bundle.agent_digest}",
         f"{DIGEST_ENV['approver']}={bundle.approver_digest}",
-        f"{DIGEST_ENV['viewer']}={bundle.viewer_digest}",
         "MELLYN_LOG_LEVEL=INFO",
         "MELLYN_STRICT_MODE=true",
     ]
@@ -452,7 +443,7 @@ def run_up(
         check_no_legacy_env(dotenv_values)
         merged_env = {**dotenv_values, **mellyn_env}  # compose also lets the shell override the env file
         roles = {Role.AGENT, Role.APPROVER}
-        if "viewer" in profiles or merged_env.get(DIGEST_ENV["viewer"], "").strip():
+        if merged_env.get(DIGEST_ENV["viewer"], "").strip():
             roles.add(Role.VIEWER)
         CredentialConfig.from_env(merged_env, roles=frozenset(roles))
     else:

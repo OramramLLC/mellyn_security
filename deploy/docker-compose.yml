@@ -123,10 +123,10 @@ services:
 
   mellyn-approval-relay:
     <<: *hardening
-    # Also in "viewer" so the console can relay approvals without `up` starting a detached gateway: the MCP
+    # Also in "relay" so the host relay can run without `up` starting a detached gateway: the MCP
     # client runs the real one with `compose run --name mellyn-gateway`, and a second container answering to the
     # same `mellyn-gateway` alias would make the relay deliver approvals to whichever one DNS picks.
-    profiles: ["gateway", "viewer"]
+    profiles: ["gateway", "relay"]
     image: mellyn-security:local
     container_name: mellyn-approval-relay
     restart: unless-stopped
@@ -172,37 +172,6 @@ services:
       - /tmp:noexec,nosuid,size=64m,uid=13,gid=13
       - /var/spool/squid:noexec,nosuid,size=64m,uid=13,gid=13
       - /var/log/squid:noexec,nosuid,size=64m,uid=13,gid=13
-
-  mellyn-viewer:
-    <<: *hardening
-    profiles: ["viewer"]
-    build:
-      context: ..
-      dockerfile: deploy/viewer/Dockerfile
-    image: mellyn-viewer:local
-    container_name: mellyn-viewer
-    restart: unless-stopped
-    env_file:
-      - ${MELLYN_ENV_FILE:-../.env}
-    environment:
-      MELLYN_AUDIT_LOG_PATH: /var/log/mellyn/gateway/gateway-audit.jsonl
-      MELLYN_AIRLOCK_AUDIT_PATH: /var/lib/mellyn/evidence/audit.jsonl
-      MELLYN_ASSURANCE_REPORT_PATH: /var/lib/mellyn/evidence/control-assurance.json
-      MELLYN_APPROVAL_HOST: mellyn-approval-relay
-      MELLYN_APPROVAL_PORT: "8765"
-    ports:
-      # Loopback only; exposes the static SPA and Role.VIEWER / Role.APPROVER BFF routes.
-      - "127.0.0.1:8080:8080"
-    volumes:
-      # Read-only mounts only; the viewer BFF never mutates audit logs or evidence artifacts.
-      - mellyn-gateway-audit-logs:/var/log/mellyn/gateway:ro
-      # Host folder you fill: point `mellyn-airlock --audit-log` at <folder>/audit.jsonl and write the conformance
-      # report to <folder>/control-assurance.json (see deploy/README.md). No container writes here.
-      - ${MELLYN_EVIDENCE_DIR:-../evidence}:/var/lib/mellyn/evidence:ro
-    networks:
-      - mellyn-frontend
-    tmpfs:
-      - /tmp:noexec,nosuid,size=32m
 
 networks:
   mellyn-internal:
