@@ -67,12 +67,12 @@ Or install the unified package (`mellyn` Control Plane + `mcp_airlock`; installs
 ```bash
 pip install -e .
 mellyn presets                                       # inspect built-in SMB presets (filesystem, fetch, github, linear, slack, postgres)
-mellyn init --preset mcp-filesystem --preset github --workspace /abs/path/to/agent/workspace
-                                                     # digest-only .env, plus config/mellyn-policy.toml & mellyn-gateway.toml
+mellyn init --unified --preset mcp-filesystem --preset github --workspace /abs/path/to/agent/workspace
+                                                     # digest-only .env + single schema_version=2 config/mellyn.toml (omit --unified for v1 split files)
 mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
 mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
-mellyn proxy --config config/mellyn-gateway.toml --workspace . --audit-log mellyn-audit.jsonl
-mellyn verify audit.jsonl --json                     # or use the mellyn-airlock / mellyn-pin / mellyn-ir / mellyn-bench shims below
+mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl
+mellyn verify mellyn-audit.jsonl --json              # auto-detects Gateway or Airlock hash-chained ledgers
 ```
 
 `mellyn init` keeps `.env` outside `config/`, because compose mounts `config/` read-only into the containers. It

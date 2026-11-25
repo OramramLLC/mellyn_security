@@ -33,6 +33,7 @@ from typing import Any
 
 from mellyn.approval_relay import forward_approval_request, validate_upstream
 from mellyn.approvals import API_KEY_HEADER, MAX_BODY_BYTES, parse_approval_route
+from mellyn.audit import verify_gateway_audit_lines
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.legacy_env import check_no_legacy_env
 
@@ -93,7 +94,14 @@ def _reconstruct_airlock_report(ledger_path: Path) -> dict[str, Any]:
 
 def _load_gateway_audit(audit_path: Path, *, limit: int) -> dict[str, Any]:
     if not audit_path.exists():
-        return {"events": [], "total_lines": 0, "returned_count": 0, "malformed_lines": 0}
+        return {
+            "events": [],
+            "total_lines": 0,
+            "returned_count": 0,
+            "malformed_lines": 0,
+            "chain_valid": None,
+            "chain_reason": None,
+        }
     if not audit_path.is_file():
         raise OSError("Gateway audit path is not a regular file.")
     size = audit_path.stat().st_size
@@ -105,12 +113,14 @@ def _load_gateway_audit(audit_path: Path, *, limit: int) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise ValueError("Gateway audit file is not valid UTF-8.") from exc
     parsed: list[dict[str, Any]] = []
+    non_empty_lines: list[str] = []
     total_lines = 0
     malformed_lines = 0
     for line in raw_text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        non_empty_lines.append(stripped)
         total_lines += 1
         try:
             obj = json.loads(stripped)
@@ -122,12 +132,21 @@ def _load_gateway_audit(audit_path: Path, *, limit: int) -> dict[str, Any]:
         else:
             malformed_lines += 1
 
+    chain_valid: bool | None = None
+    chain_reason: str | None = None
+    if any("entry_hash" in entry for entry in parsed):
+        verification = verify_gateway_audit_lines(non_empty_lines)
+        chain_valid = verification.valid
+        chain_reason = verification.reason
+
     recent = parsed[-limit:]
     return {
         "events": recent,
         "total_lines": total_lines,
         "returned_count": len(recent),
         "malformed_lines": malformed_lines,
+        "chain_valid": chain_valid,
+        "chain_reason": chain_reason,
     }
 
 

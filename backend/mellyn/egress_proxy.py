@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 from mellyn.policy import PolicyConfig
-from mellyn.policy_loader import PolicyLoadError, load_policy_file
+from mellyn.policy_loader import PolicyLoadError
 
 # Strict RFC 1035 / 1123 hostname (at least one dot, lowercase labels, no wildcards/spaces/newlines)
 _VALID_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -146,8 +146,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from mellyn.unified_config import load_policy_any
+
     try:
-        policy = load_policy_file(args.policy)
+        policy = load_policy_any(args.policy)
         rendered = generate_squid_config(
             policy, listen_port=args.port, client_cidrs=tuple(args.client_cidr or DEFAULT_CLIENT_CIDRS)
         )

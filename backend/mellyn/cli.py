@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from mellyn.audit import verify_gateway_audit_file
 from mellyn.credentials import CredentialConfigError
 from mellyn.init_cmd import InitError, init_workspace, run_up
 from mellyn.legacy_env import LegacyConfigError
@@ -15,6 +17,12 @@ from mellyn.policy import SMB_SERVER_PRESETS
 from mellyn.policy_loader import PolicyLoadError
 
 MELLYN_VERSION = "1.0.0"
+
+_AIRLOCK_VERIFY_MODULE = "mcp_airlock.ir_lab.reconstruct"
+_AIRLOCK_VERIFY_HINT = (
+    "The `verify` command on Airlock ledgers requires the `mcp_airlock` package "
+    "(not installed in gateway-only containers)."
+)
 
 _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),
@@ -29,10 +37,6 @@ _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
         "mcp_airlock.airlock.pin_cli",
         "The `pin` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
     ),
-    "verify": (
-        "mcp_airlock.ir_lab.reconstruct",
-        "The `verify` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
-    ),
     "bench": (
         "mcp_airlock.egress.bench",
         "The `bench` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
@@ -45,7 +49,7 @@ usage: mellyn <command> [args...]
 Mellyn Security — Turn-Key MCP Security & Airlock CLI
 
 Setup & Control Plane:
-  init         Generate starter .env (digests only), mellyn-policy.toml & mellyn-gateway.toml
+  init         Generate starter .env (digests only) & split configs or unified mellyn.toml (--unified)
   presets      List curated SMB MCP server presets (filesystem, fetch, github, linear, slack, postgres)
   up           Validate .env + the containers' policy, sync squid.conf from it, and run docker compose up
   proxy        Run the multi-server MCP stdio security gateway
@@ -54,10 +58,10 @@ Setup & Control Plane:
   sync-egress  Regenerate deploy/egress/squid.conf from a policy TOML/JSON file
   version      Print the Mellyn Security version
 
-Containment & Forensics (Airlock):
+Containment & Forensics (Gateway & Airlock):
   airlock      Run the fail-closed stdio Airlock proxy with AAD kill switch
   pin          Inspect & pin a downstream MCP server's AgBOM tools/list manifest
-  verify       Verify audit.jsonl cryptographic hash chain & reconstruct timeline
+  verify       Verify Gateway or Airlock audit.jsonl hash chain (auto-detected)
   bench        Run the obfuscated canary & secret scanner benchmark
 """
 
@@ -110,6 +114,18 @@ def _cmd_init(argv: list[str]) -> int:
         help="Generate production .env settings and write squid.conf alongside configs",
     )
     parser.add_argument("--squid-output", type=Path, default=None, help="Explicit output path for squid.conf")
+    parser.add_argument(
+        "--unified",
+        action="store_true",
+        help="Write a single schema_version = 2 mellyn.toml instead of split policy/gateway TOMLs",
+    )
+    parser.add_argument(
+        "--canary",
+        action="append",
+        dest="canaries",
+        default=[],
+        help="Canary token to register under [scanner].canary_tokens (requires --unified; repeatable)",
+    )
     parser.add_argument("--force", action="store_true", help="Overwrite existing generated files")
     parser.add_argument(
         "--quiet-keys",
@@ -121,6 +137,10 @@ def _cmd_init(argv: list[str]) -> int:
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 0
 
+    if args.canaries and not args.unified:
+        print("mellyn init failed: --canary requires --unified.", file=sys.stderr)
+        return 2
+
     presets = tuple(args.presets) if args.presets else ("mcp-filesystem",)
     try:
         res = init_workspace(
@@ -131,6 +151,8 @@ def _cmd_init(argv: list[str]) -> int:
             extra_domains=args.domains,
             force=args.force,
             squid_output=args.squid_output,
+            unified=args.unified,
+            canary_tokens=args.canaries,
         )
     except (InitError, PolicyLoadError, CredentialConfigError, ValueError, OSError) as exc:
         print(f"mellyn init failed: {exc}", file=sys.stderr)
@@ -138,8 +160,13 @@ def _cmd_init(argv: list[str]) -> int:
 
     print(f"Initialized Mellyn workspace in {res.env_path.parent} (presets: {', '.join(res.presets)}):")
     print(f"  env:     {res.env_path} (pepper + digests only; no raw role keys stored)")
-    print(f"  policy:  {res.policy_path} (folder mounted read-only into the containers; .env stays outside it)")
-    print(f"  gateway: {res.gateway_path}")
+    if res.mellyn_config_path is not None:
+        print(f"  config:  {res.mellyn_config_path} (unified schema_version=2 config)")
+        cfg_for_next: Path | None = res.mellyn_config_path
+    else:
+        print(f"  policy:  {res.policy_path} (folder mounted read-only into the containers; .env stays outside it)")
+        print(f"  gateway: {res.gateway_path}")
+        cfg_for_next = res.gateway_path
     if res.squid_path is not None:
         print(f"  squid:   {res.squid_path}")
 
@@ -149,9 +176,9 @@ def _cmd_init(argv: list[str]) -> int:
         print(f"  MELLYN_APPROVER_KEY = {res.credentials.approver_key}")
         print(f"  MELLYN_VIEWER_KEY   = {res.credentials.viewer_key}")
 
-    print("\nNext steps (replace the placeholder server commands in the gateway config first):")
-    print(f"  Local:      mellyn proxy --config {res.gateway_path} --workspace . --audit-log mellyn-audit.jsonl")
-    print(f"  Containers: mellyn up --env-file {res.env_path}   (uses the generated policy and gateway config)")
+    print("\nNext steps (replace the placeholder server commands in the config first):")
+    print(f"  Local:      mellyn proxy --config {cfg_for_next} --workspace . --audit-log mellyn-audit.jsonl")
+    print(f"  Containers: mellyn up --env-file {res.env_path}   (uses the generated config)")
     return 0
 
 
@@ -243,6 +270,80 @@ def _cmd_up(argv: list[str]) -> int:
     return int(rc)
 
 
+def _extract_verify_ledger_path(rest: Sequence[str]) -> Path | None:
+    """Return the positional ledger path when inspecting without Airlock-only flags."""
+    for tok in rest:
+        if tok in ("-h", "--help", "--json"):
+            continue
+        if tok in ("--anchor-seq", "--anchor-hash") or tok.startswith(("--anchor-seq=", "--anchor-hash=")):
+            return None
+        if tok.startswith("-"):
+            return None
+        return Path(tok)
+    return None
+
+
+def _looks_like_gateway_ledger(path: Path) -> bool:
+    """Return True when the first non-empty JSON line is a Gateway AuditEvent (not Airlock)."""
+    try:
+        if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+            return False
+        with path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                obj = json.loads(stripped)
+                return isinstance(obj, dict) and "audit_id" in obj and "event" not in obj
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def _verify_gateway_ledger_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mellyn verify",
+        description="Verify the cryptographic hash chain of a Mellyn Gateway JSONL audit log.",
+    )
+    parser.add_argument("ledger", type=Path, help="Path to gateway audit JSONL file")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON verification report")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 0
+
+    result = verify_gateway_audit_file(args.ledger)
+    if args.json:
+        payload = {
+            "ledger_type": "gateway",
+            "valid": result.valid,
+            "entry_count": result.entry_count,
+            "last_seq": result.last_seq,
+            "last_hash": result.last_hash,
+            "first_invalid_line": result.first_invalid_line,
+            "reason": result.reason,
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    elif result.valid:
+        print(
+            f"Gateway audit chain VALID ({result.entry_count} entries, "
+            f"last_seq={result.last_seq}, last_hash={result.last_hash})"
+        )
+    else:
+        print(
+            f"Gateway audit chain INVALID (line {result.first_invalid_line}): {result.reason}",
+            file=sys.stderr,
+        )
+    return 0 if result.valid else 2
+
+
+def _cmd_verify(rest: list[str]) -> int:
+    ledger = _extract_verify_ledger_path(rest)
+    if ledger is not None and _looks_like_gateway_ledger(ledger):
+        return _verify_gateway_ledger_cli(rest)
+    return _dispatch_module(_AIRLOCK_VERIFY_MODULE, rest, optional_hint=_AIRLOCK_VERIFY_HINT)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entrypoint for the unified `mellyn` CLI."""
     raw = sys.argv[1:] if argv is None else list(argv)
@@ -260,6 +361,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_presets(rest)
     if cmd == "up":
         return _cmd_up(rest)
+    if cmd == "verify":
+        return _cmd_verify(rest)
     if cmd in _PASSTHROUGH_MODULES:
         mod_name, hint = _PASSTHROUGH_MODULES[cmd]
         return _dispatch_module(mod_name, rest, optional_hint=hint)

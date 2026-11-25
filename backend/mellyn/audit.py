@@ -1,34 +1,48 @@
-"""Redacted structured audit logger for Mellyn Security authorization decisions."""
+"""Redacted, hash-chained structured audit logger for Mellyn Security authorization decisions."""
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
-import re
+import os
 import secrets
 import threading
 from collections import deque
-from dataclasses import asdict, dataclass
-from typing import Any, TextIO
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import IO, Any, TextIO
 
-from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, utc_now
-
-SECRET_REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"sk-(?:proj|svcacct|None)-[A-Za-z0-9_-]{10,}"),
-    re.compile(r"sk-[A-Za-z0-9]{48}"),
-    re.compile(r"sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{10,}"),
-    re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
-    re.compile(r"hf_[A-Za-z0-9]{20,}"),
-    re.compile(r"lsv2_(?:pt|sk)_[a-f0-9]{16,}_[a-f0-9]{6,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
-    re.compile(r"xox[baprs]-[0-9A-Za-z-]{16,}"),
-    re.compile(r"(?:sk|rk)_live_[0-9A-Za-z]{16,}"),
-    re.compile(r"(?i)(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"),
+from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, canonical_json_value, utc_now
+from mellyn.scanner import (
+    _URL_USERINFO_SECRET_RE,
+    redact_canaries_in_text,
+)
+from mellyn.scanner import (
+    SECRET_REDACTION_PATTERNS as SECRET_REDACTION_PATTERNS,
 )
 
-_URL_USERINFO_SECRET_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)")
+GENESIS_PREV_HASH = "0" * 64
+MAX_AUDIT_REASON_CHARS = 512
+MAX_TAINT_ENTRY_CHARS = 256
+EMPTY_ARGS_SHA256 = hashlib.sha256(b"{}").hexdigest()
+
+
+class AuditChainError(RuntimeError):
+    """Raised fail-closed when an audit log fails hash-chain verification or path safety."""
+
+
+@dataclass(frozen=True)
+class ChainVerificationResult:
+    """Result of verifying a gateway JSONL hash chain."""
+
+    valid: bool
+    entry_count: int
+    last_seq: int | None
+    last_hash: str
+    first_invalid_line: int | None
+    reason: str | None
 
 
 def redact_text(value: str) -> str:
@@ -49,13 +63,11 @@ def hash_arguments(arguments: Any) -> str:
     try:
         payload = canonical_json(arguments).encode("utf-8")
     except (TypeError, ValueError):
-        payload = f"invalid:{type(arguments).__name__}:{arguments!r}".encode("utf-8", errors="replace")
+        try:
+            payload = canonical_json_value(arguments).encode("utf-8")
+        except (TypeError, ValueError):
+            payload = f"invalid:{type(arguments).__name__}".encode("utf-8", errors="replace")
     return hashlib.sha256(payload).hexdigest()
-
-
-MAX_AUDIT_REASON_CHARS = 512
-MAX_TAINT_ENTRY_CHARS = 256
-EMPTY_ARGS_SHA256 = hashlib.sha256(b"{}").hexdigest()
 
 
 def hash_untrusted_identifier(prefix: str, raw_value: str) -> str:
@@ -76,9 +88,120 @@ def format_taint_entry(source: TaintSource, *, max_chars: int = MAX_TAINT_ENTRY_
     return combined[:max_chars]
 
 
+def compute_audit_entry_hash(event_dict: Mapping[str, Any]) -> str:
+    """Compute canonical SHA-256 hash over an `AuditEvent` dictionary excluding `entry_hash`."""
+    body = {k: v for k, v in event_dict.items() if k != "entry_hash"}
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _strict_json_loads(raw_line: str) -> Any:
+    def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in pairs:
+            if k in out:
+                raise ValueError(f"Duplicate JSON key '{k}' in audit entry.")
+            out[k] = v
+        return out
+
+    return json.loads(raw_line, object_pairs_hook=_reject_dup_keys)
+
+
+def verify_gateway_audit_lines(lines: Sequence[str]) -> ChainVerificationResult:
+    """Verify sequential `seq`, `prev_hash`, and `entry_hash` links across gateway JSONL lines."""
+    expected_seq = 0
+    expected_prev = GENESIS_PREV_HASH
+    entry_count = 0
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = _strict_json_loads(stripped)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return ChainVerificationResult(
+                valid=False,
+                entry_count=entry_count,
+                last_seq=expected_seq - 1 if entry_count else None,
+                last_hash=expected_prev,
+                first_invalid_line=line_no,
+                reason=f"Malformed JSON or duplicate key on line {line_no}: {exc}",
+            )
+        if not isinstance(obj, dict):
+            return ChainVerificationResult(
+                valid=False,
+                entry_count=entry_count,
+                last_seq=expected_seq - 1 if entry_count else None,
+                last_hash=expected_prev,
+                first_invalid_line=line_no,
+                reason=f"Audit entry on line {line_no} is not a JSON object.",
+            )
+
+        seq = obj.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq != expected_seq:
+            return ChainVerificationResult(
+                valid=False,
+                entry_count=entry_count,
+                last_seq=expected_seq - 1 if entry_count else None,
+                last_hash=expected_prev,
+                first_invalid_line=line_no,
+                reason=f"Sequence mismatch on line {line_no}: expected seq={expected_seq}, got {seq!r}.",
+            )
+
+        prev_hash = obj.get("prev_hash")
+        if not isinstance(prev_hash, str) or not hmac.compare_digest(prev_hash, expected_prev):
+            return ChainVerificationResult(
+                valid=False,
+                entry_count=entry_count,
+                last_seq=expected_seq - 1 if entry_count else None,
+                last_hash=expected_prev,
+                first_invalid_line=line_no,
+                reason=f"Chain link mismatch on line {line_no}: prev_hash does not match previous entry_hash.",
+            )
+
+        entry_hash = obj.get("entry_hash")
+        expected_hash = compute_audit_entry_hash(obj)
+        if not isinstance(entry_hash, str) or not hmac.compare_digest(entry_hash, expected_hash):
+            return ChainVerificationResult(
+                valid=False,
+                entry_count=entry_count,
+                last_seq=expected_seq - 1 if entry_count else None,
+                last_hash=expected_prev,
+                first_invalid_line=line_no,
+                reason=f"Entry digest mismatch on line {line_no} (tampered record).",
+            )
+
+        entry_count += 1
+        expected_seq += 1
+        expected_prev = entry_hash
+
+    return ChainVerificationResult(
+        valid=True,
+        entry_count=entry_count,
+        last_seq=expected_seq - 1 if entry_count else None,
+        last_hash=expected_prev,
+        first_invalid_line=None,
+        reason=None,
+    )
+
+
+def verify_gateway_audit_file(path: Path) -> ChainVerificationResult:
+    """Verify hash-chain integrity on a gateway JSONL file on disk (fails closed on unreadable/missing files)."""
+    if path.is_symlink() or path.parent.is_symlink():
+        raise AuditChainError(f"Refusing symlink audit log path '{path}'.")
+    if not path.is_file():
+        raise AuditChainError(f"Audit log file does not exist: '{path}'.")
+    try:
+        raw_lines = path.read_bytes().decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AuditChainError(f"Unable to read audit log '{path}': {exc}") from exc
+    return verify_gateway_audit_lines(raw_lines)
+
+
 @dataclass(frozen=True)
 class AuditEvent:
-    """Structured, redacted audit record (never stores raw prompts, secrets, or unrecognized caller IDs)."""
+    """Structured, redacted, hash-chained audit record (never stores raw prompts or secret/canary values)."""
 
     audit_id: str
     timestamp: str
@@ -95,31 +218,119 @@ class AuditEvent:
     grant_id: str | None
     event_type: str = "authorization"
     taint_count: int = 0
+    seq: int = 0
+    prev_hash: str = GENESIS_PREV_HASH
+    entry_hash: str = ""
+    enforcement_mode: str = "enforce"
 
 
 class AuditLogger:
     """
-    Redacted audit sink. Keeps the most recent events in memory and, when `sink` is given, appends each
-    event to it as one JSON line and flushes. The gateway points `sink` at a dedicated file: never at a
+    Redacted, hash-chained audit sink. Keeps the most recent events in memory and, when `sink` is given,
+    appends each event as one JSON line and flushes. The gateway points `sink` at a dedicated file: never at a
     stream a downstream process can also write to (such as a shared stderr), or entries can be forged.
     """
 
-    def __init__(self, sink: TextIO | None = None, max_in_memory: int = 10_000) -> None:
+    def __init__(
+        self,
+        sink: TextIO | None = None,
+        max_in_memory: int = 10_000,
+        *,
+        canary_tokens: Sequence[str] = (),
+        start_seq: int = 0,
+        prev_hash: str = GENESIS_PREV_HASH,
+        enforcement_mode: str = "enforce",
+    ) -> None:
         self._events: deque[AuditEvent] = deque(maxlen=max_in_memory)
         self._sink = sink
         self._lock = threading.Lock()
+        self._canary_tokens = tuple(t for t in canary_tokens if t)
+        self._next_seq = start_seq
+        self._last_hash = prev_hash
+        self._enforcement_mode = enforcement_mode
+
+    @classmethod
+    def open_chained(
+        cls,
+        path: Path,
+        *,
+        canary_tokens: Sequence[str] = (),
+        enforcement_mode: str = "enforce",
+    ) -> tuple[AuditLogger, IO[str]]:
+        """
+        Verify any existing ledger at `path` fail-closed, then open for append (mode 0600 on POSIX).
+        """
+        if path.is_symlink() or path.parent.is_symlink():
+            raise AuditChainError(f"Refusing symlink audit log path '{path}'.")
+        if path.exists() and path.is_dir():
+            raise AuditChainError(f"Audit log path '{path}' is a directory.")
+
+        start_seq = 0
+        prev_hash = GENESIS_PREV_HASH
+        if path.exists():
+            res = verify_gateway_audit_file(path)
+            if not res.valid:
+                raise AuditChainError(res.reason or f"Existing audit log '{path}' failed hash-chain check.")
+            if res.last_seq is not None:
+                start_seq = res.last_seq + 1
+                prev_hash = res.last_hash
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        handle = os.fdopen(fd, "a", encoding="utf-8")
+        if os.name == "posix" and path.exists() and not path.is_symlink():
+            os.chmod(path, 0o600)
+        return (
+            cls(
+                sink=handle,
+                canary_tokens=canary_tokens,
+                start_seq=start_seq,
+                prev_hash=prev_hash,
+                enforcement_mode=enforcement_mode,
+            ),
+            handle,
+        )
 
     @property
     def events(self) -> tuple[AuditEvent, ...]:
         return tuple(self._events)
 
+    def _scrub(self, text: str) -> str:
+        sanitized = redact_text(text)
+        if self._canary_tokens:
+            sanitized = redact_canaries_in_text(sanitized, self._canary_tokens)
+        return sanitized
+
     def _emit(self, event: AuditEvent) -> AuditEvent:
         with self._lock:
-            self._events.append(event)
+            redacted_reasons = [self._scrub(reason)[:MAX_AUDIT_REASON_CHARS] for reason in event.reasons]
+            redacted_taints = [self._scrub(item)[:MAX_TAINT_ENTRY_CHARS] for item in event.taint_sources]
+            redacted_session = self._scrub(event.session_id)[:128]
+            redacted_tool = self._scrub(event.tool_name)[:128]
+            redacted_server = self._scrub(event.mcp_server)[:128] if event.mcp_server is not None else None
+
+            draft = replace(
+                event,
+                session_id=redacted_session,
+                tool_name=redacted_tool,
+                mcp_server=redacted_server,
+                taint_sources=redacted_taints,
+                reasons=redacted_reasons,
+                seq=self._next_seq,
+                prev_hash=self._last_hash,
+                entry_hash="",
+                enforcement_mode=event.enforcement_mode or self._enforcement_mode,
+            )
+            entry_hash = compute_audit_entry_hash(asdict(draft))
+            final = replace(draft, entry_hash=entry_hash)
+
+            self._next_seq += 1
+            self._last_hash = entry_hash
+            self._events.append(final)
             if self._sink is not None:
-                self._sink.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+                self._sink.write(json.dumps(asdict(final), sort_keys=True, ensure_ascii=False) + "\n")
                 self._sink.flush()
-        return event
+            return final
 
     def record(
         self,
@@ -172,6 +383,7 @@ class AuditLogger:
             grant_id=grant_id,
             event_type="authorization",
             taint_count=effective_count,
+            enforcement_mode=self._enforcement_mode,
         )
         return self._emit(event)
 
@@ -200,9 +412,46 @@ class AuditLogger:
             grant_id=None,
             event_type="taint",
             taint_count=taint_count,
+            enforcement_mode=self._enforcement_mode,
+        )
+        return self._emit(event)
+
+    def record_containment(
+        self,
+        *,
+        session_id: str,
+        tool_name: str,
+        mcp_server: str | None,
+        decision: str,
+        reasons: tuple[str, ...],
+        payload: Any = None,
+        tainted: bool = False,
+        taint_count: int = 0,
+        taint_sources: tuple[str, ...] = (),
+        enforcement_mode: str | None = None,
+        policy_id: str = "scanner.egress",
+    ) -> AuditEvent:
+        """Emit a structured redacted record when the egress scanner triggers containment or observation."""
+        event = AuditEvent(
+            audit_id=f"aud_{secrets.token_hex(12)}",
+            timestamp=utc_now().isoformat(),
+            session_id=redact_text(session_id)[:128],
+            tool_name=redact_text(tool_name)[:128],
+            mcp_server=redact_text(mcp_server)[:128] if mcp_server is not None else None,
+            decision=decision,
+            risk_tier=RiskTier.HIGH.value,
+            tainted=tainted,
+            taint_sources=list(taint_sources),
+            args_sha256=EMPTY_ARGS_SHA256 if payload is None else hash_arguments(payload),
+            reasons=[redact_text(r)[:MAX_AUDIT_REASON_CHARS] for r in reasons],
+            policy_id=policy_id,
+            grant_id=None,
+            event_type="containment",
+            taint_count=taint_count,
+            enforcement_mode=enforcement_mode or self._enforcement_mode,
         )
         return self._emit(event)
 
     def to_jsonl(self) -> str:
         """Export all recorded audit events as newline-delimited JSON."""
-        return "\n".join(json.dumps(asdict(event), sort_keys=True) for event in self._events)
+        return "\n".join(json.dumps(asdict(event), sort_keys=True, ensure_ascii=False) for event in self._events)
