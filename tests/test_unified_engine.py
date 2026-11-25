@@ -40,7 +40,7 @@ from mellyn import (  # noqa: E402
     verify_gateway_audit_file,
     verify_gateway_audit_lines,
 )
-from mellyn.audit import GENESIS_PREV_HASH  # noqa: E402
+from mellyn.audit import GENESIS_PREV_HASH, _is_legacy_unchained_log  # noqa: E402
 from mellyn.cli import main as cli_main  # noqa: E402
 from mellyn.egress_proxy import main as egress_main  # noqa: E402
 from mellyn.init_cmd import init_workspace, run_up  # noqa: E402
@@ -53,7 +53,6 @@ from mellyn.mcp_gateway import (  # noqa: E402
     main as gateway_main,
 )
 from mellyn.unified_config import load_policy_any, render_unified_config  # noqa: E402
-from mellyn.viewer_server import _load_gateway_audit  # noqa: E402
 
 
 def _synth_canary() -> str:
@@ -864,7 +863,7 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
                 any(ev["event_type"] == "containment" and ev["decision"] == "observed_aad" for ev in events)
             )
 
-    def test_viewer_load_gateway_audit_verifies_hash_chain(self) -> None:
+    def test_gateway_audit_verifier_detects_valid_tampered_and_legacy_ledgers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             chained_path = root / "chained.jsonl"
@@ -874,23 +873,23 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
             finally:
                 handle.close()
 
-            valid_res = _load_gateway_audit(chained_path, limit=50)
-            self.assertTrue(valid_res["chain_valid"])
-            self.assertIsNone(valid_res["chain_reason"])
+            valid_res = verify_gateway_audit_file(chained_path)
+            self.assertTrue(valid_res.valid)
+            self.assertIsNone(valid_res.reason)
 
             tampered_path = root / "tampered.jsonl"
             row = json.loads(chained_path.read_text(encoding="utf-8").strip())
             row["taint_count"] = 777
             tampered_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-            tampered_res = _load_gateway_audit(tampered_path, limit=50)
-            self.assertFalse(tampered_res["chain_valid"])
-            self.assertIsInstance(tampered_res["chain_reason"], str)
+            tampered_res = verify_gateway_audit_file(tampered_path)
+            self.assertFalse(tampered_res.valid)
+            self.assertIsInstance(tampered_res.reason, str)
 
             legacy_path = root / "legacy.jsonl"
             legacy_path.write_text(json.dumps({"audit_id": "aud_legacy", "decision": "allow"}) + "\n", encoding="utf-8")
-            legacy_res = _load_gateway_audit(legacy_path, limit=50)
-            self.assertIsNone(legacy_res["chain_valid"])
-            self.assertIsNone(legacy_res["chain_reason"])
+            legacy_res = verify_gateway_audit_file(legacy_path)
+            self.assertFalse(legacy_res.valid)
+            self.assertTrue(_is_legacy_unchained_log(legacy_path))
 
 
 if __name__ == "__main__":

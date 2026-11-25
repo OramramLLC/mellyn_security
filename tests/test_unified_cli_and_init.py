@@ -171,18 +171,18 @@ class TestMellynInitAndUp(unittest.TestCase):
         for raw_key in (
             res.credentials.agent_key,
             res.credentials.approver_key,
-            res.credentials.viewer_key,
         ):
             self.assertNotIn(raw_key, env_raw)
+        self.assertNotIn("MELLYN_VIEWER_KEY_DIGEST", env_raw)
 
         parsed = parse_dotenv(res.env_path)
         self.assertEqual(parsed["MELLYN_ENV"], "production")
         self.assertEqual(parsed["MELLYN_WORKSPACE"], str(ws.resolve()))
+        self.assertNotIn("MELLYN_VIEWER_KEY_DIGEST", parsed)
 
-        creds = CredentialConfig.from_env(parsed, roles=frozenset(Role))
+        creds = CredentialConfig.from_env(parsed, roles=frozenset({Role.AGENT, Role.APPROVER}))
         self.assertTrue(creds.verify(res.credentials.agent_key, Role.AGENT))
         self.assertTrue(creds.verify(res.credentials.approver_key, Role.APPROVER))
-        self.assertTrue(creds.verify(res.credentials.viewer_key, Role.VIEWER))
         self.assertFalse(creds.verify(res.credentials.agent_key, Role.APPROVER))
 
         policy = load_policy_file(res.policy_path)
@@ -250,7 +250,7 @@ class TestMellynInitAndUp(unittest.TestCase):
                 compose_file=compose,
                 squid_output=squid_out,
                 env_file=init_res.env_path,
-                profiles=("viewer",),
+                profiles=("relay",),
                 dry_run=True,
             )
             self.assertEqual(rc, 0)
@@ -264,7 +264,7 @@ class TestMellynInitAndUp(unittest.TestCase):
                     "-f",
                     str(compose),
                     "--profile",
-                    "viewer",
+                    "relay",
                     "up",
                     "-d",
                     "--build",
@@ -530,7 +530,7 @@ class TestInitUpWiring(unittest.TestCase):
     def test_compose_reads_config_location_and_env_file_from_variables(self) -> None:
         compose = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertEqual(compose.count("- ${MELLYN_CONFIG_DIR:-../config}:/etc/mellyn:ro"), 2)
-        self.assertEqual(compose.count("- ${MELLYN_ENV_FILE:-../.env}"), 3)
+        self.assertEqual(compose.count("- ${MELLYN_ENV_FILE:-../.env}"), 2)
         self.assertIn("MELLYN_POLICY_PATH: /etc/mellyn/${MELLYN_POLICY_FILE:-mellyn-policy.example.toml}", compose)
         self.assertIn("- /etc/mellyn/${MELLYN_GATEWAY_CONFIG_FILE:-mellyn-gateway.example.toml}", compose)
         self.assertNotIn("- ../config:/etc/mellyn", compose)

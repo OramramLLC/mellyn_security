@@ -197,6 +197,8 @@ class TestEgressProxyGenerator(unittest.TestCase):
     def test_compose_internal_subnet_matches_squid_client_cidr(self) -> None:
         compose = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn(f"subnet: {DEFAULT_CLIENT_CIDRS[0]}", compose)
+        self.assertIn('profiles: ["gateway", "relay"]', compose)
+        self.assertNotIn("mellyn-viewer:", compose)
 
     def test_empty_allowlist_fails_closed_with_no_allow_rules(self) -> None:
         cfg = generate_squid_config(PolicyConfig(allowed_egress_domains=frozenset()))

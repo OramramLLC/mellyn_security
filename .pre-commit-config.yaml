@@ -13,12 +13,6 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
-    hooks:
-      - id: gitleaks
-        args: ["--config=.gitleaks.toml"]
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 38bfb07c0c64c304f47eb52090f8288150c77730 # frozen: v0.17.1
     hooks:
@@ -26,31 +20,19 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/semgrep/semgrep
-    rev: 240da9f30cd06fb4ee00c2c31c114c1c1f5ee0f4 # frozen: v1.182.0
+  - repo: https://github.com/OramramLLC/mellyn-guardrails
+    rev: 21c719e49137c4f7cd2857f073528bbb436f5a07
     hooks:
-      - id: semgrep
-        args: ["--config", ".semgrep/owasp-ai-code-rules.yaml", "--error", "--metrics=off"]
-        exclude: ^\.semgrep/ # rule test fixtures are intentionally insecure
+      - id: mellyn-verify-dependencies
+      - id: mellyn-check-agent-rules
+        args: [--check, --require-pack-canonical]
+      - id: mellyn-gitleaks
+      - id: mellyn-semgrep
 
-  # language: python runs each hook in a pre-commit-managed virtualenv, so "python" resolves
+  # language: python runs the test hook in a pre-commit-managed virtualenv, so "python" resolves
   # correctly on Windows even when the bare command opens the Microsoft Store stub.
   - repo: local
     hooks:
-      - id: owasp-ai-dependency-verifier
-        name: Dependency & anti-slopsquatting verifier
-        entry: python scripts/verify_dependencies.py
-        language: python
-        pass_filenames: false
-        files: (^|/)(pyproject\.toml|requirements.*\.(txt|lock)|uv\.lock|package(-lock)?\.json|\.mellyn-allowlist\.toml|scripts/verify_dependencies\.py)$
-
-      - id: agent-rules-sync
-        name: Agent rules files in sync, no hidden characters
-        entry: python scripts/sync_agent_rules.py --check
-        language: python
-        pass_filenames: false
-        files: ^(CLAUDE\.md|AGENTS\.md|GEMINI\.md|\.cursorrules|\.windsurfrules|\.clinerules|\.agent/.*|\.cursor/rules/.*|\.github/(copilot-instructions\.md|instructions/.*)|config/mellyn-(policy\.example|self-policy)\.toml|scripts/sync_agent_rules\.py)$
-
       - id: unit-tests
         name: Unit tests
         entry: python -m unittest discover -s tests

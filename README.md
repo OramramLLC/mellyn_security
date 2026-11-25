@@ -1,163 +1,71 @@
-# Mellyn Security — AI Security Engineering Architecture & B2B Guardrail Platform
+# Mellyn Security — MCP Airlock & Runtime Authorization
 
-An **OWASP-aligned AI Security Engineering Reference Architecture** and **B2B Security Platform** designed to secure AI-assisted coding workflows and runtime LLM/Agentic applications for small and medium businesses (SMBs).
+**Mellyn Security** is a fail-closed runtime security runtime for Model Context Protocol (MCP) tool ecosystems. This repository contains the focused **Core Runtime**:
 
----
-
-## Status
-
-| Plane | State |
-| :--- | :--- |
-| 1–2. Secure AI-assisted coding (agent rules, pre-commit, CI gate, CODEOWNERS) | **Implemented & Tested** |
-| 3a. MCP Airlock & Red-Team Flight Recorder (`src/mcp_airlock/`) | **Implemented & Tested** (`mellyn-pin`, `mellyn-airlock`, `mellyn-ir`, `mellyn-bench`, AgBOM pinning, AAD kill switch, `--mode observe` harness) |
-| 3b. Self-hosted MCP Control Plane (`backend/mellyn/`) | **Implemented & Tested** (core, HTTP API with durable SQLite session/taint/grant state via `MELLYN_STATE_DB_PATH`, stdio MCP gateway & container deployment with Squid egress proxy; see `deploy/README.md`) |
-| 4. B2B posture & audit viewer (`frontend/` + `backend/mellyn/viewer_server.py`) | **Implemented & Tested** (loopback fail-closed BFF, Control Assurance matrix, Airlock hash-chain verifier, Control Plane audit stream & live human approvals UI) |
-
-Self-hosted deployment (control-plane authorizer, gateway, Squid egress proxy): [`deploy/README.md`](deploy/README.md).
-
-## Core Capabilities
-
-1. **OWASP Secure Coding with AI Guardrails (IDE & Agent Layer)**
-   - One canonical ruleset ([`scripts/sync_agent_rules.py`](scripts/sync_agent_rules.py) keeps every agent's file in sync and rejects hidden Unicode):
-     - [`.agent/rules/owasp-secure-ai-coding.md`](.agent/rules/owasp-secure-ai-coding.md)
-     - [`CLAUDE.md`](CLAUDE.md)
-     - [`.cursorrules`](.cursorrules)
-     - [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
-   - Claude Code permission boundaries ([`.claude/settings.json`](.claude/settings.json)) and guardrail review enforcement ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
-2. **Deterministic Pre-Commit & CI/CD Security Gateways**
-   - **Anti-Slopsquatting & Dependency Verification**: [`scripts/verify_dependencies.py`](scripts/verify_dependencies.py) prevents hallucinated packages, unpinned dependencies, and freshly registered packages (<90 days).
-   - **AI-Targeted Static Analysis (SAST)**: [`.semgrep/owasp-ai-code-rules.yaml`](.semgrep/owasp-ai-code-rules.yaml) blocks unsafe `eval`/`exec`, `shell=True`, insecure deserialization, weak crypto defaults, and XSS sinks.
-   - **AI & Cloud Secret Scanning**: [`.gitleaks.toml`](.gitleaks.toml) detects OpenAI, Anthropic, Gemini, HuggingFace, LangSmith, and cloud keys before commit.
-3. **Zero-Dependency Stdio Containment Airlock & Red-Team Flight Recorder (`src/mcp_airlock/` — `pydantic`-only)**
-   - **AgBOM Pinning (`mellyn-pin`)**: Quarantined discovery computes exact SHA-256 digests over downstream `tools/list` definitions and flags pre-poisoned invisible Unicode (`pin_cli.py`).
-   - **Deterministic Containment Proxy (`mellyn-airlock`)**: Enforces fail-closed JSON-RPC 2.0 wire schemas (`extra="forbid"`, duplicate-key rejection), AgBOM/instructions pins, bounded stdio framing and stdin backpressure, minimal child environment isolation, workspace/resource path containment, and canary/secret scanning (`proxy.py`, `engine.py`, `scanner.py`). On canary leak, spoofed `rpc_id`, or AgBOM rug-pull, triggers an Automatic Activation Device (AAD) kill sequence (`SIGKILL` process group + Linux `PR_SET_PDEATHSIG` / Windows Job Object, exit code `78`) and appends a post-reap confirmation receipt.
-   - **Red-Team Harness Telemetry (`--mode observe`)**: Operator CLI flags (`--mode observe`, `--record-redacted-payloads`, `--opaque-policy-errors`) let red-team runs traverse multi-step kill chains with true `BLOCK`/`AAD_FIRE` telemetry recorded in `AuditLedger` while keeping protocol safety bounds active. Observe mode forwards every policy violation and never kills the downstream, so it also requires `allow_observe_mode = true` in the reviewed policy (a launch flag alone is refused), and every session's first ledger record states its mode.
-   - **Forensic Reconstruction & Egress Benchmark (`mellyn-ir`, `mellyn-bench`)**: `AuditLedger` computes raw `artifact_sha256`, redacts secrets and encoded/obfuscated canaries before disk flush, and maintains an unbroken SHA-256 hash chain verified by `mellyn-ir` (`reconstruct.py`); `mellyn-bench` validates scanner recall and microsecond/KB latency.
-4. **Self-Hosted MCP Control Plane (`backend/mellyn/` — Optional `[gateway]` Extras)**
-   - **Authorization-First Core**: Server-issued sessions with automatic cross-server taint tracking, tool risk tiers (fail-closed for unknown tools), exact-match policy rules, and single-use, short-TTL human grants for one exact call (`authorizer.py`, `approvals.py`). Install optional server extras via `pip install ".[gateway]"`.
-   - **Multi-Server MCP Gateway** ([`mcp_gateway.py`](backend/mellyn/mcp_gateway.py)): One stdio process fronting all downstream MCP servers (`<server>__<tool>`), holding high-risk/tainted calls for loopback human approval (`python -m mellyn.approve`) with container Squid egress isolation (`deploy/`).
-5. **B2B Posture, Forensic Audit & Approval Console (`frontend/` + `backend/mellyn/viewer_server.py`)**
-   - **Loopback Fail-Closed BFF (`viewer_server.py`)**: Serves the built SPA on `127.0.0.1:8080` with strict `CSP`/`nosniff`/`DENY` headers and refuses any `Host` header outside its allowlist (`421`, against DNS rebinding). Reads (status, reconstructed Airlock reports, gateway audit logs, OWASP/ATLAS assurance reports) need a separate read-only `Role.VIEWER` key (`MELLYN_VIEWER_KEY_DIGEST`); listing, approving, and rejecting held calls need the `Role.APPROVER` key. Both are checked in constant time via `X-Mellyn-API-Key` (`503` if unconfigured, `403` for the wrong role), and approvals are relayed without following redirects. Binding `0.0.0.0` requires `--allow-non-loopback`; extra hostnames are allowed with `--allow-host`.
-   - **Offline + Live Security Console (`frontend/` — React + TypeScript + Vite)**: Works with built-in redacted synthetic demos, client-side local file uploads (verifying `audit.jsonl` SHA-256 hash chains via Web Crypto), or live loopback API connections (the viewer key is kept in memory only; the approver key is entered in the Approvals tab and held only while that tab is open). Uploaded pre-built reports are labelled unverified.
+1. **MCP Airlock (`src/mcp_airlock/airlock/`)** — A fail-closed stdio JSON-RPC proxy enforcing strict schema typing, exact-byte AgBOM tool-definition and capability pins, payload size limits, invisible-character rejection, and downstream subprocess environment isolation.
+2. **Runtime Authorization Engine & Multi-Server Gateway (`backend/mellyn/`)** — Default-deny policy enforcement (`authorizer.py`, `policy.py`, `policy_loader.py`), single-use approval tokens and approval relay (`approvals.py`, `approval_relay.py`, `state_store.py`), multi-server stdio/HTTP-downstream MCP Gateway with OAuth 2.1 support (`mcp_gateway.py`, `pin_gateway.py`, `http_downstream.py`, `oauth_client.py`), and FastAPI service (`api.py`).
+3. **Egress Guard & Scanner (`src/mcp_airlock/egress/`, `backend/mellyn/egress*.py`)** — Pre-egress secret, token-shape, and canary leakage detection (`scanner.py`, `guards.py`), egress benchmarking (`bench.py`), and domain-filtering forward proxy support.
+4. **Forensic Flight Recorder (`src/mcp_airlock/core/audit.py`, `src/mcp_airlock/ir_lab/`, `backend/mellyn/audit.py`)** — Redact-before-disk SHA-256 hash-chained JSONL audit logs with `artifact_sha256` digests, timeline reconstruction (`reconstruct.py`), and tamper verification (`verify_chain.py`).
+5. **Optional Container & Squid Egress Stack (`deploy/`, `Dockerfile`)** — Hardened Docker Compose deployment with isolated internal networks, Squid egress allowlisting (`deploy/egress/squid.conf`), Gateway profile (`--profile gateway`), and optional Approval Relay profile (`--profile relay`).
 
 ---
 
-## Quickstart: Red-Teaming & Containment Workflow
+## Key Security Guarantees
 
-Want a self-contained **5-minute runnable demo** first (harmless in-memory MCP server + reviewed policy + one allowed call + one blocked call + ledger in the Plane 4 viewer)? See [**`examples/airlock_demo/README.md`**](examples/airlock_demo/README.md) or run:
+- **Fail-Closed Everywhere:** Malformed JSON-RPC frames, duplicate JSON keys, missing or mismatched AgBOM pins, schema violations, or unhandled errors default to `DENY`.
+- **Check and Hash What Is Forwarded:** AgBOM pins, request/response `artifact_sha256` digests, and payload limits operate over exact forwarded JSON bytes (`exact_json_bytes`), while normalization only tightens deny/canary checks.
+- **Redact Before Disk:** Secrets and canaries are hashed first (`artifact_sha256`), then redacted before appending to the hash-chained audit ledger.
+- **Stdio Wire Purity & Env Isolation:** Airlock diagnostics never touch `stdout`, and downstream MCP servers receive an explicit minimal environment rather than inheriting ambient `os.environ`.
+
+See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for architectural invariants and threat-model traceability.
+
+---
+
+## Repository Layout
+
+- `src/mcp_airlock/` — Focused MCP Airlock (`airlock/`), core framing/normalization/audit (`core/`), egress scanning & benchmarking (`egress/`), and forensic IR verification (`ir_lab/`).
+- `backend/mellyn/` — Runtime authorizer, policy engine, state store, multi-server gateway, HTTP/OAuth downstream adapters, egress proxy, API server, and `mellyn` CLI.
+- `config/` — Example configurations (`mellyn.example.toml`, `mellyn-gateway.example.toml`, `mellyn-policy.example.toml`, `mellyn-self-policy.toml`).
+- `deploy/` — Optional container & Squid egress deployment (`docker-compose.yml`, `egress/`, pinned lockfiles `requirements.lock`, `requirements-ci-lint.lock`, `requirements-ci-tests.lock`, and [deploy/README.md](deploy/README.md)).
+- `examples/airlock_demo/` — End-to-end Airlock walkthrough (`run_demo.py`, `sample_mcp_server.py`, `reviewed_policy.toml`).
+- `scripts/` — Container & egress stack verification (`verify_container_stack.py`).
+- `tests/` — Unit, security invariant, HTTP/OAuth, gateway, and end-to-end test suites.
+
+---
+
+## Quick Start
+
+Run the interactive CLI demo walkthrough (prints forensic report to stdout):
 
 ```bash
 python examples/airlock_demo/run_demo.py
 ```
 
-Want to run the **28-scenario adversarial red-team scorecard** (six attack families, regression-tested on every run)? See [**`examples/adversarial_eval/README.md`**](examples/adversarial_eval/README.md) or run:
+Run the test suite and linters using a local virtual environment:
 
 ```bash
-python examples/adversarial_eval/run_redteam.py
+python -m unittest discover -s tests -v
+ruff check .
+ruff format --check .
 ```
 
-Want to see a live multi-turn **`--mode observe` red-team workflow** against `--mode enforce` in the Plane 4 console (including a ready-to-paste real MCP client config)? See [**`examples/observe_redteam/README.md`**](examples/observe_redteam/README.md) or run:
+Generate local credentials, bring up the optional container stack, or run egress scanning benchmarks via the `mellyn` CLI (`backend/mellyn/cli.py`):
 
 ```bash
-python examples/observe_redteam/run_observe_workflow.py
+mellyn init
+mellyn up --profile gateway
+mellyn up --profile relay
+mellyn bench
 ```
 
-Or install the unified package (`mellyn` Control Plane + `mcp_airlock`; installs only `pydantic>=2.10.0` for local CLI, no `PYTHONPATH` needed):
-
-```bash
-pip install -e .
-mellyn presets                                       # inspect built-in SMB presets (filesystem, fetch, github, linear, slack, postgres)
-mellyn init --unified --preset mcp-filesystem --preset github --workspace /abs/path/to/agent/workspace
-                                                     # digest-only .env + single schema_version=2 config/mellyn.toml (omit --unified for v1 split files)
-mellyn pin --name workspace --preset mcp-filesystem --config config/mellyn.toml -- my-mcp-server --root .
-                                                     # inspect tools/list in a minimal env & pin exact tools_sha256 into mellyn.toml
-# Or pin a remote Streamable HTTP MCP server with OAuth 2.1 (M2M, PKCE, or bearer_env):
-mellyn pin --name github --url https://api.githubcopilot.com/mcp/ --oauth-flow pkce --oauth-as https://github.com/login/oauth --client-id-env GITHUB_CLIENT_ID --preset github --config config/mellyn.toml
-mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
-mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
-mellyn proxy --config config/mellyn.toml --workspace . --audit-log mellyn-audit.jsonl
-mellyn verify mellyn-audit.jsonl --json              # auto-detects Gateway or Airlock hash-chained ledgers
-```
-
-`mellyn init` keeps `.env` outside `config/`, because compose mounts `config/` read-only into the containers. It
-also records `MELLYN_CONFIG_DIR`, `MELLYN_POLICY_FILE` and `MELLYN_GATEWAY_CONFIG_FILE` in `.env`, and `mellyn up`
-passes `.env` to compose, so the containers enforce the generated policy rather than the checked-in example. Replace
-any placeholder commands in `config/mellyn.toml` (or run `mellyn pin --name ... --config config/mellyn.toml -- <cmd>`)
-before connecting a client.
-
-1. **Pin a downstream MCP server manifest (`mellyn-pin`)**:
-
-```bash
-mellyn-pin --output policy.toml -- python -m my_mcp_server
-# Review policy.toml and fill in allowed_tools, workspace_roots, and canary_tokens
-```
-
-2. **Run with fail-closed enforcement (`mellyn-airlock`, default `--mode enforce`)**:
-
-```bash
-mellyn-airlock --policy policy.toml --audit-log audit.jsonl --opaque-policy-errors -- python -m my_mcp_server
-```
-
-3. **Run a multi-turn red-team evaluation (`--mode observe`) inside an isolated sandbox**. Observe mode forwards policy violations (including canary leaks) instead of blocking them, so use a separate policy with `allow_observe_mode = true`, throwaway canaries, and a sandboxed downstream:
-
-```bash
-mellyn-airlock --policy policy.observe.toml --audit-log audit.observe.jsonl \
-  --mode observe --record-redacted-payloads -- python -m my_mcp_server
-```
-
-`--record-redacted-payloads` stores request and response contents (up to 16 KiB each, secrets and canaries redacted) for allowed traffic too, so tool results such as file contents end up in the audit log.
-
-4. **Verify the ledger & reconstruct the incident timeline (`mellyn-ir`)**:
-
-```bash
-mellyn-ir audit.jsonl --json
-```
-
-5. **Run the deterministic canary/secret scanner benchmark (`mellyn-bench`)**:
-
-```bash
-mellyn-bench --json
-```
-
-6. **Build & launch the Plane 4 Posture, Audit & Approval Console**:
-
-```bash
-npm --prefix frontend install
-npm --prefix frontend run build
-# Needs MELLYN_API_KEY_PEPPER, MELLYN_VIEWER_KEY_DIGEST (reads) and MELLYN_APPROVER_KEY_DIGEST (approvals).
-PYTHONPATH=backend python -m mellyn.viewer_server \
-  --airlock-audit-log audit.jsonl \
-  --gateway-audit-log gateway-audit.jsonl \
-  --approval-port 8765
-```
+See [deploy/README.md](deploy/README.md) for container networking, secret-file configuration, and egress verification (`scripts/verify_container_stack.py`).
 
 ---
 
-## Documentation
+## Companion Projects & Parked Scope
 
-- [**Client Onboarding Guide (Reusable CI Gate & Pre-Commit Pack)**](docs/CLIENT_ONBOARDING.md)
-- [**Self-Hosted Deployment Guide (Docker + Egress Proxy)**](deploy/README.md)
-- [**OWASP AI-Assisted & Agentic Coding Security Synthesis**](docs/OWASP_AI_CODING_SECURITY.md)
-- [**System & B2B Reference Architecture**](docs/ARCHITECTURE.md)
-- [**Runtime Gateway Threat Model**](docs/THREAT_MODEL.md)
-- [**Security Policy & Coordinated Disclosure**](SECURITY.md)
-- [**Release Changelog**](CHANGELOG.md)
-- [**License: Apache-2.0**](LICENSE) (see also [`NOTICE`](NOTICE))
+This repository intentionally isolates the **Core Runtime**:
 
----
-
-## Quick Verification
-
-Run the built-in OWASP AI Dependency & Anti-Slopsquatting Verifier:
-
-```bash
-python scripts/verify_dependencies.py --online   # existence, package age, pinning, non-registry sources
-python scripts/sync_agent_rules.py --check        # agent rules in sync, no hidden characters
-python -m unittest discover -s tests              # tests
-pre-commit install && pre-commit run --all-files  # all local gates
-```
-
-The HTTP API tests (`tests/test_api.py`) skip locally unless FastAPI and httpx are installed; CI installs
-pinned versions in the test job and sets `MELLYN_REQUIRE_API_TESTS=1`, so there they fail rather than skip.
-Locally, install them in a separate virtual environment from Semgrep: current FastAPI releases need a newer
-`opentelemetry-api` than Semgrep 1.182 allows.
+- **Guardrail & CI Policy Pack:** `OramramLLC/mellyn-guardrails` — Reusable Gitleaks/Semgrep/agent-rule/dependency verification hooks and GitHub Actions workflow, consumed here pinned by immutable commit SHA in [.pre-commit-config.yaml](.pre-commit-config.yaml) and [.github/workflows/ai-security-gate.yml](.github/workflows/ai-security-gate.yml).
+- **Red-Team Evaluation Harness:** `mellyn-redteam` — Dedicated adversarial evaluation and conformance suite separated into its own sibling project.
+- **Parked Monolith Scope:** The legacy web console, enterprise multi-tenant/distributed features, and full pre-split monolith remain preserved on the `archive/v1-monolith-full` reference (see Section 7 of [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)).

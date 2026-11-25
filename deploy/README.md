@@ -90,7 +90,7 @@ curl -fsS http://127.0.0.1:8000/healthz
 
 `mellyn-authorizer` stores durable SQLite session, taint, and single-use grant state in `MELLYN_STATE_DB_PATH`
 (`/var/lib/mellyn/state.db`), backed by the dedicated `mellyn-authorizer-state` volume (`0700` owned by `mellyn`
-UID `10001`, separate from audit log volumes and never mounted on `mellyn-gateway` or `mellyn-viewer`).
+UID `10001`, separate from audit log volumes and never mounted on `mellyn-gateway`).
 
 ### 5. Run the MCP gateway from your MCP client
 
@@ -126,37 +126,15 @@ PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 approve 
 
 Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). Inside `mellyn-gateway`, downstream MCP servers run under the dedicated unprivileged `mellyn-mcp` (`10002`) UID while the gateway drops to `mellyn` (`10001`), keeping `/var/log/mellyn` (`0700`, mounted from its own isolated `mellyn-gateway-audit-logs` volume) inaccessible to child MCP processes. If you prefer not to run Python on the host, run `docker exec -it -u mellyn mellyn-gateway python -m mellyn.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i -u mellyn ... --key-stdin`); never pass the key via `docker exec -e`.
 
-### 7. Launch the Plane 4 Posture, Audit & Approval Console (`mellyn-viewer`)
+### 7. Start the approval relay without a detached gateway (`--profile relay`)
 
-`mellyn-viewer` builds the React + TypeScript SPA in a digest-pinned `node:22.21.1-bookworm-slim` stage (`npm ci --ignore-scripts`) and serves it from a non-root `mellyn` (`10001`) Python container on **`127.0.0.1:8080`** over the `mellyn-frontend` bridge network only (never `mellyn-internal` or `mellyn-egress-net`):
-
-1. Generate a third, read-only key with `PYTHONPATH=backend python -m mellyn.credentials`, then uncomment
-   `MELLYN_VIEWER_KEY_DIGEST` in `.env` and set it to that digest. Leave the line commented out if you don't run
-   the viewer: every service checks every digest that is set, so a placeholder there stops them all from starting.
-2. Create the evidence folder the viewer reads. It defaults to `evidence/` at the repository root (gitignored);
-   set `MELLYN_EVIDENCE_DIR` to an absolute path to use another one. Put two files in it:
-   - `audit.jsonl`: the Airlock ledger. Point `mellyn-airlock --audit-log` straight at it so the viewer shows the
-     live ledger.
-   - `control-assurance.json`: the conformance report, from
-     `python scripts/run_conformance_report.py --json-out evidence/control-assurance.json --markdown-out evidence/control-assurance.md`.
-
-   Until `audit.jsonl` exists, **Airlock Forensics reports `INTEGRITY_COMPROMISED`**. That is deliberate: a missing
-   ledger looks exactly like a deleted one, and the viewer will not call either one clean.
-3. Start the viewer profile. It starts `mellyn-viewer` and `mellyn-approval-relay`, plus the authorizer and egress
-   proxy, but **not** the gateway. Don't add `--profile gateway` to this command: the MCP client starts the gateway
-   per session (step 5). A second, detached gateway would answer to the same `mellyn-gateway` name, so the relay
-   could deliver your approvals to it instead of the session that is waiting.
+To start `mellyn-approval-relay` alongside `mellyn-authorizer` and `mellyn-egress` before your MCP client launches `mellyn-gateway` (step 5), use `--profile relay`:
 
 ```bash
-mkdir -p evidence
-docker compose -f deploy/docker-compose.yml --profile viewer up -d --build
-curl -fsS http://127.0.0.1:8080/api/v1/healthz
+docker compose -f deploy/docker-compose.yml --profile relay up -d --build
 ```
 
-The viewer mounts only the gateway audit volume (`mellyn-gateway-audit-logs`) and the evidence folder, both
-**read-only (`:ro`)**. Live approvals go through `mellyn-approval-relay:8765`, and only after you enter the
-`Role.APPROVER` key in the **Approvals Queue** tab. The approver key travels over plain HTTP between the viewer and
-the relay inside the `mellyn-frontend` network, so keep that network to these containers.
+Do not add `--profile gateway` to `up -d`: the MCP client starts `mellyn-gateway` per session (`compose run ...`), and a second detached gateway would answer to the same `mellyn-gateway` DNS alias, causing the relay to deliver approvals to whichever container DNS picks.
 
 ---
 
@@ -173,9 +151,8 @@ directly, and a held call was approved with `docker exec` and then ran once.
 
 ## Supply chain
 
-- Base images are pinned by digest (`Dockerfile`, `deploy/egress/Dockerfile`, `deploy/viewer/Dockerfile`).
+- Base images are pinned by digest (`Dockerfile`, `deploy/egress/Dockerfile`).
 - Python packages, including transitive ones, come from `deploy/requirements.lock`, installed with `--require-hashes`.
   Every release in it was published before 2026-10-22.
-- Plane 4 frontend packages come from `frontend/package-lock.json`, installed with `npm ci --ignore-scripts`.
 - Squid is installed from the Ubuntu 24.04 archive at build time (the `ubuntu/squid` image only ships edge/beta
   channels and its 24.04 tag had not been rebuilt in a year). Rebuild regularly to pick up security updates.

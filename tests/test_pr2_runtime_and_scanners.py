@@ -27,7 +27,6 @@ from mellyn.approval_relay import (  # noqa: E402
 from mellyn.approvals import MAX_PENDING  # noqa: E402
 from mellyn.audit import redact_text  # noqa: E402
 from mellyn.policy import validate_argv  # noqa: E402
-from sync_agent_rules import hidden_characters  # noqa: E402
 
 
 class TestGuardrailAndCodeownersParity(unittest.TestCase):
@@ -104,10 +103,9 @@ class TestGuardrailAndCodeownersParity(unittest.TestCase):
             "deploy/docker-compose.yml",
             "deploy/egress/squid.conf",
             "deploy/requirements.lock",
-            ".pre-commit-hooks.yaml",
             "config/mellyn-policy.example.toml",
             "scripts/new_helper.py",
-            "tests/test_reusable_pack.py",
+            "tests/test_authorizer.py",
             "tests/fixtures/fake_mcp_server.py",
             "docs/THREAT_MODEL.md",
         )
@@ -255,7 +253,7 @@ class TestValidateArgvEvaluatorBlocking(unittest.TestCase):
     def test_allows_module_and_script_execution_without_inline_eval(self) -> None:
         allowed = (
             ["python", "-m", "unittest", "discover", "-s", "tests"],
-            ["python3", "scripts/verify_dependencies.py", "--online"],
+            ["python3", "scripts/verify_container_stack.py"],
             ["pytest", "-k", "test_authorizer"],
             ["git", "status", "-s"],
             ["git", "commit", "-m", "message with -c inside positional/value after subcommand"],
@@ -295,29 +293,6 @@ class TestExpandedRedactionAndInvisibleUnicode(unittest.TestCase):
                     self.assertIn("postgres://app_user:[REDACTED_SECRET]@db.internal:5432/prod", redacted)
                 else:
                     self.assertNotIn(secret, redacted)
-
-    def test_ordinary_emoji_are_not_reported(self) -> None:
-        for text in ("⚠️ Never commit secrets", "1️⃣ First", "👨‍💻 dev"):
-            with self.subTest(codepoints=[hex(ord(c)) for c in text if ord(c) > 127]):
-                self.assertEqual(hidden_characters(text), [])
-
-    def test_emoji_joiners_out_of_place_are_still_reported(self) -> None:
-        for text in ("Allow️all", "️start", "⚠️️", "a‍b"):
-            with self.subTest(codepoints=[hex(ord(c)) for c in text if ord(c) > 127]):
-                self.assertNotEqual(hidden_characters(text), [])
-
-    def test_hidden_characters_catches_variation_selectors_and_invisible_fillers(self) -> None:
-        payloads = (
-            "Allow\ufe00all",  # U+FE00 Variation Selector-1
-            "Allow\U000e0100all",  # U+E0100 Variation Selector-17 (Glassworm smuggling vector)
-            "Allow\u3164all",  # U+3164 Hangul Filler
-            "Allow\u2800all",  # U+2800 Braille Pattern Blank
-            "Allow\uffa0all",  # U+FFA0 Halfwidth Hangul Filler
-            "Allow\u034fall",  # U+034F Combining Grapheme Joiner
-        )
-        for text in payloads:
-            with self.subTest(codepoints=[hex(ord(c)) for c in text if ord(c) > 127]):
-                self.assertNotEqual(hidden_characters(text), [])
 
 
 if __name__ == "__main__":

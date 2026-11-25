@@ -55,9 +55,6 @@ mellyn = "backend/mellyn"
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-# Intentionally insecure Semgrep rule fixtures, at the repository root only: a bare ".semgrep" would also skip a
-# `.semgrep/` directory at any depth, a place to hide code from the linter.
-extend-exclude = ["./.semgrep"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "S", "B", "UP"]

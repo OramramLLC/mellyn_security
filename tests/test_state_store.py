@@ -530,8 +530,8 @@ class TestDeploymentPersistenceWiring(unittest.TestCase):
 
         gateway_section = compose.split("mellyn-gateway:", 1)[1].split("mellyn-approval-relay:", 1)[0]
         relay_section = compose.split("mellyn-approval-relay:", 1)[1].split("mellyn-egress:", 1)[0]
-        viewer_section = compose.split("mellyn-viewer:", 1)[1].split("networks:", 1)[0]
-        for section in (gateway_section, relay_section, viewer_section):
+        egress_section = compose.split("mellyn-egress:", 1)[1].split("networks:", 1)[0]
+        for section in (gateway_section, relay_section, egress_section):
             self.assertNotIn("mellyn-authorizer-state", section)
 
 

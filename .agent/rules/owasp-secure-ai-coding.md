@@ -6,9 +6,10 @@ alwaysApply: true
 
 # Secure AI-Assisted Coding — Engineering Steering Guidelines
 
-<!-- SINGLE SOURCE OF TRUTH. CLAUDE.md imports this file; .cursorrules and
-     .github/copilot-instructions.md are generated from it by scripts/sync_agent_rules.py.
-     Edit only this file, then run: python scripts/sync_agent_rules.py -->
+<!-- SINGLE SOURCE OF TRUTH, maintained in OramramLLC/mellyn-guardrails. CLAUDE.md imports this file;
+     .cursorrules and .github/copilot-instructions.md are generated from it by mellyn-guardrails'
+     scripts/sync_agent_rules.py. In a repository that uses the pack, copy this file unchanged from the pinned
+     commit, then regenerate with: python <mellyn-guardrails>/scripts/sync_agent_rules.py --root <repository> -->
 
 These guidelines apply to every code change, command, and recommendation. They draw on the OWASP Top 10 (2021 numbering),
 the OWASP Top 10 for LLM Applications (2025), the OWASP Top 10 for Agentic Applications, and the OWASP Cheat Sheet
@@ -20,8 +21,9 @@ lives in the local pre-commit hooks, CI gates, and runtime tool-call authorizer.
   dependencies already declared in `pyproject.toml` / `package.json`.
 - **New dependencies need human approval.** Propose the package, its maintainer, and why; do not add it on your own.
 - **Version floors and lockfiles are verified.** Use `==`, `~=`, or a real `>=X.Y` floor (never `*`, `latest`, or `>=0`),
-  registry sources only (no git/URL/path installs), and run `python scripts/verify_dependencies.py --online`, which
-  verifies manifests and lockfiles for registry existence, 90-day package age, and 14-day release cooldowns.
+  registry sources only (no git/URL/path installs). The Mellyn Guardrails dependency verifier (pre-commit hook
+  `mellyn-verify-dependencies`; online in CI) checks manifests and lockfiles for registry existence, 90-day package
+  age, and 14-day release cooldowns.
 
 ## 2. Secrets & Credential Protection (LLM02)
 - **Zero hardcoded secrets** — no API keys, JWT secrets, passwords, or tokens, including realistic-looking placeholders
@@ -63,7 +65,8 @@ lives in the local pre-commit hooks, CI gates, and runtime tool-call authorizer.
   be flagged for human security review.
 
 ## 5. Verify Before Declaring Done
-- `python scripts/verify_dependencies.py --online` — dependency, lockfile, and slopsquatting verification
+- `pre-commit run --all-files` — the Mellyn Guardrails hooks (dependency and lockfile verification, agent rules check,
+  Gitleaks secrets scan, OWASP AI Semgrep rules) plus the repository's own hooks
 - `python -m unittest discover -s tests` (or `pytest`) — unit and security regression tests
-- `semgrep scan --config .semgrep/owasp-ai-code-rules.yaml --exclude .semgrep --error` — AI-targeted SAST
-- `gitleaks git --config .gitleaks.toml` — secrets
+- If a check cannot run (for example, a scanner is not installed), say so. Never recreate, edit, or skip a check to make
+  it pass; CI runs the same checks.
