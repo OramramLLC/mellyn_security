@@ -14,6 +14,7 @@ import type {
 const GENESIS_PREV_HASH = "0".repeat(64);
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 const AAD_CONTAINMENT_CONFIRMED_RULE_ID = "airlock.aad_containment_confirmed";
+const SESSION_STARTED_RULE_ID = "airlock.session_started";
 
 const EXTRA_INVISIBLE_CODEPOINTS = new Set<number>([
   0x034f, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x180b, 0x180c, 0x180d, 0x180e, 0x200b, 0x200c, 0x200d, 0x2060,
@@ -688,6 +689,7 @@ export async function verifyAndReconstructAirlockJsonl(
     const aadTriggers: TerminalTrigger[] = [];
     const aadIndexById = new Map<string, number>();
     let prevZone: Zone | null = null;
+    let sessionMode: "enforce" | "observe" | null = null;
 
     for (const entry of sidEntries) {
       const ev = entry.event;
@@ -700,6 +702,13 @@ export async function verifyAndReconstructAirlockJsonl(
         typeof ev.request_id === "string" || typeof ev.request_id === "number" ? ev.request_id : null;
       const toolName = typeof ev.tool_name === "string" ? ev.tool_name : null;
       const isObserved = meta.enforcement_mode === "observe";
+      if (ruleId === SESSION_STARTED_RULE_ID) {
+        if (meta.enforcement_mode === "observe") {
+          sessionMode = "observe";
+        } else if (meta.enforcement_mode === "enforce") {
+          sessionMode = "enforce";
+        }
+      }
 
       const tEv: TimelineEvent = {
         seq: entry.seq,
@@ -790,6 +799,7 @@ export async function verifyAndReconstructAirlockJsonl(
       block_precursors: blockPrecursors,
       terminal_event: sessionTerminal,
       events,
+      enforcement_mode: sessionMode,
     });
   }
 

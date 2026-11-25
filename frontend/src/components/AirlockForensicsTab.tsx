@@ -100,8 +100,9 @@ export function AirlockForensicsTab({ report }: AirlockForensicsTabProps) {
 
         {(report.observed_aad_count > 0 || report.observed_block_count > 0) && (
           <div className="callout-info">
-            <strong>Red-Team Observe Telemetry:</strong> Recorded <code>{report.observed_aad_count}</code> observed AAD
-            trigger(s) and <code>{report.observed_block_count}</code> observed block(s) without terminating downstream.
+            <StatusBadge tone="warn">OBSERVE</StatusBadge> <strong>Red-Team Observe Telemetry:</strong> Recorded{" "}
+            <code>{report.observed_aad_count}</code> observed AAD trigger(s) and <code>{report.observed_block_count}</code>{" "}
+            observed block(s) without terminating downstream.
           </div>
         )}
       </section>
@@ -156,7 +157,8 @@ export function AirlockForensicsTab({ report }: AirlockForensicsTabProps) {
               <option value="all">All Sessions ({report.sessions.length})</option>
               {report.sessions.map((s) => (
                 <option key={s.session_id} value={s.session_id}>
-                  {s.session_id} ({s.event_count})
+                  {s.session_id}
+                  {s.enforcement_mode ? ` [${s.enforcement_mode.toUpperCase()}]` : ""} ({s.event_count})
                 </option>
               ))}
             </select>

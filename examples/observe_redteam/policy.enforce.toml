@@ -1,0 +1,32 @@
+# Production fail-closed counterpart for `examples/observe_redteam/sandbox_mcp_server.py`.
+# Identical AgBOM pins, path rules, and canary configuration, with `allow_observe_mode = false`
+# so any attempt to launch `--mode observe` with this policy fails closed (exit 2).
+
+policy_id = "mellyn-observe-redteam-enforce"
+allow_observe_mode = false
+allowed_tools = ["list_tickets", "read_workspace_file"]
+max_payload_bytes = 65536
+workspace_roots = ["."]
+canary_tokens = ["MELLYN_OBSERVE_CANARY_4219"]
+manifest_sha256 = "da4c7ec570b5765f237f44eb180e0d91a455061b19a4c9c62522bd2a9581b6e9"
+
+[agbom_pins]
+list_tickets = "1805124b5503b9dd9520547cb566a382884b02efdeb79286e1dfe95c24ca3167"
+read_workspace_file = "ac160867e2626323572065014ea19232774b820322d55fa43984283969650482"
+post_webhook = "9ab9a17b15a6053633759dfcbc20f70aa545aae60626430037b2f329b2b6173a"
+
+[tool_rules.list_tickets]
+name = "list_tickets"
+allowed = true
+allowed_arg_names = []
+
+[tool_rules.read_workspace_file]
+name = "read_workspace_file"
+allowed = true
+path_arg_names = ["path"]
+allowed_arg_names = ["path"]
+
+[tool_rules.post_webhook]
+name = "post_webhook"
+allowed = false
+allowed_arg_names = []

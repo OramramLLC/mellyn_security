@@ -62,6 +62,7 @@ export interface SessionTimeline {
   block_precursors: TimelineEvent[];
   terminal_event: TerminalTrigger | null;
   events: TimelineEvent[];
+  enforcement_mode?: "enforce" | "observe" | null;
 }
 
 /**
