@@ -95,9 +95,14 @@ class TestGatewayHostsStayOutOfToolEgress(unittest.TestCase):
     def test_a_tool_cannot_reach_another_webhook_on_the_shared_host(self) -> None:
         extra = '[auth]\nmode = "oidc"\nissuer = "https://idp.corp.example"\naudience = "https://mcp.corp.example"\n'
         unified = self.load(_config(extra))
-        self.assertEqual(unified.gateway_egress_domains, frozenset({"hooks.slack.com", "idp.corp.example"}))
-        self.assertNotIn("hooks.slack.com", unified.policy.allowed_egress_domains)
-        self.assertNotIn("idp.corp.example", unified.policy.allowed_egress_domains)
+        gateway_only = {"hooks.slack.com", "idp.corp.example", "mcp.remote.example", "auth.remote.example"}
+        self.assertEqual(unified.gateway_egress_domains, frozenset(gateway_only))
+        # Before the fix the remote MCP server and its authorization server were in the tool policy too.
+        self.assertEqual(unified.policy.allowed_egress_domains & gateway_only, frozenset())
+        remote_allowed, _ = EgressValidator(unified.policy.allowed_egress_domains).validate_url(
+            "https://auth.remote.example/anything"
+        )
+        self.assertFalse(remote_allowed)
 
         # Before the fix this passed: any tool could post to an attacker's own webhook on hooks.slack.com.
         allowed, _ = EgressValidator(unified.policy.allowed_egress_domains).validate_url(ATTACKER)
@@ -108,7 +113,9 @@ class TestGatewayHostsStayOutOfToolEgress(unittest.TestCase):
         self.assertNotIn("dstdomain .hooks.slack.com", squid)  # exact host, not every subdomain
 
 
-class TestSecretsAreWithheldFromDownstreamServers(unittest.TestCase):
+class _GatewayConfigCase(unittest.TestCase):
+    """A config with a stdio server, a remote OAuth server, webhooks and OIDC, for driving both gateways."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -120,6 +127,8 @@ class TestSecretsAreWithheldFromDownstreamServers(unittest.TestCase):
         oidc = '[auth]\nmode = "oidc"\nissuer = "https://idp.corp.example"\naudience = "https://mcp.corp.example"\n'
         self.config.write_text(_config(oidc), encoding="utf-8")
 
+
+class TestSecretsAreWithheldFromDownstreamServers(_GatewayConfigCase):
     def test_named_secrets_are_dropped_from_the_child_environment(self) -> None:
         unified = parse_unified_dict(tomllib.loads(_config()), base_dir=self.root, config_path=self.config)
         self.assertEqual(set(unified.secret_env_names), {WEBHOOK_ENV, CLIENT_SECRET_ENV})
@@ -153,6 +162,34 @@ class TestSecretsAreWithheldFromDownstreamServers(unittest.TestCase):
                 # Before the fix nothing was withheld: servers inherited the webhook URL and OAuth secrets.
                 self.assertIsNotNone(names)
                 self.assertEqual(set(names or ()), {WEBHOOK_ENV, CLIENT_SECRET_ENV})
+
+
+class TestRemoteServersStillReachTheirHosts(_GatewayConfigCase):
+    """Remote-server and OAuth hosts left the tool policy; the gateway's own HTTP clients must still allow them."""
+
+    def test_both_gateways_give_remote_clients_the_gateway_hosts(self) -> None:
+        argv = ["--config", str(self.config), "--workspace", str(self.workspace)]
+        argv += ["--audit-log", str(self.root / "audit.jsonl")]
+        for label, main, module in (
+            ("stdio", mcp_gateway.main, mcp_gateway),
+            ("serve", http_gateway.main, http_gateway),
+        ):
+            with self.subTest(label):
+                seen: dict[str, Any] = {}
+
+                def record(*_args: Any, _seen: dict[str, Any] = seen, **kwargs: Any) -> Any:
+                    _seen.update(kwargs)
+                    raise RuntimeError("stop after recording the remote client's allowlist")
+
+                with (
+                    mock.patch.object(module, "StdioDownstream", return_value=mock.MagicMock()),
+                    mock.patch.object(module, "StreamableHttpDownstream", side_effect=record),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    main(argv)
+                allowed = seen.get("allowed_domains") or frozenset()
+                self.assertIn("mcp.remote.example", allowed)
+                self.assertIn("auth.remote.example", allowed)
 
 
 class TestAlertsCarryNoAgentMarkup(unittest.TestCase):

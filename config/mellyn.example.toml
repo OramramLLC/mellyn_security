@@ -54,7 +54,8 @@ preset = "github"
 trusted = false
 command = ["replace-with-your-github-mcp-server", "--read-only"]
 
-# Optional remote Streamable HTTP MCP server with OAuth 2.1 (M2M or PKCE):
+# Optional remote Streamable HTTP MCP server with OAuth 2.1 (M2M or PKCE). Its URL and OAuth hosts are allowed for
+# the gateway only (and in Squid), never added to the tool egress allowlist:
 # [[servers]]
 # name = "remote-github"
 # transport = "streamable-http"

@@ -14,6 +14,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **`mellyn pin --name … --config mellyn.toml`** records a server's tool hash in the unified config. It refuses tool
   definitions containing invisible Unicode, edits only that server's block so comments survive, and writes
   atomically. The gateway also blocks any listing with invisible Unicode, pinned or not.
+- **Gateway-only egress hosts.** Remote `streamable-http` server URLs, their OAuth authorization servers and token
+  endpoints, the OIDC issuer and JWKS hosts, and the approval webhook host are no longer added to the tool egress
+  allowlist (`policy.allowed_egress_domains`). The gateway's own clients still reach them, and Squid still allows them.
+  A tool that relied on reaching one of these hosts now needs it listed in `[egress].allowed_domains`.
+- **Approval webhooks (breaking for `[notifications]`).** The webhook URL is read only from the environment variable
+  named by `approval_webhook_url_env`, and `webhook_host` must name the one host alerts may go to. A literal
+  `approval_webhook_url` in `mellyn.toml` is refused. Configured secret variables (the webhook URL, OAuth client
+  secrets and bearer tokens) are withheld from downstream MCP servers.
 
 ## [1.0.0] - 2026-11-24
 

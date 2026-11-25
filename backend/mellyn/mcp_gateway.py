@@ -1460,7 +1460,7 @@ def main(argv: list[str] | None = None) -> int:
                     spec.name,
                     spec.url,
                     oauth_config=spec.oauth,
-                    allowed_domains=policy.allowed_egress_domains,
+                    allowed_domains=policy.allowed_egress_domains | unified.gateway_egress_domains,
                     on_notification=on_notification,
                 )
 

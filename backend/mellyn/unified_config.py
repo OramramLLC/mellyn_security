@@ -125,7 +125,8 @@ class UnifiedConfig:
     auto_sync_squid: bool = True
     auth: AuthConfig = field(default_factory=AuthConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
-    # Hosts only the gateway process contacts (identity provider, approval webhook). Kept out of
+    # Hosts only the gateway process contacts (remote MCP servers and their OAuth authorization servers, the
+    # identity provider, the approval webhook). Kept out of
     # `policy.allowed_egress_domains`, which bounds where tools may send data: a shared webhook host such as
     # hooks.slack.com there would let a tool post to anyone's webhook. Squid still allows them (see egress_proxy).
     gateway_egress_domains: frozenset[str] = frozenset()
@@ -493,7 +494,9 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                 server_url = validate_outbound_url(url_raw, allow_loopback_http=False)
             except ValueError as exc:
                 raise PolicyLoadError(f"servers[{idx}] ({name}).url rejected: {exc}") from exc
-            _add_domain_from_url(server_url, seen_domains, allowed_domains)
+            # The gateway connects to remote servers and their authorization servers itself; tools never need
+            # to. In the tool policy, a shared host (github.com, a cloud IdP) would be open to every tool.
+            _add_domain_from_url(server_url, seen_gateway_domains, gateway_domains)
 
             oauth_raw = entry.get("oauth")
             if oauth_raw is not None:
@@ -504,7 +507,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                     *([oauth_cfg.token_endpoint] if oauth_cfg.token_endpoint else ()),
                     *([oauth_cfg.authorization_endpoint] if oauth_cfg.authorization_endpoint else ()),
                 ):
-                    _add_domain_from_url(oauth_url, seen_domains, allowed_domains)
+                    _add_domain_from_url(oauth_url, seen_gateway_domains, gateway_domains)
 
         trusted = _require_bool(entry, "trusted", False, f"servers[{idx}]")
 
