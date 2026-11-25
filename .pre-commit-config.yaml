@@ -21,7 +21,7 @@ repos:
       - id: ruff-format
 
   - repo: https://github.com/OramramLLC/mellyn-guardrails
-    rev: 06b620b70ea5c46b105f6a0a41dc7c3a5191d3a5
+    rev: 21c719e49137c4f7cd2857f073528bbb436f5a07
     hooks:
       - id: mellyn-verify-dependencies
       - id: mellyn-check-agent-rules

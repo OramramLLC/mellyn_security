@@ -21,7 +21,7 @@ permissions:
 jobs:
   guardrails:
     name: Mellyn Guardrails
-    uses: OramramLLC/mellyn-guardrails/.github/workflows/mellyn-reusable-ai-security-gate.yml@06b620b70ea5c46b105f6a0a41dc7c3a5191d3a5
+    uses: OramramLLC/mellyn-guardrails/.github/workflows/mellyn-reusable-ai-security-gate.yml@21c719e49137c4f7cd2857f073528bbb436f5a07
     with:
       require-pack-rules: true
 
