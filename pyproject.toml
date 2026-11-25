@@ -32,13 +32,25 @@ dev = [
 ]
 
 [project.scripts]
+mellyn = "mellyn.cli:main"
 mellyn-airlock = "mcp_airlock.airlock.proxy:main"
 mellyn-pin = "mcp_airlock.airlock.pin_cli:main"
 mellyn-ir = "mcp_airlock.ir_lab.reconstruct:main"
 mellyn-bench = "mcp_airlock.egress.bench:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = [
+    "mcp_airlock",
+    "mcp_airlock.core",
+    "mcp_airlock.egress",
+    "mcp_airlock.airlock",
+    "mcp_airlock.ir_lab",
+    "mellyn",
+]
+
+[tool.setuptools.package-dir]
+mcp_airlock = "src/mcp_airlock"
+mellyn = "backend/mellyn"
 
 [tool.ruff]
 line-length = 120

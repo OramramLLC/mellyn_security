@@ -18,10 +18,14 @@ from mcp_airlock.airlock.models import parse_airlock_policy_toml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
+BACKEND_DIR = REPO_ROOT / "backend"
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 HOSTILE_SERVER = REPO_ROOT / "tests" / "fixtures" / "hostile_mcp_server.py"
 IR_LAB_DIR = SRC_DIR / "mcp_airlock" / "ir_lab"
 
 CLI_MODULES: dict[str, str] = {
+    "mellyn": "mellyn.cli",
     "mellyn-airlock": "mcp_airlock.airlock.proxy",
     "mellyn-pin": "mcp_airlock.airlock.pin_cli",
     "mellyn-ir": "mcp_airlock.ir_lab.reconstruct",
@@ -32,7 +36,8 @@ CLI_MODULES: dict[str, str] = {
 def _subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{existing}" if existing else str(SRC_DIR)
+    roots = f"{SRC_DIR}{os.pathsep}{BACKEND_DIR}"
+    env["PYTHONPATH"] = f"{roots}{os.pathsep}{existing}" if existing else roots
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env

@@ -119,7 +119,9 @@ V1/
 │       ├── approval_relay.py        # Narrow host-loopback to internal-network approval relay
 │       ├── approve.py               # Approver CLI (python -m mellyn.approve)
 │       ├── viewer_server.py         # Fail-closed loopback BFF + SPA (VIEWER reads, APPROVER approvals)
-│       └── api.py                   # FastAPI HTTP adapter (/healthz, /v1/sessions, /v1/agent/authorize, grants)
+│       ├── api.py                   # FastAPI HTTP adapter (/healthz, /v1/sessions, /v1/agent/authorize, grants)
+│       ├── init_cmd.py              # Turn-key workspace bootstrap (`mellyn init`) & Compose runner (`mellyn up`)
+│       └── cli.py                   # Unified `mellyn` CLI dispatching gateway, setup & Airlock commands
 ├── config/
 │   ├── mellyn-policy.example.toml   # Starter policy for client workspaces
 │   ├── mellyn-self-policy.toml      # Dogfooding policy protecting this repository's own core

@@ -62,11 +62,23 @@ Want to see a live multi-turn **`--mode observe` red-team workflow** against `--
 python examples/observe_redteam/run_observe_workflow.py
 ```
 
-Or install the core Airlock package (installs only `pydantic>=2.10.0`):
+Or install the unified package (`mellyn` Control Plane + `mcp_airlock`; installs only `pydantic>=2.10.0` for local CLI, no `PYTHONPATH` needed):
 
 ```bash
 pip install -e .
+mellyn presets                                       # inspect built-in SMB presets (filesystem, fetch, github, linear, slack, postgres)
+mellyn init --preset mcp-filesystem --preset github --workspace /abs/path/to/agent/workspace
+                                                     # digest-only .env, plus config/mellyn-policy.toml & mellyn-gateway.toml
+mellyn up --dry-run                                  # check .env, the policy the containers will load, and the compose command
+mellyn up                                            # sync deploy/egress/squid.conf from that policy and start the stack
+mellyn proxy --config config/mellyn-gateway.toml --workspace . --audit-log mellyn-audit.jsonl
+mellyn verify audit.jsonl --json                     # or use the mellyn-airlock / mellyn-pin / mellyn-ir / mellyn-bench shims below
 ```
+
+`mellyn init` keeps `.env` outside `config/`, because compose mounts `config/` read-only into the containers. It
+also records `MELLYN_CONFIG_DIR`, `MELLYN_POLICY_FILE` and `MELLYN_GATEWAY_CONFIG_FILE` in `.env`, and `mellyn up`
+passes `.env` to compose, so the containers enforce the generated policy rather than the checked-in example. Replace
+the placeholder server commands in `config/mellyn-gateway.toml` before connecting a client.
 
 1. **Pin a downstream MCP server manifest (`mellyn-pin`)**:
 

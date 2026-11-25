@@ -168,6 +168,138 @@ MCP_CAPABILITY_PRESETS: dict[str, dict[str, ToolCapability]] = {
     "mcp-fetch": {
         "fetch": ToolCapability(url_args=("url",)),
     },
+    "github": {
+        "get_issue": ToolCapability(pure=True),
+        "list_issues": ToolCapability(pure=True),
+        "search_issues": ToolCapability(pure=True),
+        "get_pull_request": ToolCapability(pure=True),
+        "list_pull_requests": ToolCapability(pure=True),
+        "get_pull_request_diff": ToolCapability(pure=True),
+        "get_pull_request_files": ToolCapability(pure=True),
+        "get_file_contents": ToolCapability(pure=True),
+        "list_commits": ToolCapability(pure=True),
+        "get_commit": ToolCapability(pure=True),
+        "search_code": ToolCapability(pure=True),
+        "search_repositories": ToolCapability(pure=True),
+        "list_branches": ToolCapability(pure=True),
+    },
+    "linear": {
+        "list_issues": ToolCapability(pure=True),
+        "get_issue": ToolCapability(pure=True),
+        "search_issues": ToolCapability(pure=True),
+        "list_projects": ToolCapability(pure=True),
+        "get_project": ToolCapability(pure=True),
+        "list_teams": ToolCapability(pure=True),
+        "list_issue_statuses": ToolCapability(pure=True),
+        "list_issue_labels": ToolCapability(pure=True),
+        "list_comments": ToolCapability(pure=True),
+    },
+    "slack": {
+        "list_channels": ToolCapability(pure=True),
+        "get_channel_history": ToolCapability(pure=True),
+        "get_thread_replies": ToolCapability(pure=True),
+        "search_messages": ToolCapability(pure=True),
+        "get_user_profile": ToolCapability(pure=True),
+        "list_users": ToolCapability(pure=True),
+    },
+    "postgres": {
+        "query": ToolCapability(pure=True),
+        "list_tables": ToolCapability(pure=True),
+        "describe_table": ToolCapability(pure=True),
+        "list_schemas": ToolCapability(pure=True),
+    },
+}
+
+
+@dataclass(frozen=True)
+class ServerPresetProfile:
+    """Turn-key SMB onboarding defaults pairing a capability preset with risk, trust, and egress settings."""
+
+    preset_name: str
+    default_server_name: str
+    trusted: bool
+    egress_domains: tuple[str, ...]
+    default_tool_risk_tiers: dict[str, RiskTier]
+    example_command: tuple[str, ...]
+    description: str
+
+
+SMB_SERVER_PRESETS: dict[str, ServerPresetProfile] = {
+    "mcp-filesystem": ServerPresetProfile(
+        preset_name="mcp-filesystem",
+        default_server_name="local-workspace",
+        trusted=True,
+        egress_domains=(),
+        default_tool_risk_tiers={
+            "read_file": RiskTier.LOW,
+            "read_text_file": RiskTier.LOW,
+            "read_media_file": RiskTier.LOW,
+            "read_multiple_files": RiskTier.LOW,
+            "list_directory": RiskTier.LOW,
+            "list_directory_with_sizes": RiskTier.LOW,
+            "get_file_info": RiskTier.LOW,
+            "list_allowed_directories": RiskTier.LOW,
+            "write_file": RiskTier.MEDIUM,
+            "edit_file": RiskTier.MEDIUM,
+            "create_directory": RiskTier.MEDIUM,
+            "move_file": RiskTier.MEDIUM,
+        },
+        example_command=("replace-with-your-workspace-mcp-server", "--root", "."),
+        description="Local workspace file read/write tools (trusted, workspace-jailed paths).",
+    ),
+    "mcp-fetch": ServerPresetProfile(
+        preset_name="mcp-fetch",
+        default_server_name="web-fetch",
+        trusted=False,
+        egress_domains=(),
+        default_tool_risk_tiers={"fetch": RiskTier.MEDIUM},
+        example_command=("replace-with-your-fetch-mcp-server",),
+        description="Outbound HTTPS fetch tool (untrusted responses; SSRF & allowlist guarded).",
+    ),
+    "github": ServerPresetProfile(
+        preset_name="github",
+        default_server_name="github",
+        trusted=False,
+        egress_domains=("api.github.com",),
+        default_tool_risk_tiers={name: RiskTier.LOW for name in MCP_CAPABILITY_PRESETS["github"]},
+        example_command=("replace-with-your-github-mcp-server", "--read-only"),
+        description="GitHub read tools LOW (tainting session); writes/merges/pushes remain HIGH.",
+    ),
+    "linear": ServerPresetProfile(
+        preset_name="linear",
+        default_server_name="linear",
+        trusted=False,
+        egress_domains=("api.linear.app",),
+        default_tool_risk_tiers={name: RiskTier.LOW for name in MCP_CAPABILITY_PRESETS["linear"]},
+        example_command=("replace-with-your-linear-mcp-server", "--read-only"),
+        description="Linear read tools LOW (tainting session); mutations remain HIGH.",
+    ),
+    "slack": ServerPresetProfile(
+        preset_name="slack",
+        default_server_name="slack",
+        trusted=False,
+        egress_domains=("api.slack.com", "slack.com"),
+        default_tool_risk_tiers={name: RiskTier.LOW for name in MCP_CAPABILITY_PRESETS["slack"]},
+        example_command=("replace-with-your-slack-mcp-server", "--read-only"),
+        description="Slack channel/history read tools LOW (tainting session); posting stays HIGH.",
+    ),
+    "postgres": ServerPresetProfile(
+        preset_name="postgres",
+        default_server_name="postgres",
+        trusted=False,
+        egress_domains=(),
+        default_tool_risk_tiers={
+            "list_tables": RiskTier.LOW,
+            "describe_table": RiskTier.LOW,
+            "list_schemas": RiskTier.LOW,
+            # `query` runs whatever SQL it is given: SELECT, but also DROP, UPDATE, or COPY ... TO PROGRAM on servers
+            # that are not truly read-only, and this preset cannot verify that. MEDIUM means it needs human approval
+            # once the session is tainted, so injected instructions cannot run SQL on their own.
+            "query": RiskTier.MEDIUM,
+        },
+        example_command=("replace-with-your-postgres-mcp-server", "--readonly"),
+        description="Schema inspection LOW (tainting); arbitrary SQL `query` MEDIUM, needing approval once tainted.",
+    ),
 }
 
 
