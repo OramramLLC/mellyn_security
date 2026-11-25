@@ -1,0 +1,55 @@
+# Mellyn Security — Example Unified Configuration (schema_version = 2)
+# Combines runtime mode, Squid egress allowlist, obfuscated canary/secret scanner, tool-call policy, and
+# downstream MCP servers into a single GitOps-managed file (`mellyn proxy --config config/mellyn.example.toml`).
+#
+# Quickstart:
+#   mellyn init --unified --preset mcp-filesystem --preset github
+#   mellyn pin --name local-workspace --preset mcp-filesystem --config config/mellyn.toml -- <cmd>
+#   mellyn proxy --config config/mellyn.toml --workspace .
+
+schema_version = 2
+
+[runtime]
+mode = "enforce"
+allow_observe_mode = false
+audit_log = "mellyn-audit.jsonl"
+state_db = "mellyn-state.sqlite3"
+
+[egress]
+allowed_domains = ["docs.python.org"]
+auto_sync_squid = true
+
+[scanner]
+canary_tokens = []
+block_known_secrets = true
+aad_kill_on_leak = true
+blocked_patterns = []
+
+[policy]
+protected_paths = []
+injection_escalate_threshold = 0.70
+injection_deny_threshold = 0.90
+deny_on_dlp_secret = true
+
+[[policy.scoped_rules]]
+rule_id = "deny-destructive-programs"
+tool_name = "shell_exec"
+effect = "deny"
+programs = ["rm", "curl", "wget", "nc", "ncat"]
+description = "Defense-in-depth denial of destructive deletion and raw network binaries."
+
+[[servers]]
+name = "local-workspace"
+transport = "stdio"
+preset = "mcp-filesystem"
+trusted = true
+command = ["replace-with-your-workspace-mcp-server", "--root", "."]
+# Run `mellyn pin --name local-workspace --preset mcp-filesystem --config config/mellyn.toml -- <cmd>`
+# to record the reviewed 64-char `tools_sha256` manifest digest and detect rug pulls at startup.
+
+[[servers]]
+name = "github"
+transport = "stdio"
+preset = "github"
+trusted = false
+command = ["replace-with-your-github-mcp-server", "--read-only"]

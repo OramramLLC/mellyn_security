@@ -23,6 +23,10 @@ _AIRLOCK_VERIFY_HINT = (
     "The `verify` command on Airlock ledgers requires the `mcp_airlock` package "
     "(not installed in gateway-only containers)."
 )
+_AIRLOCK_PIN_MODULE = "mcp_airlock.airlock.pin_cli"
+_AIRLOCK_PIN_HINT = "The `pin` command requires the `mcp_airlock` package (not installed in gateway-only containers)."
+_GATEWAY_PIN_FLAGS = frozenset({"--name", "--config", "--preset", "--trusted", "--untrusted", "--cwd", "--json"})
+_GATEWAY_PIN_PREFIXES = ("--name=", "--config=", "--preset=", "--cwd=")
 
 _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),
@@ -32,10 +36,6 @@ _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "airlock": (
         "mcp_airlock.airlock.proxy",
         "The `airlock` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
-    ),
-    "pin": (
-        "mcp_airlock.airlock.pin_cli",
-        "The `pin` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
     ),
     "bench": (
         "mcp_airlock.egress.bench",
@@ -60,7 +60,7 @@ Setup & Control Plane:
 
 Containment & Forensics (Gateway & Airlock):
   airlock      Run the fail-closed stdio Airlock proxy with AAD kill switch
-  pin          Inspect & pin a downstream MCP server's AgBOM tools/list manifest
+  pin          Inspect & pin a server into mellyn.toml (--name, --config) or standalone Airlock policy (--output)
   verify       Verify Gateway or Airlock audit.jsonl hash chain (auto-detected)
   bench        Run the obfuscated canary & secret scanner benchmark
 """
@@ -344,6 +344,22 @@ def _cmd_verify(rest: list[str]) -> int:
     return _dispatch_module(_AIRLOCK_VERIFY_MODULE, rest, optional_hint=_AIRLOCK_VERIFY_HINT)
 
 
+def _uses_gateway_pin(rest: Sequence[str]) -> bool:
+    """Return True when flags before `--` target unified `mellyn.toml` pinning rather than standalone Airlock."""
+    for tok in rest:
+        if tok == "--":
+            return False
+        if tok in _GATEWAY_PIN_FLAGS or tok.startswith(_GATEWAY_PIN_PREFIXES):
+            return True
+    return False
+
+
+def _cmd_pin(rest: list[str]) -> int:
+    if _uses_gateway_pin(rest):
+        return _dispatch_module("mellyn.pin_gateway", rest)
+    return _dispatch_module(_AIRLOCK_PIN_MODULE, rest, optional_hint=_AIRLOCK_PIN_HINT)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entrypoint for the unified `mellyn` CLI."""
     raw = sys.argv[1:] if argv is None else list(argv)
@@ -361,6 +377,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_presets(rest)
     if cmd == "up":
         return _cmd_up(rest)
+    if cmd == "pin":
+        return _cmd_pin(rest)
     if cmd == "verify":
         return _cmd_verify(rest)
     if cmd in _PASSTHROUGH_MODULES:

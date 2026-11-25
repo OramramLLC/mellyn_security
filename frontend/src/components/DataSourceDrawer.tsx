@@ -13,7 +13,7 @@ interface DataSourceDrawerProps {
   onConnectLive: (baseUrl: string, apiKey: string) => Promise<void>;
   onResetSample: () => void;
   onLoadAirlockText: (text: string, filename: string) => Promise<void>;
-  onLoadGatewayText: (text: string) => void;
+  onLoadGatewayText: (text: string) => Promise<void>;
   onLoadAssuranceText: (text: string) => void;
 }
 
@@ -78,7 +78,7 @@ export function DataSourceDrawer({
       if (kind === "airlock") {
         await onLoadAirlockText(text, file.name);
       } else if (kind === "gateway") {
-        onLoadGatewayText(text);
+        await onLoadGatewayText(text);
       } else {
         onLoadAssuranceText(text);
       }
@@ -145,8 +145,8 @@ export function DataSourceDrawer({
           <section className="subcard">
             <h3>2. Inspect Local Audit &amp; Assurance Files (Client-Side Only)</h3>
             <p className="muted small">
-              Files are parsed locally in your browser; Airlock JSONL ledgers undergo full Web Crypto SHA-256 hash
-              chain verification.
+              Files are parsed locally in your browser; Airlock and Gateway JSONL ledgers undergo full Web Crypto
+              SHA-256 hash chain verification.
             </p>
             <div className="upload-grid">
               <label className="upload-field">

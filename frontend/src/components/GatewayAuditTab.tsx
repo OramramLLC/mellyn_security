@@ -6,18 +6,27 @@ interface GatewayAuditTabProps {
   events: GatewayAuditEvent[];
   totalLines: number;
   malformedLines: number;
+  chainValid: boolean | null;
+  chainReason: string | null;
 }
 
-export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayAuditTabProps) {
+export function GatewayAuditTab({
+  events,
+  totalLines,
+  malformedLines,
+  chainValid,
+  chainReason,
+}: GatewayAuditTabProps) {
   const [decisionFilter, setDecisionFilter] = useState<string>("all");
   const [taintOnly, setTaintOnly] = useState<boolean>(false);
   const [search, setSearch] = useState<string>("");
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const targetDecision = decisionFilter.toLowerCase();
     return [...events]
       .reverse()
-      .filter((ev) => decisionFilter === "all" || ev.decision === decisionFilter)
+      .filter((ev) => decisionFilter === "all" || ev.decision.toLowerCase() === targetDecision)
       .filter((ev) => !taintOnly || ev.tainted)
       .filter((ev) => {
         if (!q) return true;
@@ -35,11 +44,16 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
       <section className="card">
         <div className="card-header">
           <div>
-            <h2>Control Plane Authorization &amp; Taint Stream</h2>
+            <div className="banner-title-row">
+              <h2>Control Plane Authorization &amp; Taint Stream</h2>
+              {chainValid === true && <StatusBadge tone="pass">CHAIN VERIFIED</StatusBadge>}
+              {chainValid === false && <StatusBadge tone="aad">INTEGRITY COMPROMISED</StatusBadge>}
+              {chainValid === null && <StatusBadge tone="warn">NO HASH CHAIN — UNVERIFIED</StatusBadge>}
+            </div>
             <p className="muted">
               Showing {filtered.length} of {events.length} loaded events (total lines: {totalLines}
-              {malformedLines > 0 ? `, malformed skipped: ${malformedLines}` : ""}). Raw prompts and secrets are never
-              stored.
+              {malformedLines > 0 ? `, malformed skipped: ${malformedLines}` : ""}). Raw prompts, secrets, and canaries
+              are scrubbed before hashing and disk write.
             </p>
           </div>
           <div className="controls-row">
@@ -49,10 +63,14 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
               onChange={(e) => setDecisionFilter(e.target.value)}
             >
               <option value="all">All Decisions</option>
-              <option value="ALLOW">ALLOW</option>
-              <option value="DENY">DENY</option>
-              <option value="REQUIRE_APPROVAL">REQUIRE_APPROVAL</option>
-              <option value="TAINT">TAINT</option>
+              <option value="allow">ALLOW</option>
+              <option value="deny">DENY</option>
+              <option value="require_approval">REQUIRE_APPROVAL</option>
+              <option value="tainted">TAINTED</option>
+              <option value="aad_fire">AAD_FIRE</option>
+              <option value="blocked_egress">BLOCKED_EGRESS</option>
+              <option value="observed_aad">OBSERVED_AAD</option>
+              <option value="observed_block">OBSERVED_BLOCK</option>
             </select>
             <label className="checkbox-inline">
               <input type="checkbox" checked={taintOnly} onChange={(e) => setTaintOnly(e.target.checked)} />
@@ -67,6 +85,20 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
           </div>
         </div>
 
+        {chainValid === false && (
+          <div className="callout-danger">
+            <strong>Tamper or truncation detected:</strong>{" "}
+            {chainReason ?? "Gateway hash-chain verification failed."}
+          </div>
+        )}
+        {chainValid === null && (
+          <div className="callout-warn">
+            <strong>This log has no hash chain, so none of it can be verified.</strong> Gateway and authorizer logs are
+            chained from 1.1 on, and an older log is moved aside as <code>*.pre-chain-*</code> on upgrade. A live log
+            without a chain may have had its chain fields stripped; treat every entry here as untrusted.
+          </div>
+        )}
+
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -76,7 +108,7 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
                 <th>Server / Tool</th>
                 <th>Decision</th>
                 <th>Tier &amp; Taint</th>
-                <th>Args SHA-256</th>
+                <th>Digests</th>
                 <th>Policy Reasons</th>
               </tr>
             </thead>
@@ -90,7 +122,10 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
               ) : (
                 filtered.map((ev) => (
                   <tr key={ev.audit_id}>
-                    <td className="nowrap muted small">{ev.timestamp}</td>
+                    <td className="nowrap muted small">
+                      <div>{ev.timestamp}</div>
+                      {ev.seq !== undefined && <div>seq #{ev.seq}</div>}
+                    </td>
                     <td>
                       <code>{ev.session_id}</code>
                     </td>
@@ -99,7 +134,12 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
                       {ev.mcp_server && <div className="muted small">server: {ev.mcp_server}</div>}
                     </td>
                     <td>
-                      <StatusBadge tone={toneForSeverity(ev.decision)}>{ev.decision}</StatusBadge>
+                      <StatusBadge tone={toneForSeverity(ev.decision)}>{ev.decision.toUpperCase()}</StatusBadge>
+                      {ev.enforcement_mode === "observe" && (
+                        <div className="small">
+                          <StatusBadge tone="warn">OBSERVE</StatusBadge>
+                        </div>
+                      )}
                     </td>
                     <td>
                       <StatusBadge tone={toneForSeverity(ev.risk_tier)}>{ev.risk_tier}</StatusBadge>
@@ -111,7 +151,14 @@ export function GatewayAuditTab({ events, totalLines, malformedLines }: GatewayA
                       )}
                     </td>
                     <td>
-                      <code>{ev.args_sha256 ? `${ev.args_sha256.slice(0, 14)}…` : "-"}</code>
+                      <div>
+                        <code>{ev.args_sha256 ? `${ev.args_sha256.slice(0, 14)}…` : "-"}</code>
+                      </div>
+                      {ev.entry_hash && (
+                        <div className="muted small">
+                          chain: <code>{ev.entry_hash.slice(0, 12)}…</code>
+                        </div>
+                      )}
                     </td>
                     <td>
                       <div className="small">{ev.reasons.join("; ")}</div>

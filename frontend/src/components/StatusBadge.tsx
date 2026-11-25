@@ -12,31 +12,39 @@ export function StatusBadge({ tone, children }: StatusBadgeProps) {
 }
 
 export function toneForSeverity(severity: string): BadgeTone {
-  switch (severity) {
-    case "AAD_FIRE":
-    case "AAD_TRIGGERED_UNCONFIRMED":
-    case "INTEGRITY_COMPROMISED":
-    case "DENY":
+  switch (severity.toLowerCase()) {
+    case "aad_fire":
+    case "aad_triggered_unconfirmed":
+    case "integrity_compromised":
+    case "deny":
+    case "blocked_egress":
+    case "chain_invalid":
     case "fail":
     case "error":
       return "aad";
-    case "BLOCK":
-    case "BLOCKED_ACTIVITY":
-    case "HIGH":
-    case "REQUIRE_APPROVAL":
+    case "block":
+    case "blocked_activity":
+    case "high":
+    case "require_approval":
       return "block";
-    case "WARN":
-    case "OBSERVED_VIOLATIONS":
-    case "TAINT":
-    case "MEDIUM":
+    case "warn":
+    case "observed_violations":
+    case "observed_aad":
+    case "observed_block":
+    case "observe":
+    case "taint":
+    case "tainted":
+    case "medium":
       return "warn";
-    case "ALLOW":
-    case "AAD_CONTAINED":
-    case "CLEAN":
-    case "LOW":
+    case "allow":
+    case "aad_contained":
+    case "clean":
+    case "low":
     case "pass":
+    case "enforce":
+    case "chain_valid":
       return "pass";
-    case "INFO":
+    case "info":
       return "info";
     default:
       return "muted";

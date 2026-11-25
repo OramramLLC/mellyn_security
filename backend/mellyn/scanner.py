@@ -123,6 +123,38 @@ def strip_invisible_unicode(text: str) -> str:
     return _INVISIBLE_UNICODE_RE.sub("", text)
 
 
+def _has_invisible_unicode(value: Any) -> bool:
+    stack: list[Any] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if _INVISIBLE_UNICODE_RE.search(node) is not None:
+                return True
+        elif isinstance(node, list | tuple):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            for key, val in node.items():
+                stack.append(str(key))
+                stack.append(val)
+    return False
+
+
+def invisible_unicode_tools(entries: Sequence[Any]) -> list[str]:
+    """
+    Labels of tool or resource definitions containing invisible format/tag characters anywhere, keys included.
+
+    Such characters hide text from a human reviewer while the model still reads it, so a definition carrying them is
+    treated as pre-poisoned: refused when pinning and blocked when listed.
+    """
+    flagged: list[str] = []
+    for idx, entry in enumerate(entries):
+        if _has_invisible_unicode(entry):
+            raw_name = entry.get("name") if isinstance(entry, dict) else None
+            label = raw_name if isinstance(raw_name, str) and not _has_invisible_unicode(raw_name) else f"#{idx}"
+            flagged.append(repr(label))
+    return flagged
+
+
 def normalize_scan_text(text: str) -> str:
     """Normalize text for stricter detection checks (never for relaxing allow rules)."""
     return unicodedata.normalize("NFKC", strip_invisible_unicode(text))

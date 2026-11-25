@@ -23,6 +23,12 @@ from mellyn.models import (
     TaintSource,
     ToolCallRequest,
 )
+from mellyn.pin_gateway import (
+    GatewayPinError,
+    GatewayPinResult,
+    inspect_gateway_server,
+    upsert_server_in_unified_toml,
+)
 from mellyn.policy import (
     MCP_CAPABILITY_PRESETS,
     SMB_SERVER_PRESETS,
@@ -49,6 +55,8 @@ __all__ = [
     "CredentialConfigError",
     "Decision",
     "EgressValidator",
+    "GatewayPinError",
+    "GatewayPinResult",
     "InMemoryStateStore",
     "MCP_CAPABILITY_PRESETS",
     "PolicyConfig",
@@ -71,11 +79,13 @@ __all__ = [
     "ToolCapability",
     "UnifiedConfig",
     "WorkspacePathGuard",
+    "inspect_gateway_server",
     "load_mellyn_config",
     "load_policy_file",
     "load_unified_config",
     "parse_policy_dict",
     "scan_value",
+    "upsert_server_in_unified_toml",
     "verify_gateway_audit_file",
     "verify_gateway_audit_lines",
 ]

@@ -50,7 +50,7 @@ from mellyn.egress import WorkspaceConfigError, check_workspace_root
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
 from mellyn.models import Decision, TaintSource, ToolCallRequest, canonical_json
 from mellyn.policy_loader import PolicyLoadError
-from mellyn.scanner import ScannerConfig, ScanResult, scan_value
+from mellyn.scanner import ScannerConfig, ScanResult, invisible_unicode_tools, scan_value
 from mellyn.state_store import SqliteStateStore, StateStoreError
 from mellyn.unified_config import load_mellyn_config
 
@@ -401,11 +401,12 @@ class StdioDownstream:
         child_home: str | None = None,
         child_username: str | None = None,
         on_notification: Callable[[str, dict[str, Any]], None] | None = None,
-        stderr: TextIO | None = None,
+        stderr: int | TextIO | None = None,
         max_line_bytes: int = MAX_LINE_BYTES,
         max_inbox_messages: int = DEFAULT_MAX_INBOX_MESSAGES,
         max_inbox_bytes: int = DEFAULT_MAX_INBOX_BYTES,
         writer: Callable[[bytes], None] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         if not argv:
             raise ValueError(f"Server '{name}' requires a non-empty command argv.")
@@ -419,7 +420,7 @@ class StdioDownstream:
         self._writer_thread: threading.Thread | None = None
         self._closed = False
 
-        child_env = downstream_environment()
+        child_env = downstream_environment(env)
         if child_home is not None:
             child_env["HOME"] = child_home
         if child_username is not None:
@@ -784,6 +785,42 @@ class MCPGateway:
             {"decision": Decision.DENY.value, "mcp_server": server_name},
         )
 
+    def _reject_hidden_text(
+        self, req_id: Any, *, server_name: str, listed: list[dict[str, Any]], kind: str
+    ) -> dict[str, Any] | None:
+        """
+        Block a listing whose definitions hide text in invisible format/tag characters, pinned or not.
+
+        Pinning records a hash; it does not make hidden instructions safe, and pinned descriptions are not tainted.
+        Independent of the scanner config, so it applies even with no canaries configured.
+        """
+        flagged = invisible_unicode_tools(listed)
+        if not flagged:
+            return None
+        observed = self.mode == "observe"
+        snap = self.authorizer._state.get_session_snapshot(self.session_id)
+        self.authorizer.audit.record_containment(
+            session_id=self.session_id,
+            tool_name=kind,
+            mcp_server=server_name,
+            decision="observed_hidden_unicode" if observed else "blocked_listing",
+            reasons=(f"{kind} from '{server_name}' has {len(flagged)} definition(s) with invisible Unicode.",),
+            payload=listed,
+            tainted=bool(snap and snap.tainted),
+            taint_count=snap.taint_count if snap else 0,
+            taint_sources=snap.taint_entries if snap else (),
+            enforcement_mode=self.mode,
+            policy_id="gateway.hidden_unicode",
+        )
+        if observed:
+            return None
+        return _jsonrpc_error(
+            req_id,
+            MELLYN_POLICY_DENIED,
+            f"Listing from '{server_name}' blocked: definitions contain invisible Unicode characters.",
+            {"decision": Decision.DENY.value, "mcp_server": server_name},
+        )
+
     # ---- Taint helpers --------------------------------------------------------------------------
 
     def _is_trusted(self, server: str) -> bool:
@@ -938,9 +975,11 @@ class MCPGateway:
             else:
                 listed = [t for t in self._list_all(server, "tools/list", "tools") if _valid_name(t.get("name"))]
             # Tool names and descriptions are server-written text the agent reads, so they are scanned like results.
-            listing_err = self._apply_scanner(
-                req_id, server_name=name, tool_name="tools/list", payload=listed, direction="response"
-            )
+            listing_err = self._reject_hidden_text(req_id, server_name=name, listed=listed, kind="tools/list")
+            if listing_err is None:
+                listing_err = self._apply_scanner(
+                    req_id, server_name=name, tool_name="tools/list", payload=listed, direction="response"
+                )
             if listing_err is not None:
                 return listing_err
             for tool in listed:
@@ -954,9 +993,11 @@ class MCPGateway:
         owners: dict[str, str | None] = {}
         for name, server in self.servers.items():
             listed = [r for r in self._list_all(server, "resources/list", "resources") if isinstance(r.get("uri"), str)]
-            listing_err = self._apply_scanner(
-                req_id, server_name=name, tool_name="resources/list", payload=listed, direction="response"
-            )
+            listing_err = self._reject_hidden_text(req_id, server_name=name, listed=listed, kind="resources/list")
+            if listing_err is None:
+                listing_err = self._apply_scanner(
+                    req_id, server_name=name, tool_name="resources/list", payload=listed, direction="response"
+                )
             if listing_err is not None:
                 return listing_err
             for resource in listed:
@@ -1372,6 +1413,12 @@ def main(argv: list[str] | None = None) -> int:
             canary_tokens=unified.scanner.canary_tokens,
             enforcement_mode=effective_mode,
         )
+        if audit_logger.rotated_legacy_path is not None:
+            print(
+                f"Moved the unchained pre-1.1 audit log to {audit_logger.rotated_legacy_path} "
+                "and started a new hash-chained log.",
+                file=sys.stderr,
+            )
         if unified.runtime.state_db is not None:
             state_store = SqliteStateStore(unified.runtime.state_db)
 
