@@ -18,6 +18,7 @@ import argparse
 import ipaddress
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from mellyn.policy import PolicyConfig
@@ -65,9 +66,20 @@ REGENERATE_HINT = "python -m mellyn.egress_proxy --policy <policy.toml> --output
 
 
 def generate_squid_config(
-    policy: PolicyConfig, *, listen_port: int = 3128, client_cidrs: tuple[str, ...] = DEFAULT_CLIENT_CIDRS
+    policy: PolicyConfig,
+    *,
+    listen_port: int = 3128,
+    client_cidrs: tuple[str, ...] = DEFAULT_CLIENT_CIDRS,
+    gateway_domains: Iterable[str] = (),
 ) -> str:
-    """Render a hardened, fail-closed Squid egress proxy config from PolicyConfig."""
+    """
+    Render a hardened, fail-closed Squid egress proxy config from PolicyConfig.
+
+    `gateway_domains` are hosts only the gateway process should contact (remote MCP servers and their OAuth
+    hosts). They are not in the tool policy, so the authorizer refuses tool calls aimed at them, but Squid cannot
+    tell the gateway from the MCP servers it launches in the same container, so they are reachable at the network
+    layer.
+    """
     if not 1 <= listen_port <= 65535:
         raise ValueError("listen_port must be between 1 and 65535.")
     if not client_cidrs:
@@ -75,6 +87,7 @@ def generate_squid_config(
     clients = [str(ipaddress.ip_network(cidr, strict=True)) for cidr in client_cidrs]
 
     domains = sorted(validate_egress_domain(d) for d in policy.allowed_egress_domains)
+    gw_domains = sorted({validate_egress_domain(d) for d in gateway_domains} - set(domains))
 
     lines: list[str] = [
         "# GENERATED FILE — Mellyn Security Network Egress Proxy (Squid)",
@@ -127,6 +140,14 @@ def generate_squid_config(
     else:
         lines.append("# Policy has no allowed_egress_domains; failing closed (all outbound traffic denied).")
 
+    if gw_domains:
+        lines.append("")
+        lines.append("# Gateway-only hosts (remote MCP servers and their OAuth hosts): NOT in the tool policy, so the")
+        lines.append("# authorizer refuses tool calls to them, but processes on the gateway's network can reach them.")
+        for domain in gw_domains:
+            lines.append(f"acl gateway_domains dstdomain {domain}")
+        lines.append("http_access allow CONNECT SSL_ports gateway_domains")
+
     lines.append("")
     lines.append("# Default deny everything else (fail closed)")
     lines.append("http_access deny all")
@@ -146,12 +167,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from mellyn.unified_config import load_policy_any
+    from mellyn.unified_config import load_gateway_egress_domains_any, load_policy_any
 
     try:
         policy = load_policy_any(args.policy)
         rendered = generate_squid_config(
-            policy, listen_port=args.port, client_cidrs=tuple(args.client_cidr or DEFAULT_CLIENT_CIDRS)
+            policy,
+            listen_port=args.port,
+            client_cidrs=tuple(args.client_cidr or DEFAULT_CLIENT_CIDRS),
+            gateway_domains=load_gateway_egress_domains_any(args.policy),
         )
     except (PolicyLoadError, ValueError) as exc:
         print(f"Egress config generation failed: {exc}", file=sys.stderr)
