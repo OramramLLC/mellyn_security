@@ -28,9 +28,16 @@ from mellyn.core.scan import (
 _AUDIT_EXPORTS = frozenset(
     {
         "AuditLedger",
+        "CoreAuditLedger",
+        "CoreLedgerEntry",
+        "CoreLedgerVerification",
+        "LEDGER_SCHEMA_VERSION",
         "LedgerAnchor",
+        "LedgerIntegrityError",
         "verify_ledger",
         "verify_ledger_bytes",
+        "verify_ledger_bytes_core",
+        "verify_ledger_file_core",
     }
 )
 _SCHEMA_EXPORTS = frozenset(
@@ -38,6 +45,8 @@ _SCHEMA_EXPORTS = frozenset(
         "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
         "AuditLedgerEntry",
         "GENESIS_PREV_HASH",
+        "LedgerFormat",
+        "LedgerSource",
         "LedgerVerification",
         "RedactionKind",
         "RedactionRecord",
@@ -62,11 +71,18 @@ __all__ = [
     "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
     "AuditLedger",
     "AuditLedgerEntry",
+    "CoreAuditLedger",
+    "CoreLedgerEntry",
+    "CoreLedgerVerification",
     "GENESIS_PREV_HASH",
     "JsonObject",
     "JsonScalar",
     "JsonValue",
+    "LEDGER_SCHEMA_VERSION",
     "LedgerAnchor",
+    "LedgerFormat",
+    "LedgerIntegrityError",
+    "LedgerSource",
     "LedgerVerification",
     "RedactionKind",
     "RedactionRecord",
@@ -89,4 +105,6 @@ __all__ = [
     "strip_invisible",
     "verify_ledger",
     "verify_ledger_bytes",
+    "verify_ledger_bytes_core",
+    "verify_ledger_file_core",
 ]

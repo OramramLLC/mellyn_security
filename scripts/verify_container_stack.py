@@ -652,7 +652,8 @@ def main(argv: list[str] | None = None) -> int:
             verified_data = json.loads(audit_verify.stdout)
             sentinel_ok = verified_data["sentinel"] == "sentinel-intact\n"
             audit_lines = verified_data["audit"]
-            audit_appended = len(audit_lines) == 1 and json.loads(audit_lines[0])["decision"] == "allow"
+            row0 = json.loads(audit_lines[0]) if len(audit_lines) == 1 else {}
+            audit_appended = row0.get("schema_version") == 2 and row0.get("event", {}).get("decision") == "allow"
             audit_chain = verify_gateway_audit_lines(audit_lines)
             if not sentinel_ok:
                 raise RuntimeError(f"Audit sentinel was modified: {verified_data['sentinel']!r}")

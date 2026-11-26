@@ -22,8 +22,10 @@ for _import_dir in (REPO_ROOT, REPO_ROOT / "src"):
         sys.path.insert(0, str(_import_dir))
 
 from mellyn.audit import (  # noqa: E402
+    GENESIS_PREV_HASH,
     AuditChainError,
     AuditLogger,
+    compute_audit_entry_hash,
     split_audit_lines,
     verify_gateway_audit_file,
     verify_gateway_audit_lines,
@@ -92,7 +94,8 @@ class TestLedgerSurvivesLineBreakCharacters(_TmpCase):
                 self.assertNotIn(ch, raw)  # escaped on write
                 self.assertTrue(verify_gateway_audit_file(path).valid)
                 records = [json.loads(line) for line in raw.split("\n") if line.strip()]
-                self.assertTrue(any(ch in entry for r in records for entry in r["taint_sources"]))
+                self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in records))
+                self.assertTrue(any(ch in entry for r in records for entry in r["event"]["taint_sources"]))
                 # Before the fix, the next start refused with "Unterminated string".
                 reopened, handle2 = AuditLogger.open_chained(path)
                 handle2.close()
@@ -100,13 +103,33 @@ class TestLedgerSurvivesLineBreakCharacters(_TmpCase):
 
     def test_ledgers_already_holding_raw_line_breaks_still_verify(self) -> None:
         path = self.root / "audit.jsonl"
-        log, handle = AuditLogger.open_chained(path)
-        log.record_taint(session_id="ses_1", taint_count=1, taint_sources=("web_page:a b",))
-        handle.close()
-        # What the earlier writer produced: the same JSON values with the character left raw.
-        path.write_text(path.read_text(encoding="utf-8").replace("\\u2028", " "), encoding="utf-8")
+        v1_body = {
+            "audit_id": "aud_v1_linesep",
+            "args_sha256": "e" * 64,
+            "decision": "tainted",
+            "enforcement_mode": "enforce",
+            "event_type": "taint",
+            "grant_id": None,
+            "mcp_server": None,
+            "policy_id": None,
+            "prev_hash": GENESIS_PREV_HASH,
+            "reasons": ["Session tainted."],
+            "risk_tier": "low",
+            "seq": 0,
+            "session_id": "ses_1",
+            "taint_count": 1,
+            "taint_sources": ["web_page:a\u2028b"],
+            "tainted": True,
+            "timestamp": "2026-11-23T00:00:00Z",
+            "tool_name": "session/taint",
+        }
+        v1_record = {**v1_body, "entry_hash": compute_audit_entry_hash(v1_body)}
+        raw_v1 = json.dumps(v1_record, sort_keys=True, ensure_ascii=False) + "\n"
+        path.write_text(raw_v1, encoding="utf-8", newline="\n")
         self.assertIn(" ", path.read_text(encoding="utf-8"))
-        self.assertTrue(verify_gateway_audit_file(path).valid)
+        res = verify_gateway_audit_file(path)
+        self.assertTrue(res.valid, res.reason)
+        self.assertEqual(res.ledger_format, "v1_gateway")
         raw_lines = split_audit_lines(path.read_text(encoding="utf-8"))
         non_empty = [line for line in raw_lines if line.strip()]
         self.assertTrue(verify_gateway_audit_lines(non_empty).valid)
@@ -195,7 +218,9 @@ class TestLegacyLogUpgrade(_TmpCase):
         self.assertEqual(rotated.read_text(encoding="utf-8"), self.LEGACY * 3)  # kept unchanged
         self.assertTrue(verify_gateway_audit_file(path).valid)
         first = json.loads(path.read_text(encoding="utf-8").split("\n")[0])
-        self.assertEqual((first["event_type"], first["seq"]), ("ledger_rotated", 0))
+        self.assertEqual(
+            (first["schema_version"], first["event"]["event_type"], first["seq"]), (2, "ledger_rotated", 0)
+        )
 
     def test_a_second_rotation_never_overwrites_the_first(self) -> None:
         path = self.root / "audit.jsonl"
@@ -215,11 +240,13 @@ class TestLegacyLogUpgrade(_TmpCase):
         log.record_taint(session_id="s", taint_count=1, taint_sources=("x",))
         handle.close()
         chained_line = good.read_text(encoding="utf-8")
+        tampered_chain = chained_line.replace('"decision":"tainted"', '"decision":"allow"')
+        self.assertNotEqual(tampered_chain, chained_line)
         cases = {
             "chained then legacy": chained_line + self.LEGACY,
             "legacy then chained": self.LEGACY + chained_line,
             "not json": "this is not an audit log\n",
-            "tampered chain": chained_line.replace('"decision": "tainted"', '"decision": "allow"'),
+            "tampered chain": tampered_chain,
         }
         for label, content in cases.items():
             with self.subTest(case=label):

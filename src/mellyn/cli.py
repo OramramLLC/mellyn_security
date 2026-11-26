@@ -265,12 +265,19 @@ def _cmd_up(argv: list[str]) -> int:
 
 
 def _extract_verify_ledger_path(rest: Sequence[str]) -> Path | None:
-    """Return the positional ledger path when inspecting without Airlock-only flags."""
+    """Return the positional ledger path when inspecting without unsupported flags."""
+    skip_next = False
     for tok in rest:
+        if skip_next:
+            skip_next = False
+            continue
         if tok in ("-h", "--help", "--json"):
             continue
-        if tok in ("--anchor-seq", "--anchor-hash") or tok.startswith(("--anchor-seq=", "--anchor-hash=")):
-            return None
+        if tok in ("--anchor-seq", "--anchor-hash"):
+            skip_next = True
+            continue
+        if tok.startswith(("--anchor-seq=", "--anchor-hash=")):
+            continue
         if tok.startswith("-"):
             return None
         return Path(tok)
@@ -278,7 +285,7 @@ def _extract_verify_ledger_path(rest: Sequence[str]) -> Path | None:
 
 
 def _looks_like_gateway_ledger(path: Path) -> bool:
-    """Return True when the first non-empty JSON line is a Gateway AuditEvent (not Airlock)."""
+    """Return True when the first non-empty JSON line is a Gateway/Authorizer v1 or v2 record."""
     try:
         if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
             return False
@@ -288,25 +295,51 @@ def _looks_like_gateway_ledger(path: Path) -> bool:
                 if not stripped:
                     continue
                 obj = json.loads(stripped)
-                return isinstance(obj, dict) and "audit_id" in obj and "event" not in obj
+                if not isinstance(obj, dict):
+                    return False
+                if obj.get("schema_version") == 2 and obj.get("source") in ("gateway", "authorizer"):
+                    return True
+                return "audit_id" in obj and "event" not in obj
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
     return False
 
 
 def _verify_gateway_ledger_cli(argv: list[str]) -> int:
+    from mellyn.audit import AuditChainError, ChainVerificationResult
+
     parser = argparse.ArgumentParser(
         prog="mellyn verify",
         description="Verify the cryptographic hash chain of a Mellyn Gateway JSONL audit log.",
     )
     parser.add_argument("ledger", type=Path, help="Path to gateway audit JSONL file")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON verification report")
+    parser.add_argument("--anchor-seq", type=int, default=None, help="Optional external anchor seq number.")
+    parser.add_argument("--anchor-hash", default=None, help="Optional external anchor SHA-256 hex digest.")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 0
 
-    result = verify_gateway_audit_file(args.ledger)
+    anchor: tuple[int, str] | None = None
+    if args.anchor_seq is not None or args.anchor_hash is not None:
+        if args.anchor_seq is None or args.anchor_hash is None:
+            print("mellyn verify: --anchor-seq and --anchor-hash must be supplied together.", file=sys.stderr)
+            return 2
+        anchor = (args.anchor_seq, args.anchor_hash)
+
+    try:
+        result = verify_gateway_audit_file(args.ledger, anchor=anchor)
+    except AuditChainError as exc:
+        result = ChainVerificationResult(
+            valid=False,
+            entry_count=0,
+            last_seq=None,
+            last_hash="0" * 64,
+            first_invalid_line=1,
+            reason=str(exc),
+        )
+
     if args.json:
         payload = {
             "ledger_type": "gateway",
@@ -316,6 +349,8 @@ def _verify_gateway_ledger_cli(argv: list[str]) -> int:
             "last_hash": result.last_hash,
             "first_invalid_line": result.first_invalid_line,
             "reason": result.reason,
+            "anchored": anchor is not None,
+            "ledger_format": result.ledger_format,
         }
         print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
     elif result.valid:

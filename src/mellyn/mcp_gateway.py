@@ -1393,6 +1393,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Gateway config rejected (fail-closed): {exc}", file=sys.stderr)
         return 2
     own_files = [_inside(p, workspace_root) for p in protected_inputs]
+    # The ledger's siblings record or guard it too: `<ledger>.lock` (a directory planted there stops every
+    # restart) and the `<ledger>.v1-*` / `.pre-chain-*` files older ledgers are moved aside to.
+    ledger_rel = _inside(audit_log_path, workspace_root)
+    if ledger_rel:
+        own_files.append(f"{ledger_rel}.*")
     policy = dataclasses.replace(policy, protected_paths=(*policy.protected_paths, *[p for p in own_files if p]))
 
     credentials: CredentialConfig | None = None
@@ -1448,10 +1453,12 @@ def main(argv: list[str] | None = None) -> int:
             audit_log_path,
             canary_tokens=unified.scanner.canary_tokens,
             enforcement_mode=effective_mode,
+            source="gateway",
         )
         if audit_logger.rotated_legacy_path is not None:
+            kind_label = "unchained pre-1.1" if audit_logger.rotated_legacy_format == "pre_chain" else "v1"
             print(
-                f"Moved the unchained pre-1.1 audit log to {audit_logger.rotated_legacy_path} "
+                f"Moved the {kind_label} audit log to {audit_logger.rotated_legacy_path} "
                 "and started a new hash-chained log.",
                 file=sys.stderr,
             )

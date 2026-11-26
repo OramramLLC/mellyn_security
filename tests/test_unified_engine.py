@@ -225,10 +225,10 @@ class TestGatewayHashChainedAudit(unittest.TestCase):
             # 1) Field modification on line 2
             mod_lines = list(orig_lines)
             row1 = json.loads(mod_lines[1])
-            row1["taint_count"] = 999
+            row1["event"]["taint_count"] = 999
             mod_lines[1] = json.dumps(row1, sort_keys=True)
             mod_path = root / "mod.jsonl"
-            mod_path.write_text("\n".join(mod_lines) + "\n", encoding="utf-8")
+            mod_path.write_text("\n".join(mod_lines) + "\n", encoding="utf-8", newline="\n")
             res_mod = verify_gateway_audit_file(mod_path)
             self.assertFalse(res_mod.valid)
             self.assertEqual(res_mod.first_invalid_line, 2)
@@ -770,7 +770,9 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
             raw_disk = audit_path.read_text(encoding="utf-8")
             self.assertNotIn(canary, raw_disk)
             self.assertTrue(verify_gateway_audit_file(audit_path).valid)
-            events = [json.loads(line) for line in raw_disk.splitlines() if line.strip()]
+            rows = [json.loads(line) for line in raw_disk.splitlines() if line.strip()]
+            self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in rows))
+            events = [r["event"] for r in rows]
             containment = [ev for ev in events if ev.get("event_type") == "containment"]
             # One trigger: once the session is severed, later calls are refused before they are even scanned.
             self.assertEqual(len(containment), 1)
@@ -881,9 +883,9 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
 
             def containment_decisions(ledger: Path) -> list[str]:
                 return [
-                    json.loads(line)["decision"]
+                    json.loads(line)["event"]["decision"]
                     for line in ledger.read_text(encoding="utf-8").splitlines()
-                    if line.strip() and json.loads(line).get("event_type") == "containment"
+                    if line.strip() and json.loads(line)["event"].get("event_type") == "containment"
                 ]
 
             # First session: one AAD trigger; the resources/read after it is refused before it is scanned.
@@ -956,7 +958,9 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
             self.assertTrue(verify_gateway_audit_file(audit_path).valid)
             raw_disk = audit_path.read_text(encoding="utf-8")
             self.assertNotIn(canary, raw_disk)
-            events = [json.loads(line) for line in raw_disk.splitlines() if line.strip()]
+            rows = [json.loads(line) for line in raw_disk.splitlines() if line.strip()]
+            self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in rows))
+            events = [r["event"] for r in rows]
             self.assertTrue(all(ev["enforcement_mode"] == "observe" for ev in events))
             self.assertTrue(
                 any(ev["event_type"] == "authorization" and ev["decision"] == "require_approval" for ev in events)
@@ -981,8 +985,8 @@ class TestUnifiedGatewayContainmentAndObserve(unittest.TestCase):
 
             tampered_path = root / "tampered.jsonl"
             row = json.loads(chained_path.read_text(encoding="utf-8").strip())
-            row["taint_count"] = 777
-            tampered_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            row["event"]["taint_count"] = 777
+            tampered_path.write_text(json.dumps(row) + "\n", encoding="utf-8", newline="\n")
             tampered_res = verify_gateway_audit_file(tampered_path)
             self.assertFalse(tampered_res.valid)
             self.assertIsInstance(tampered_res.reason, str)

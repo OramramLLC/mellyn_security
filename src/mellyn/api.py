@@ -257,10 +257,15 @@ def create_app_from_env() -> FastAPI:
     sink: IO[str] | None = None
     state_store: SqliteStateStore | None = None
     if audit_path_raw:
-        audit_logger, sink = AuditLogger.open_chained(Path(audit_path_raw), canary_tokens=canary_tokens)
+        audit_logger, sink = AuditLogger.open_chained(
+            Path(audit_path_raw),
+            canary_tokens=canary_tokens,
+            source="authorizer",
+        )
         if audit_logger.rotated_legacy_path is not None:
+            kind_label = "unchained pre-1.1" if audit_logger.rotated_legacy_format == "pre_chain" else "v1"
             print(
-                f"mellyn: moved the unchained pre-1.1 audit log to {audit_logger.rotated_legacy_path} "
+                f"mellyn: moved the {kind_label} audit log to {audit_logger.rotated_legacy_path} "
                 "and started a new hash-chained log.",
                 file=sys.stderr,
             )
