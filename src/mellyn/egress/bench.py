@@ -11,20 +11,23 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import statistics
 import sys
 import time
-from collections.abc import Sequence
-from typing import Literal
+from collections.abc import Callable, Sequence
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from mellyn.core.normalize import JsonValue, exact_json_bytes
+from mellyn.core.scan import ScannerConfig, scan_value
 from mellyn.egress.scanner import scan_payload
 
 BENCH_CANARY = "MELLYN_BENCH_CANARY_9944"
+BenchmarkSurface = Literal["airlock", "gateway"]
 
 
 class BenchmarkSample(BaseModel):
@@ -40,10 +43,11 @@ class BenchmarkSample(BaseModel):
 
 
 class BenchmarkReport(BaseModel):
-    """Deterministic precision/recall and latency summary from `mellyn-bench`."""
+    """Deterministic precision/recall and latency summary for one `mellyn-bench` surface."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
+    surface: BenchmarkSurface = "airlock"
     total_samples: int = Field(ge=1)
     iterations: int = Field(ge=1)
     total_scans: int = Field(ge=1)
@@ -58,6 +62,20 @@ class BenchmarkReport(BaseModel):
     canary_recall: float = Field(ge=0.0, le=1.0)
     p50_us_per_kb: float = Field(ge=0.0)
     p99_us_per_kb: float = Field(ge=0.0)
+    # Worst µs/KB over `build_large_latency_payloads()`, each scanned once. The corpus samples are small, so p50/p99
+    # alone missed a 3x slowdown on megabyte payloads; compare this figure release to release as well.
+    large_payload_us_per_kb: float = Field(default=0.0, ge=0.0)
+    passed: bool
+
+
+class CombinedBenchmarkReport(BaseModel):
+    """Combined deterministic benchmark summary across Airlock and Gateway scanner wrappers."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    surface: Literal["both"] = "both"
+    airlock: BenchmarkReport
+    gateway: BenchmarkReport
     passed: bool
 
 
@@ -279,6 +297,28 @@ def build_benchmark_corpus() -> tuple[BenchmarkSample, ...]:
     )
 
 
+LARGE_PAYLOAD_KB = 256
+
+
+def build_large_latency_payloads() -> tuple[str, ...]:
+    """
+    Deterministic ~256 KiB payloads for the large-payload latency figure (timing only, not accuracy).
+
+    Non-ASCII prose and MIME-style Base64 both send the scanner down its decode and normalization paths, which is
+    where per-character work shows up.
+    """
+    unit = "Résumé für Café — 日本語のテキスト, naïve coöperation 🙂 "
+    prose = (unit * (LARGE_PAYLOAD_KB * 1024 // len(unit.encode("utf-8")) + 1))[: LARGE_PAYLOAD_KB * 1024 // 2]
+    seed = b"mellyn-bench-large-payload"
+    blob = bytearray()
+    while len(blob) < LARGE_PAYLOAD_KB * 1024 * 3 // 4:
+        seed = hashlib.sha256(seed).digest()
+        blob.extend(seed)
+    b64 = base64.b64encode(bytes(blob)).decode("ascii")
+    mime = "\n".join(b64[i : i + 76] for i in range(0, len(b64), 76))
+    return (prose, mime)
+
+
 def _percentile(sorted_values: Sequence[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
@@ -288,17 +328,46 @@ def _percentile(sorted_values: Sequence[float], pct: float) -> float:
     return float(sorted_values[idx])
 
 
-def run_benchmark(*, iterations: int = 10) -> BenchmarkReport:
+def _runner_for_surface(
+    surface: BenchmarkSurface,
+) -> tuple[Callable[[JsonValue], Any], Callable[[BenchmarkSample], bool]]:
+    if surface == "airlock":
+
+        def _scan_airlock(payload: JsonValue) -> Any:
+            return scan_payload(payload, canary_tokens=(BENCH_CANARY,))
+
+        def _expect_airlock(sample: BenchmarkSample) -> bool:
+            return sample.expect_clean
+
+        return _scan_airlock, _expect_airlock
+
+    if surface == "gateway":
+        gw_config = ScannerConfig(canary_tokens=(BENCH_CANARY,))
+
+        def _scan_gateway(payload: JsonValue) -> Any:
+            return scan_value(payload, gw_config)
+
+        def _expect_gateway(sample: BenchmarkSample) -> bool:
+            # Gateway keeps high-entropy detection disabled by default.
+            return True if sample.category == "high_entropy" else sample.expect_clean
+
+        return _scan_gateway, _expect_gateway
+
+    raise ValueError(f"Unsupported benchmark surface: {surface!r}")
+
+
+def run_benchmark(*, iterations: int = 10, surface: BenchmarkSurface = "airlock") -> BenchmarkReport:
     """Execute the deterministic benchmark corpus across `iterations` passes and summarize accuracy + latency."""
     if iterations <= 0:
         raise ValueError("iterations must be positive.")
 
+    scan_fn, expected_clean_fn = _runner_for_surface(surface)
     corpus = build_benchmark_corpus()
     sample_sizes_kb = [max(len(exact_json_bytes(sample.payload)), 1) / 1024.0 for sample in corpus]
 
     # Warm regex compilation/imports before timing
     for sample in corpus:
-        scan_payload(sample.payload, canary_tokens=(BENCH_CANARY,))
+        scan_fn(sample.payload)
 
     tp = fp = tn = fn = 0
     canary_total = 0
@@ -308,12 +377,12 @@ def run_benchmark(*, iterations: int = 10) -> BenchmarkReport:
     for iteration in range(iterations):
         for sample, size_kb in zip(corpus, sample_sizes_kb, strict=True):
             start_ns = time.perf_counter_ns()
-            result = scan_payload(sample.payload, canary_tokens=(BENCH_CANARY,))
+            result = scan_fn(sample.payload)
             elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
             latencies_us_per_kb.append(elapsed_us / size_kb)
 
             if iteration == 0:
-                if sample.expect_clean:
+                if expected_clean_fn(sample):
                     if result.clean:
                         tn += 1
                     else:
@@ -337,8 +406,16 @@ def run_benchmark(*, iterations: int = 10) -> BenchmarkReport:
     p50 = round(_percentile(latencies_sorted, 50.0), 3)
     p99 = round(_percentile(latencies_sorted, 99.0), 3)
 
+    large_us_per_kb = 0.0
+    for payload in build_large_latency_payloads():
+        size_kb = max(len(exact_json_bytes(payload)), 1) / 1024.0
+        start_ns = time.perf_counter_ns()
+        scan_fn(payload)
+        large_us_per_kb = max(large_us_per_kb, (time.perf_counter_ns() - start_ns) / 1000.0 / size_kb)
+
     passed = canary_recall == 1.0 and fp == 0 and fn == 0
     return BenchmarkReport(
+        surface=surface,
         total_samples=len(corpus),
         iterations=iterations,
         total_scans=len(corpus) * iterations,
@@ -353,7 +430,19 @@ def run_benchmark(*, iterations: int = 10) -> BenchmarkReport:
         canary_recall=round(canary_recall, 6),
         p50_us_per_kb=p50,
         p99_us_per_kb=p99,
+        large_payload_us_per_kb=round(large_us_per_kb, 3),
         passed=passed,
+    )
+
+
+def run_benchmark_both(*, iterations: int = 10) -> CombinedBenchmarkReport:
+    """Run deterministic benchmarks for both Airlock and Gateway surfaces."""
+    airlock = run_benchmark(iterations=iterations, surface="airlock")
+    gateway = run_benchmark(iterations=iterations, surface="gateway")
+    return CombinedBenchmarkReport(
+        airlock=airlock,
+        gateway=gateway,
+        passed=airlock.passed and gateway.passed,
     )
 
 
@@ -362,7 +451,7 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
     verdict = "PASS" if report.passed else "FAIL"
     return "\n".join(
         [
-            f"# Mellyn Egress Scanner Benchmark ({verdict})",
+            f"# Mellyn Egress Scanner Benchmark [{report.surface}] ({verdict})",
             "",
             "- **Scope**: fixed regression corpus built from the scanner's own test cases; it catches regressions "
             "and measures latency, and is not an estimate of real-world precision or recall.",
@@ -372,6 +461,19 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
             f"- **Recall**: `{report.recall:.4f}` (FN={report.false_negatives}, TN={report.true_negatives})",
             f"- **Canary Recall**: `{report.canary_recall:.4f}` ({report.canary_detected}/{report.canary_total})",
             f"- **Latency (us/KB)**: `p50={report.p50_us_per_kb:.2f}`, `p99={report.p99_us_per_kb:.2f}`",
+            f"- **Large payloads (~{LARGE_PAYLOAD_KB} KiB, us/KB, worst)**: `{report.large_payload_us_per_kb:.2f}`",
+        ]
+    )
+
+
+def render_combined_benchmark_markdown(report: CombinedBenchmarkReport) -> str:
+    """Format a combined `CombinedBenchmarkReport` across both surfaces as Markdown."""
+    verdict = "PASS" if report.passed else "FAIL"
+    return "\n\n".join(
+        [
+            f"# Mellyn Combined Scanner Benchmark [both] ({verdict})",
+            render_benchmark_markdown(report.airlock),
+            render_benchmark_markdown(report.gateway),
         ]
     )
 
@@ -379,9 +481,15 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mellyn-bench",
-        description="Run deterministic accuracy and latency benchmarks for mellyn.egress.scanner.",
+        description="Run deterministic accuracy and latency benchmarks for the unified scanner core.",
     )
     parser.add_argument("--iterations", type=int, default=10, help="Corpus repetitions for latency percentiles.")
+    parser.add_argument(
+        "--surface",
+        choices=("airlock", "gateway", "both"),
+        default="airlock",
+        help="Scanner wrapper surface to benchmark (default: airlock).",
+    )
     parser.add_argument("--json", action="store_true", help="Emit deterministic machine-readable JSON metrics.")
     return parser
 
@@ -391,7 +499,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        report = run_benchmark(iterations=args.iterations)
+        report: BenchmarkReport | CombinedBenchmarkReport
+        if args.surface == "both":
+            report = run_benchmark_both(iterations=args.iterations)
+        else:
+            report = run_benchmark(iterations=args.iterations, surface=args.surface)
     except ValueError as exc:
         sys.stderr.write(f"mellyn-bench: invalid arguments: {exc}\n")
         return 2
@@ -400,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(
             json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         )
+    elif isinstance(report, CombinedBenchmarkReport):
+        sys.stdout.write(render_combined_benchmark_markdown(report) + "\n")
     else:
         sys.stdout.write(render_benchmark_markdown(report) + "\n")
 
@@ -411,10 +525,14 @@ __all__ = [
     "BENCH_CANARY",
     "BenchmarkReport",
     "BenchmarkSample",
+    "BenchmarkSurface",
+    "CombinedBenchmarkReport",
     "build_benchmark_corpus",
     "main",
     "render_benchmark_markdown",
+    "render_combined_benchmark_markdown",
     "run_benchmark",
+    "run_benchmark_both",
 ]
 
 

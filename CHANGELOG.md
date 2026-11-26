@@ -7,6 +7,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Changed
+- **Unified scanning and redaction core (Phase 2, Pass 2B).** Consolidated the Airlock scanner
+  (`mellyn.egress.scanner`), gateway scanner (`mellyn.scanner`), and core ledger regexes into one stdlib-only
+  module, `mellyn.core.scan`. `CORE_SECRET_PATTERNS` and `KNOWN_SECRET_RULE_PATTERNS` are removed in favor of
+  `KNOWN_SECRET_RULES` and `SECRET_REDACTION_PATTERNS`. `mellyn.core.__init__` now imports Pydantic audit/schema
+  submodules lazily so stdlib-only callers can import `mellyn.core.scan`, `mellyn.scanner`, and `mellyn.audit`
+  without `pydantic`.
+  - **Airlock (`mellyn-airlock`) behaviour changes:** now enforces the 64-level nesting cap (`nesting-too-deep`,
+    extending `RedactionKind` with `"structure"`), detects `[^A-Za-z0-9]+` skeleton and iterative tuple containers,
+    applies double-NFKC normalization in `normalize_str`, and checks every secret rule and canary without early
+    `break` short-circuiting.
+  - **Gateway (`mellyn proxy`) & ledger redaction changes:** now catches `url-userinfo-password`, checks
+    `[^A-Za-z0-9]+` skeletons, runs all 13 secret rules and obfuscated/encoded layers without early `break`,
+    uses `blocked-pattern-<n>` rule IDs, and shares `redact_core_secrets` in `mellyn.audit.redact_text` /
+    `AuditLogger`. High-entropy detection stays **off** by default for the gateway (`detect_high_entropy = false`)
+    and stays **off** for audit ledger redaction; it is configurable under `[scanner]` in `mellyn.toml`
+    (`detect_high_entropy`, `entropy_threshold`, `min_entropy_length`).
+  - **Breaking for gateway audit-log consumers:** containment reasons now name the rules the shared core uses. A
+    split canary is reported as `canary:canary-<n>` (it was `canary:canary-<n>-split`; the finding's field path is
+    still `$[split]`), and policy `blocked_patterns` as `blocked_pattern:blocked-pattern-<n>` (was `blocked-<n>`).
+    Update any log search or alert that matches the old IDs.
+  - **Benchmark (`mellyn-bench`):** adds `--surface airlock|gateway|both` (default `airlock`), and a
+    `large_payload_us_per_kb` figure: the worst µs/KB over two ~256 KiB payloads (non-ASCII prose and MIME
+    Base64), each scanned once. The accuracy corpus is small, so p50/p99 alone did not show large-payload cost.
+  - **Faster invisible-character stripping:** `strip_invisible` (and so every scan of non-ASCII or decoded text)
+    uses one compiled character class instead of a per-character check, with exactly the same characters. A
+    1 MiB Base64 payload scans in about 1.1 s on the gateway, down from about 2.1 s before this pass; the
+    Airlock's 1 MiB scans drop from about 6.5 s to about 1.3 s.
 - **Breaking: one `mellyn` package (Phase 2, Pass 2A).** The Airlock package (`src/mcp_airlock/`) and the runtime
   (`backend/mellyn/`) are now one package under `src/mellyn/`. `backend/` and `src/mcp_airlock/` are gone.
   - **Imports:** `mcp_airlock.core`, `.egress`, `.airlock` and `.ir_lab` are now `mellyn.core`, `mellyn.egress`,
@@ -44,6 +71,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `gitleaks` binary and fails the commit if none is found.
 
 ### Security
+- **Unified scanning & full-rule coverage across Airlock, gateway, and ledgers (Pass 2B).** Airlock now
+  blocks payloads nested deeper than 64 levels (`nesting-too-deep`), both scanners run all 13 secret rules
+  and all canaries without early short-circuiting, and the gateway + audit redactor (`mellyn.audit.redact_text`)
+  now catch `url-userinfo-password`, `[^A-Za-z0-9]+` canary skeletons, and obfuscated/encoded secrets.
+- **Hidden-text check covers every invisible format character (Pass 2B).** The gateway's block on `tools/list` and
+  `resources/list` entries with hidden text, and `mellyn pin`'s refusal, now use the same check as the Airlock: every
+  Unicode `Cf` character, the tag block, variation selectors and blank fillers. Before, 46 of the 170 `Cf`
+  characters got through, including the interlinear annotation characters (U+FFF9–U+FFFB), which can hide text.
+  This also newly blocks a soft hyphen (U+00AD) in a tool description, so `mellyn pin` may refuse a server it
+  accepted before, and a listing that passed before may now be blocked.
 - **OAuth secrets stay out of downstream servers.** Variables named by `client_secret_env` and `bearer_token_env` are
   now withheld from the MCP servers the gateway launches, like every `MELLYN_*` variable.
 

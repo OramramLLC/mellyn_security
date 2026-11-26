@@ -19,7 +19,7 @@ from mellyn.core.normalize import JsonObject, JsonValue
 
 type Severity = Literal["ALLOW", "INFO", "WARN", "BLOCK", "AAD_FIRE"]
 type Zone = Literal["core", "egress", "airlock", "ir_lab"]
-type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_pattern"]
+type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_pattern", "structure"]
 
 GENESIS_PREV_HASH = "0" * 64
 AAD_CONTAINMENT_CONFIRMED_RULE_ID = "airlock.aad_containment_confirmed"
@@ -29,15 +29,16 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _check_finite_json(value: JsonValue) -> JsonValue:
-    """Ensure floats inside nested JSON structures are finite."""
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("Non-finite float values are forbidden in strict JSON fields.")
-    if isinstance(value, list):
-        for item in value:
-            _check_finite_json(item)
-    elif isinstance(value, dict):
-        for val in value.values():
-            _check_finite_json(val)
+    """Iteratively ensure floats inside nested JSON structures are finite."""
+    stack: list[JsonValue] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, float) and not math.isfinite(node):
+            raise ValueError("Non-finite float values are forbidden in strict JSON fields.")
+        elif isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            stack.extend(node.values())
     return value
 
 

@@ -24,6 +24,7 @@ canary_tokens = []
 block_known_secrets = true
 aad_kill_on_leak = true
 blocked_patterns = []
+detect_high_entropy = false
 
 [policy]
 protected_paths = []

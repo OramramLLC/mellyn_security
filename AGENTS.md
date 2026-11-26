@@ -5,7 +5,7 @@ This file adds the architectural invariants for the unified `mellyn` package in 
 strictly layered `core`, `egress`, `airlock`, and `ir_lab` subpackages).
 
 ## 1. Dependency DAG (Strict One-Way Imports)
-- `mellyn.core` imports NOTHING from `airlock`, `egress`, `ir_lab`, or top-level `mellyn` modules.
+- `mellyn.core` imports NOTHING from `airlock`, `egress`, `ir_lab`, or top-level `mellyn` modules (`core/scan.py` is stdlib-only and houses the shared scanning and redaction core; `core/__init__.py` loads Pydantic submodules lazily).
 - `mellyn.egress` imports ONLY from `mellyn.core` (plus stdlib / lazy `pydantic` on scanner access).
 - `mellyn.airlock` imports ONLY from `mellyn.core` and `mellyn.egress`.
 - `mellyn.ir_lab` imports ONLY from `mellyn.core`.

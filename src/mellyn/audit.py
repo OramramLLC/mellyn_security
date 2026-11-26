@@ -14,14 +14,11 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import IO, Any, TextIO
 
-from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, canonical_json_value, utc_now
-from mellyn.scanner import (
-    _URL_USERINFO_SECRET_RE,
-    redact_canaries_in_text,
-)
-from mellyn.scanner import (
+from mellyn.core.scan import (
     SECRET_REDACTION_PATTERNS as SECRET_REDACTION_PATTERNS,
 )
+from mellyn.core.scan import redact_core_secrets
+from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, canonical_json_value, utc_now
 
 GENESIS_PREV_HASH = "0" * 64
 MAX_AUDIT_REASON_CHARS = 512
@@ -46,11 +43,8 @@ class ChainVerificationResult:
 
 
 def redact_text(value: str) -> str:
-    """Replace known credential/token patterns and embedded URL passwords with [REDACTED_SECRET]."""
-    sanitized = _URL_USERINFO_SECRET_RE.sub(r"\1[REDACTED_SECRET]\2", value)
-    for pattern in SECRET_REDACTION_PATTERNS:
-        sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
-    return sanitized
+    """Replace all known credential/token patterns (including encoded/escaped forms) and URL passwords."""
+    return redact_core_secrets(value)
 
 
 def hash_arguments(arguments: Any) -> str:
@@ -381,10 +375,7 @@ class AuditLogger:
         return tuple(self._events)
 
     def _scrub(self, text: str) -> str:
-        sanitized = redact_text(text)
-        if self._canary_tokens:
-            sanitized = redact_canaries_in_text(sanitized, self._canary_tokens)
-        return sanitized
+        return redact_core_secrets(text, canary_tokens=self._canary_tokens)
 
     def _emit(self, event: AuditEvent) -> AuditEvent:
         with self._lock:

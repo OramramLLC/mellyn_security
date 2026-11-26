@@ -12,9 +12,11 @@ Strict DAG invariant: imports only the Python standard library.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
+import re
 import unicodedata
 
 type JsonScalar = str | int | float | bool | None
@@ -57,30 +59,73 @@ def is_invisible_codepoint(char: str) -> bool:
     return cp in _EXTRA_INVISIBLE_CODEPOINTS
 
 
+# Every codepoint `is_invisible_codepoint` can accept lies in these planes: Cf characters are in planes 0, 1 and 14
+# (a test scans the whole range to keep this true on each Python's Unicode version), the tags and the variation
+# selector supplement are in plane 14, and the rest are in plane 0.
+_INVISIBLE_SCAN_RANGES: tuple[range, ...] = (range(0x0000, 0x20000), range(0xE0000, 0xF0000))
+
+
+def _ranges_class(codepoints: list[int]) -> str:
+    parts: list[str] = []
+    start = prev = codepoints[0]
+    for cp in [*codepoints[1:], -1]:
+        if cp == prev + 1:
+            prev = cp
+            continue
+        parts.append(re.escape(chr(start)) if start == prev else f"{re.escape(chr(start))}-{re.escape(chr(prev))}")
+        start = prev = cp
+    return "[" + "".join(parts) + "]"
+
+
+@functools.cache
+def _invisible_re() -> re.Pattern[str]:
+    """
+    One compiled character class for exactly the codepoints `is_invisible_codepoint` accepts.
+
+    Stripping with it runs in C. The per-character Python check it replaces cost about 0.3 s per MiB of non-ASCII
+    text, and the scanner strips every decoded variant of a string, so a 1 MiB payload took seconds. Built once,
+    on first use (about 0.04 s).
+    """
+    codepoints = [cp for span in _INVISIBLE_SCAN_RANGES for cp in span if is_invisible_codepoint(chr(cp))]
+    return re.compile(_ranges_class(codepoints))
+
+
 def strip_invisible(text: str) -> str:
     """Remove all invisible format, tag, variation-selector, and filler codepoints from `text`."""
     # No ASCII codepoint is invisible here (ASCII controls are category Cc, not Cf), so ASCII text is returned
-    # as is. This is exact, not an approximation, and skips a per-character Python loop on the common case.
+    # as is. This is exact, not an approximation, and skips the scan on the common case.
     if text.isascii():
         return text
-    return "".join(ch for ch in text if not is_invisible_codepoint(ch))
+    return _invisible_re().sub("", text)
 
 
 def normalize_str(text: str) -> str:
-    """Strip invisible codepoints, apply NFKC normalization, and re-strip idempotently."""
+    """Strip invisible codepoints and apply NFKC normalization twice (idempotent against layered compatibility)."""
     if text.isascii():  # NFKC maps every ASCII string to itself, and nothing ASCII is invisible.
         return text
-    return strip_invisible(unicodedata.normalize("NFKC", strip_invisible(text)))
+    stripped = strip_invisible(text)
+    if unicodedata.is_normalized("NFKC", stripped):
+        return stripped
+    first = strip_invisible(unicodedata.normalize("NFKC", stripped))
+    if first.isascii() or unicodedata.is_normalized("NFKC", first):
+        return first
+    return strip_invisible(unicodedata.normalize("NFKC", first))
 
 
-def has_invisible_unicode(value: JsonValue) -> bool:
-    """Recursively return True if any string key or value inside `value` contains invisible codepoints."""
-    if isinstance(value, str):
-        return any(is_invisible_codepoint(ch) for ch in value)
-    if isinstance(value, list):
-        return any(has_invisible_unicode(item) for item in value)
-    if isinstance(value, dict):
-        return any(has_invisible_unicode(k) or has_invisible_unicode(v) for k, v in value.items())
+def has_invisible_unicode(value: object) -> bool:
+    """Iteratively return True if any string key or value inside `value` contains invisible codepoints."""
+    stack: list[object] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if not node.isascii() and _invisible_re().search(node) is not None:
+                return True
+        elif isinstance(node, list | tuple):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                stack.append(k if isinstance(k, str) else str(k))
+                stack.append(v)
     return False
 
 
@@ -135,23 +180,25 @@ def sha256_canonical(obj: JsonValue) -> str:
 
 
 def _validate_strict_json(value: JsonValue) -> None:
-    if value is None or isinstance(value, bool | int | str):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("Non-finite float values (NaN/Inf) are forbidden.")
-        return
-    if isinstance(value, list):
-        for item in value:
-            _validate_strict_json(item)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"JSON object keys must be strings, got {type(key).__name__}.")
-            _validate_strict_json(item)
-        return
-    raise TypeError(f"Unsupported non-JSON value type: {type(value).__name__}")
+    stack: list[JsonValue] = [value]
+    while stack:
+        node = stack.pop()
+        if node is None or isinstance(node, bool | int | str):
+            continue
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("Non-finite float values (NaN/Inf) are forbidden.")
+            continue
+        if isinstance(node, list):
+            stack.extend(node)
+            continue
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if not isinstance(key, str):
+                    raise TypeError(f"JSON object keys must be strings, got {type(key).__name__}.")
+                stack.append(item)
+            continue
+        raise TypeError(f"Unsupported non-JSON value type: {type(node).__name__}")
 
 
 def exact_json_bytes(obj: JsonValue) -> bytes:

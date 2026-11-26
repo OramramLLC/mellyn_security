@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import tomllib
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -382,6 +383,107 @@ class TestGatewayScanner(unittest.TestCase):
         res = scan_value({"query": "List open issues assigned to Alice", "limit": 10}, cfg)
         self.assertTrue(res.clean)
         self.assertEqual(res.findings, ())
+
+    def test_url_userinfo_high_entropy_config_and_gateway_redact_text(self) -> None:
+        from mellyn.audit import redact_text
+        from mellyn.unified_config import parse_unified_dict
+
+        url_secret = "https://" + "svc_user:secret_pass_987@api.custom.example/hook"
+        self.assertTrue(scan_value({"url": url_secret}, ScannerConfig()).secret_matched)
+        self.assertEqual(
+            redact_text(f"connect={url_secret}"),
+            "connect=https://svc_user:[REDACTED_SECRET]@api.custom.example/hook",
+        )
+
+        # High-entropy strings stay off by default in Gateway and ledger redaction, and turn on via [scanner].
+        high_ent = "token=" + "aZ9$kL2mP8qR4vW7xN3bY5cQ"
+        self.assertEqual(redact_text(high_ent), high_ent)
+        self.assertTrue(scan_value({"v": high_ent}, ScannerConfig()).clean)
+        self.assertTrue(scan_value({"v": high_ent}, ScannerConfig(detect_high_entropy=True)).high_entropy_matched)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hi\n", encoding="utf-8")
+            srv_tools = [{"name": "read_file", "description": "Read workspace file", "inputSchema": {}}]
+            base = tomllib.loads(render_unified_config(["mcp-filesystem"]))
+
+            default_cfg = parse_unified_dict(base, base_dir=root, config_path=root / "mellyn.toml")
+            self.assertFalse(default_cfg.scanner.detect_high_entropy)
+            gw_default = MCPGateway(
+                authorizer=Authorizer(
+                    workspace_root=root,
+                    policy_config=default_cfg.policy,
+                    audit_logger=AuditLogger(),
+                    session_ttl_seconds=None,
+                ),
+                servers={"local-workspace": _FakeDownstream("local-workspace", tools=srv_tools)},
+                scanner_config=default_cfg.scanner,
+            )
+            gw_default.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            ok_reply = gw_default.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "local-workspace__read_file",
+                        "arguments": {"path": "note.txt", "extra": high_ent},
+                    },
+                }
+            )
+            self.assertIn("result", ok_reply or {})
+
+            base["scanner"] = {
+                "canary_tokens": [],
+                "block_known_secrets": True,
+                "aad_kill_on_leak": True,
+                "blocked_patterns": [],
+                "detect_high_entropy": True,
+                "entropy_threshold": 4.0,
+                "min_entropy_length": 20,
+            }
+            strict_cfg = parse_unified_dict(base, base_dir=root, config_path=root / "mellyn.toml")
+            self.assertTrue(strict_cfg.scanner.detect_high_entropy)
+            audit_strict = AuditLogger()
+            gw_strict = MCPGateway(
+                authorizer=Authorizer(
+                    workspace_root=root,
+                    policy_config=strict_cfg.policy,
+                    audit_logger=audit_strict,
+                    session_ttl_seconds=None,
+                ),
+                servers={"local-workspace": _FakeDownstream("local-workspace", tools=srv_tools)},
+                scanner_config=strict_cfg.scanner,
+            )
+            gw_strict.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            blk_reply = gw_strict.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "local-workspace__read_file",
+                        "arguments": {"path": "note.txt", "extra": high_ent},
+                    },
+                }
+            )
+            self.assertEqual((blk_reply or {})["error"]["code"], MELLYN_POLICY_DENIED)
+            reason = next(e for e in audit_strict.events if e.event_type == "containment").reasons[0]
+            self.assertIn("high_entropy:", reason)
+            self.assertNotIn("aZ9$kL2mP8qR4vW7xN3bY5cQ", reason)
+
+            for bad_scanner in (
+                {"detect_high_entropy": "yes"},
+                {"entropy_threshold": 0.0},
+                {"entropy_threshold": float("nan")},
+                {"entropy_threshold": True},
+                {"min_entropy_length": 4},
+                {"min_entropy_length": True},
+            ):
+                bad = dict(base)
+                bad["scanner"] = bad_scanner
+                with self.subTest(bad_scanner=bad_scanner), self.assertRaises(PolicyLoadError):
+                    parse_unified_dict(bad, base_dir=root, config_path=root / "mellyn.toml")
 
 
 class TestUnifiedConfig(unittest.TestCase):
