@@ -25,7 +25,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import hashlib
 import io
 import itertools
@@ -47,6 +46,7 @@ from mellyn.audit import AuditChainError, AuditLogger
 from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import WorkspaceConfigError, check_workspace_root
+from mellyn.egress.guards import OwnedFile
 from mellyn.http_downstream import StreamableHttpDownstream
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
 from mellyn.models import (
@@ -1376,29 +1376,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Privilege separation configuration rejected (fail-closed): {exc}", file=sys.stderr)
         return 2
 
-    # The agent must never be able to edit the files that control or record its own enforcement.
-    protected_inputs: list[Path] = [config.path, config.policy_path, audit_log_path]
-    if unified.runtime.state_db is not None:
-        state_db_path = unified.runtime.state_db
-        protected_inputs.extend(
-            [
-                state_db_path,
-                state_db_path.with_name(f"{state_db_path.name}-wal"),
-                state_db_path.with_name(f"{state_db_path.name}-shm"),
-            ]
-        )
+    # The agent must never be able to edit the files that control its own enforcement. The Authorizer adds the
+    # files its audit logger and state store declare (the ledger, its lock and moved-aside siblings, the database).
+    entry_files: tuple[OwnedFile, ...] = ((config.path, ("",)), (config.policy_path, ("",)))
     try:
         check_token_caches_outside_workspace(config.servers, workspace_root)
     except ValueError as exc:
         print(f"Gateway config rejected (fail-closed): {exc}", file=sys.stderr)
         return 2
-    own_files = [_inside(p, workspace_root) for p in protected_inputs]
-    # The ledger's siblings record or guard it too: `<ledger>.lock` (a directory planted there stops every
-    # restart) and the `<ledger>.v1-*` / `.pre-chain-*` files older ledgers are moved aside to.
-    ledger_rel = _inside(audit_log_path, workspace_root)
-    if ledger_rel:
-        own_files.append(f"{ledger_rel}.*")
-    policy = dataclasses.replace(policy, protected_paths=(*policy.protected_paths, *[p for p in own_files if p]))
 
     credentials: CredentialConfig | None = None
     try:
@@ -1474,6 +1459,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_logger=audit_logger,
             session_ttl_seconds=None,
             state_store=state_store,
+            owned_files=entry_files,
         )
         approvals: PendingApprovals | None = None
         if credentials is not None:

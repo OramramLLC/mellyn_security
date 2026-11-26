@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -52,6 +53,36 @@ GUARDRAIL_PATHS: tuple[str, ...] = (
     "AGENTS.md",
     "GEMINI.md",
 )
+
+# Suffixes for `owned_file_entries`: "" protects the file itself, ".*" every `<name>.<suffix>` sibling (an audit
+# ledger's `.lock` file and the `.v1-*` / `.pre-chain-*` files older ledgers are moved aside to), and "-wal" style
+# suffixes the companion files SQLite writes next to a database.
+LEDGER_FILE_SUFFIXES: tuple[str, ...] = ("", ".*")
+SQLITE_FILE_SUFFIXES: tuple[str, ...] = ("", "-wal", "-shm", "-journal")
+
+# A file a component writes or reads its own enforcement from, with the suffixes that protect it and its companions.
+OwnedFile = tuple[Path, tuple[str, ...]]
+
+
+def owned_file_entries(workspace_root: Path, owned: Iterable[OwnedFile]) -> tuple[str, ...]:
+    """
+    Workspace-relative protected-path entries for the files a component owns that sit inside the workspace.
+
+    The agent must never be able to edit the files that configure or record its own enforcement: its policy, its
+    audit ledger and the ledger's lock, its state database. Each component declares its files, so no entry point
+    can forget one. A file outside the workspace needs no entry, since the guard denies every path outside it.
+    """
+    root = workspace_root.resolve()
+    entries: list[str] = []
+    for path, suffixes in owned:
+        try:
+            rel = Path(path).resolve().relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if rel in ("", "."):
+            continue
+        entries.extend(f"{rel}{suffix}" for suffix in suffixes)
+    return tuple(dict.fromkeys(entries))
 
 
 # NUL and other C0/DEL control characters. They have no business in a path or URL, and they are where

@@ -69,26 +69,26 @@ class TestLedgerSiblingsAreProtected(_TempDir):
             'command = ["mcp-fs"]\n',
             encoding="utf-8",
         )
-        seen: dict[str, Any] = {}
+        built: list[Authorizer] = []
 
-        def record(*_args: Any, **kwargs: Any) -> Any:
-            seen.update(kwargs)
-            raise RuntimeError("stop after recording the authorizer's policy")
+        def build(**kwargs: Any) -> Any:
+            built.append(Authorizer(**kwargs))  # the real one, with the gateway's ledger and declared files
+            raise RuntimeError("stop once the authorizer is built")
 
         argv = ["--config", str(config), "--workspace", str(ws), "--audit-log", str(ws / LEDGER)]
         with (
             mock.patch.object(mcp_gateway, "StdioDownstream", return_value=mock.MagicMock()),
-            mock.patch.object(mcp_gateway, "Authorizer", side_effect=record),
+            mock.patch.object(mcp_gateway, "Authorizer", side_effect=build),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             mcp_gateway.main(argv)
-        policy = seen["policy_config"]
+        self.assertEqual(len(built), 1)
+        authorizer = built[0]
+        # The gateway closed its ledger on the way out; record these decisions in memory instead. The path guard
+        # was fixed when the Authorizer was built, from the ledger the gateway opened.
+        authorizer.audit = AuditLogger()
         # Before the fix only the ledger itself was protected, so an approved write could plant a directory at
         # `<ledger>.lock` (every restart then failed) or delete a moved-aside `.v1-*` ledger.
-        self.assertIn(LEDGER, policy.protected_paths)
-        self.assertIn(f"{LEDGER}.*", policy.protected_paths)
-
-        authorizer = Authorizer(workspace_root=ws, policy_config=policy, session_ttl_seconds=None)
         sid = authorizer.create_session()
         for tool, args in (
             ("write_file", {"path": f"{LEDGER}.lock", "content": "x"}),

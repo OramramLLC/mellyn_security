@@ -31,6 +31,7 @@ from mellyn.core.scan import (
     SECRET_REDACTION_PATTERNS as SECRET_REDACTION_PATTERNS,
 )
 from mellyn.core.scan import redact_core_secrets
+from mellyn.egress.guards import LEDGER_FILE_SUFFIXES, OwnedFile
 from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, canonical_json_value, utc_now
 
 GENESIS_PREV_HASH = _CORE_GENESIS_PREV_HASH
@@ -373,6 +374,11 @@ class AuditLogger:
     @property
     def head(self) -> LedgerAnchor | None:
         return self._core.head
+
+    def owned_files(self) -> tuple[OwnedFile, ...]:
+        """The ledger file, its lock and moved-aside siblings, for the path guard to protect (none in memory)."""
+        path = self._core.path
+        return ((path, LEDGER_FILE_SUFFIXES),) if path is not None else ()
 
     def _scrub(self, text: str) -> str:
         return redact_core_secrets(text, canary_tokens=self._canary_tokens)

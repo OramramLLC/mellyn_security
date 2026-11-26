@@ -43,7 +43,7 @@ from mellyn.core.normalize import (
     sha256_exact,
 )
 from mellyn.core.schemas import RedactionRecord, Verdict
-from mellyn.egress.guards import WorkspacePathGuard
+from mellyn.egress.guards import WorkspacePathGuard, owned_file_entries
 from mellyn.egress.scanner import EgressScanResult, scan_payload
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -194,6 +194,7 @@ def _check_lexical_path_containment(
     *,
     roots: Sequence[str],
     block_guardrail_paths: bool,
+    owned_files: Sequence[tuple[Path, tuple[str, ...]]] = (),
 ) -> tuple[bool, str]:
     """
     Validate workspace path containment (`Path.resolve(strict=False)`) and secret-file rules across configured
@@ -254,7 +255,7 @@ def _check_lexical_path_containment(
         if not resolved.is_relative_to(root_path):
             continue
         matched_any_root = True
-        guard = WorkspacePathGuard(root_path)
+        guard = WorkspacePathGuard(root_path, owned_file_entries(root_path, owned_files))
         allowed, reason = guard.validate_path(str(resolved), is_write=block_guardrail_paths)
         if allowed:
             return True, "Path confined inside allowed workspace root."
@@ -342,6 +343,7 @@ def _evaluate_path_rules(
             raw_value,
             roots=roots,
             block_guardrail_paths=block_guardrails,
+            owned_files=policy.owned_files,
         )
         if not ok:
             return False, f"Path rule failed on '{location}': {reason}"
@@ -920,6 +922,7 @@ def evaluate_resource_read(request: JsonRpcRequest, policy: AirlockPolicy) -> Ve
         uri,
         roots=policy.workspace_roots,
         block_guardrail_paths=True,
+        owned_files=policy.owned_files,
     )
     if not path_ok:
         return _block("airlock.path_boundary_violation", f"Resource URI blocked: {path_reason}")

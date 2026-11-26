@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from mellyn.egress.guards import SQLITE_FILE_SUFFIXES, OwnedFile
 from mellyn.models import ApprovalGrant, TaintSource
 
 STATE_SCHEMA_VERSION = 1
@@ -812,6 +813,10 @@ class SqliteStateStore:
             except sqlite3.Error as exc:
                 raise StateStoreError(f"State database read failed: {exc}") from exc
             return {grant.grant_id: grant for grant in (self._row_to_grant(row) for row in rows)}
+
+    def owned_files(self) -> tuple[OwnedFile, ...]:
+        """The database and the journal files SQLite keeps beside it, for the path guard to protect."""
+        return ((self._db_path, SQLITE_FILE_SUFFIXES),)
 
     def close(self) -> None:
         with self._lock:

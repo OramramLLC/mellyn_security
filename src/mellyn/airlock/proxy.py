@@ -78,6 +78,7 @@ from mellyn.core.schemas import (
     Verdict,
     ZoneEvent,
 )
+from mellyn.egress.guards import LEDGER_FILE_SUFFIXES
 from mellyn.egress.scanner import scan_payload
 
 AAD_EXIT_CODE = 78
@@ -2555,6 +2556,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"mellyn-airlock: failed to open audit ledger '{args.audit_log}': {exc}\n")
         return 2
+    # A tool call must never rewrite the policy the proxy enforces or the ledger recording it (with the ledger's
+    # lock and moved-aside siblings), even when they sit inside a workspace root.
+    policy = policy.with_owned_files(((args.policy, ("",)), (args.audit_log, LEDGER_FILE_SUFFIXES)))
 
     try:
         allowed_env = parse_allow_env_keys(args.allow_env)

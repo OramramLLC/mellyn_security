@@ -98,6 +98,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   are moved aside to. Before, an approved agent write could plant a directory at the lock path (every restart then
   failed) or delete a moved-aside ledger. Policy `protected_paths` entries ending in `.*` now mean "every
   `<name>.<suffix>` sibling in that folder".
+- **The authorizer service and the Airlock protect their own files.** The authorizer service (`mellyn.api`)
+  protected none of its own files, and the Airlock protected none of its own: with one inside the workspace, an
+  approved write could rewrite the policy, truncate the ledger, plant a directory at the lock path, or (for the
+  service) edit the state database to clear taint or mint grants. Each component now declares the files it owns
+  (`owned_files()` on `AuditLogger` and `SqliteStateStore`), and the `Authorizer` refuses agent writes to them.
+  This covers the ledger with its `.lock` and moved-aside siblings, and the state database with its `-wal`,
+  `-shm` and `-journal` files. Each entry point adds its own config: the gateway its `mellyn.toml` and policy,
+  the service its `MELLYN_POLICY_PATH`, and the Airlock its `--policy` file and `--audit-log` ledger, for every
+  workspace root. The gateway also gains `-journal`. `Authorizer` and `create_app` take a new keyword-only
+  `owned_files` argument.
 
 ### Changed (performance)
 - **Ledger appends hold their files open (Pass 2C).** The gateway/authorizer logger keeps the ledger and its lock
