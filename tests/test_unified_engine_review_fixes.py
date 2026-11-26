@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -244,42 +245,102 @@ class TestUnifiedConfigLoadsInTheAuthorizer(unittest.TestCase):
                 self.assertIsNotNone(create_app_from_env())
 
 
-@unittest.skipUnless(HAS_PYDANTIC, "comparing against mellyn.core.audit needs pydantic")
-class TestScannerParityWithAirlock(unittest.TestCase):
-    """The gateway scanner is a port of the Airlock's detection. Until they share one copy, keep them in step."""
+class TestUnifiedScannerSingleImplementation(unittest.TestCase):
+    """The Airlock, the gateway, and both ledgers share `mellyn.core.scan` as their single detection core."""
 
-    def test_both_scanners_agree_on_every_encoding_and_split(self) -> None:
-        from mellyn.core.audit import canary_present, canary_present_in_json
+    def test_wrappers_and_sources_point_to_single_core_scan_module(self) -> None:
+        import mellyn.core.scan as core_scan
+        import mellyn.scanner as gw_scanner
+
+        for name in (
+            "ScannerConfig",
+            "ScanResult",
+            "ScanFinding",
+            "scan_value",
+            "canary_present_in_text",
+            "invisible_unicode_tools",
+            "redact_canaries_in_text",
+            "SECRET_REDACTION_PATTERNS",
+            "_INVISIBLE_UNICODE_RE",
+            "_URL_USERINFO_SECRET_RE",
+        ):
+            with self.subTest(wrapper="mellyn.scanner", attr=name):
+                self.assertIs(getattr(gw_scanner, name), getattr(core_scan, name))
+
+        if HAS_PYDANTIC:
+            import mellyn.core.audit as core_audit
+            import mellyn.egress.scanner as air_scanner
+
+            self.assertIs(air_scanner.KNOWN_SECRET_RULES, core_scan.KNOWN_SECRET_RULES)
+            self.assertIs(air_scanner.shannon_entropy, core_scan.shannon_entropy)
+            self.assertIs(core_audit.canary_present, core_scan.canary_present)
+            self.assertIs(core_audit.canary_present_in_json, core_scan.canary_present_in_json)
+            self.assertIs(core_audit.redact_core_secrets, core_scan.redact_core_secrets)
+
+        src_files = sorted((REPO_ROOT / "src" / "mellyn").rglob("*.py"))
+        for symbol_pat in (
+            r"^KNOWN_SECRET_RULES\s*(?::|=)",
+            r"^_ENCODED_SECRET_DECODERS\s*(?::|=)",
+            r"^def _canary_signature\b",
+            r"^def _iter_json_strings\b",
+        ):
+            defining = [
+                p.relative_to(REPO_ROOT).as_posix()
+                for p in src_files
+                if re.search(symbol_pat, p.read_text(encoding="utf-8"), re.M)
+            ]
+            self.assertEqual(defining, ["src/mellyn/core/scan.py"], symbol_pat)
+
+        removed_1 = "CORE_" + "SECRET_PATTERNS"
+        removed_2 = "KNOWN_SECRET_" + "RULE_PATTERNS"
+        for p in src_files:
+            text = p.read_text(encoding="utf-8")
+            self.assertNotIn(removed_1, text, p.name)
+            self.assertNotIn(removed_2, text, p.name)
+
+    def test_shared_core_detects_every_encoding_and_split_through_wrappers(self) -> None:
+        from mellyn.core.scan import canary_present, canary_present_in_json
 
         canary = "MELLYN-" + secrets.token_urlsafe(16)
         raw = canary.encode()
         third = len(canary) // 3
         pieces = [canary[:third], canary[third : 2 * third], canary[2 * third :]]
         texts = {
-            "plain": canary,
-            "x escapes": "".join(f"\\x{b:02x}" for b in raw),
-            "u escapes": "".join(f"\\u{b:04x}" for b in raw),
-            "decimal list": ", ".join(str(b) for b in raw),
-            "double base64": base64.b64encode(base64.b64encode(raw)).decode(),
-            "base64 of hex": base64.b64encode(raw.hex().encode()).decode(),
-            "reversed": canary[::-1],
-            "unrelated prose": "quarterly report: revenue grew in every region",
-            "random base64": base64.b64encode(secrets.token_bytes(600)).decode(),
+            "plain": (canary, True),
+            "x escapes": ("".join(f"\\x{b:02x}" for b in raw), True),
+            "u escapes": ("".join(f"\\u{b:04x}" for b in raw), True),
+            "decimal list": (", ".join(str(b) for b in raw), True),
+            "double base64": (base64.b64encode(base64.b64encode(raw)).decode(), True),
+            "base64 of hex": (base64.b64encode(raw.hex().encode()).decode(), True),
+            "reversed": (canary[::-1], True),
+            "unrelated prose": ("quarterly report: revenue grew in every region", False),
+            "random base64": (base64.b64encode(secrets.token_bytes(600)).decode(), False),
         }
-        for label, text in texts.items():
+        for label, (text, expected) in texts.items():
             with self.subTest(text=label):
-                self.assertEqual(canary_present_in_text(text, canary), canary_present(text, canary))
-        payloads: dict[str, Any] = {
-            "interleaved": {"p1": pieces[0], "n": "x", "p2": pieces[1], "m": 3, "p3": pieces[2]},
-            "reordered": [pieces[2], pieces[0], pieces[1]],
-            "padded": ["x" * 200_000, *pieces],
-            "keys": {pieces[0]: 1, "k": 2, pieces[1]: 3, pieces[2]: 4},
-            "clean": {"a": "hello", "b": ["world", 3]},
+                self.assertEqual(canary_present_in_text(text, canary), expected)
+                self.assertEqual(canary_present(text, canary), expected)
+
+        payloads: dict[str, tuple[Any, bool]] = {
+            "interleaved": ({"p1": pieces[0], "n": "x", "p2": pieces[1], "m": 3, "p3": pieces[2]}, True),
+            "reordered": ([pieces[2], pieces[0], pieces[1]], True),
+            "padded": (["x" * 200_000, *pieces], True),
+            "keys": ({pieces[0]: 1, "k": 2, pieces[1]: 3, pieces[2]: 4}, True),
+            "clean": ({"a": "hello", "b": ["world", 3]}, False),
         }
         cfg = ScannerConfig(canary_tokens=(canary,))
-        for label, payload in payloads.items():
+        airlock_scan = None
+        if HAS_PYDANTIC:
+            from mellyn.egress.scanner import scan_payload
+
+            airlock_scan = scan_payload
+
+        for label, (payload, expected) in payloads.items():
             with self.subTest(payload=label):
-                self.assertEqual(scan_value(payload, cfg).canary_matched, canary_present_in_json(payload, canary))
+                self.assertEqual(scan_value(payload, cfg).canary_matched, expected)
+                self.assertEqual(canary_present_in_json(payload, canary), expected)
+                if airlock_scan is not None:
+                    self.assertEqual(airlock_scan(payload, canary_tokens=(canary,)).canary_matched, expected)
 
 
 if __name__ == "__main__":

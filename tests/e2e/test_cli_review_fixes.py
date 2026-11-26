@@ -457,6 +457,18 @@ class TestBenchAndTimeouts(unittest.TestCase):
             self.assertEqual(bench.main(["--iterations", "1"]), 1)
         self.assertIn("(FAIL)", out.getvalue())
 
+        real_scan_val = bench.scan_value
+
+        def scan_gw_missing_aws(payload: Any, cfg: Any) -> Any:
+            if isinstance(payload, dict) and "aws" in payload:
+                return real_scan_val("nothing to see here", cfg)
+            return real_scan_val(payload, cfg)
+
+        gw_out = io.StringIO()
+        with mock.patch.object(bench, "scan_value", scan_gw_missing_aws), mock.patch("sys.stdout", gw_out):
+            self.assertEqual(bench.main(["--surface", "gateway", "--iterations", "1"]), 1)
+        self.assertIn("[gateway] (FAIL)", gw_out.getvalue())
+
     def test_timeouts_must_be_finite_and_positive(self) -> None:
         async def build(timeout: float) -> None:
             AirlockProxy(

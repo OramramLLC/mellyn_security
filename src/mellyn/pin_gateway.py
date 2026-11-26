@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from mellyn.core.normalize import has_invisible_unicode
 from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME
 from mellyn.http_downstream import StreamableHttpDownstream
@@ -31,7 +32,7 @@ from mellyn.legacy_env import LEGACY_ENV_PREFIX
 from mellyn.oauth_client import OAuthClientConfig, OAuthError, extract_url_host, validate_outbound_url
 from mellyn.policy import SMB_SERVER_PRESETS, validate_argv
 from mellyn.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
-from mellyn.scanner import _INVISIBLE_UNICODE_RE, invisible_unicode_tools
+from mellyn.scanner import invisible_unicode_tools
 from mellyn.unified_config import load_unified_config, parse_unified_dict
 
 DEFAULT_PIN_TIMEOUT_SECONDS = 15.0
@@ -107,7 +108,7 @@ def build_pin_env(allowed_env_keys: Sequence[str] = ()) -> dict[str, str]:
 
 def _walk_unicode_anomalies(value: Any, *, tool_label: str, path: str, out: list[str]) -> None:
     if isinstance(value, str):
-        if _INVISIBLE_UNICODE_RE.search(value):
+        if has_invisible_unicode(value):
             out.append(
                 f"SECURITY WARNING: invisible/tag Unicode characters detected in tool '{tool_label}' at '{path}'."
             )

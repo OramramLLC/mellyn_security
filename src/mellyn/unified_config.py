@@ -8,6 +8,7 @@ scanning, and runtime containment/observe options into one fail-closed file.
 from __future__ import annotations
 
 import json
+import math
 import re
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -33,7 +34,17 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNIFIED_TOP_KEYS = frozenset({"schema_version", "runtime", "egress", "policy", "scanner", "servers"})
 _RUNTIME_KEYS = frozenset({"mode", "allow_observe_mode", "state_db", "audit_log"})
 _EGRESS_KEYS = frozenset({"allowed_domains", "auto_sync_squid"})
-_SCANNER_KEYS = frozenset({"canary_tokens", "block_known_secrets", "aad_kill_on_leak", "blocked_patterns"})
+_SCANNER_KEYS = frozenset(
+    {
+        "canary_tokens",
+        "block_known_secrets",
+        "aad_kill_on_leak",
+        "blocked_patterns",
+        "detect_high_entropy",
+        "entropy_threshold",
+        "min_entropy_length",
+    }
+)
 _SERVER_KEYS = frozenset({"name", "transport", "preset", "trusted", "command", "url", "oauth", "tools_sha256"})
 _OAUTH_KEYS = frozenset(
     {
@@ -174,12 +185,30 @@ def _parse_scanner_section(raw: Any) -> ScannerConfig:
     block_known_secrets = _require_bool(sec, "block_known_secrets", True, "scanner")
     aad_kill_on_leak = _require_bool(sec, "aad_kill_on_leak", True, "scanner")
     blocked_patterns = tuple(_require_str_list(sec, "blocked_patterns", "scanner"))
+    detect_high_entropy = _require_bool(sec, "detect_high_entropy", False, "scanner")
+
+    threshold_raw = sec.get("entropy_threshold", 4.0)
+    if (
+        isinstance(threshold_raw, bool)
+        or not isinstance(threshold_raw, int | float)
+        or not math.isfinite(threshold_raw)
+        or threshold_raw <= 0.0
+    ):
+        raise PolicyLoadError("[scanner].entropy_threshold must be a finite positive number.")
+
+    min_len_raw = sec.get("min_entropy_length", 20)
+    if isinstance(min_len_raw, bool) or not isinstance(min_len_raw, int) or min_len_raw < 8:
+        raise PolicyLoadError("[scanner].min_entropy_length must be an integer >= 8.")
+
     try:
         return ScannerConfig(
             canary_tokens=canary_tokens,
             block_known_secrets=block_known_secrets,
             aad_kill_on_leak=aad_kill_on_leak,
             blocked_patterns=blocked_patterns,
+            detect_high_entropy=detect_high_entropy,
+            entropy_threshold=float(threshold_raw),
+            min_entropy_length=min_len_raw,
         )
     except ValueError as exc:
         raise PolicyLoadError(f"[scanner] configuration invalid: {exc}") from exc
@@ -588,6 +617,7 @@ def render_unified_config(
             "block_known_secrets = true",
             "aad_kill_on_leak = true",
             "blocked_patterns = []",
+            "detect_high_entropy = false",
             "",
             "[policy]",
             "protected_paths = []",

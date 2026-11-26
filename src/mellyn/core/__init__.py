@@ -1,14 +1,10 @@
-"""Mellyn core primitives: Unicode/JSON canonicalization, strict wire schemas, and tamper-evident audit ledger."""
+"""Mellyn core primitives: Unicode/JSON canonicalization, stdlib scanner/redaction core, and lazy audit schemas."""
 
-from mellyn.core.audit import (
-    AuditLedger,
-    LedgerAnchor,
-    canary_present,
-    redact_canary_in_text,
-    redact_core_secrets,
-    verify_ledger,
-    verify_ledger_bytes,
-)
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
 from mellyn.core.normalize import (
     JsonObject,
     JsonScalar,
@@ -23,23 +19,47 @@ from mellyn.core.normalize import (
     sha256_exact,
     strip_invisible,
 )
-from mellyn.core.schemas import (
-    AAD_CONTAINMENT_CONFIRMED_RULE_ID,
-    GENESIS_PREV_HASH,
-    SESSION_STARTED_RULE_ID,
-    AuditLedgerEntry,
-    LedgerVerification,
-    RedactionKind,
-    RedactionRecord,
-    Severity,
-    Verdict,
-    Zone,
-    ZoneEvent,
+from mellyn.core.scan import (
+    canary_present,
+    redact_canary_in_text,
+    redact_core_secrets,
 )
+
+_AUDIT_EXPORTS = frozenset(
+    {
+        "AuditLedger",
+        "LedgerAnchor",
+        "verify_ledger",
+        "verify_ledger_bytes",
+    }
+)
+_SCHEMA_EXPORTS = frozenset(
+    {
+        "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
+        "AuditLedgerEntry",
+        "GENESIS_PREV_HASH",
+        "LedgerVerification",
+        "RedactionKind",
+        "RedactionRecord",
+        "SESSION_STARTED_RULE_ID",
+        "Severity",
+        "Verdict",
+        "Zone",
+        "ZoneEvent",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _AUDIT_EXPORTS:
+        return getattr(importlib.import_module("mellyn.core.audit"), name)
+    if name in _SCHEMA_EXPORTS:
+        return getattr(importlib.import_module("mellyn.core.schemas"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "AAD_CONTAINMENT_CONFIRMED_RULE_ID",
-    "SESSION_STARTED_RULE_ID",
     "AuditLedger",
     "AuditLedgerEntry",
     "GENESIS_PREV_HASH",
@@ -50,6 +70,7 @@ __all__ = [
     "LedgerVerification",
     "RedactionKind",
     "RedactionRecord",
+    "SESSION_STARTED_RULE_ID",
     "Severity",
     "Verdict",
     "Zone",

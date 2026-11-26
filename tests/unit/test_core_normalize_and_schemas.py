@@ -71,6 +71,12 @@ class TestCoreNormalize(unittest.TestCase):
         bytes_a = canonical_json_bytes(obj_a)
         bytes_b = canonical_json_bytes(obj_b)
         self.assertEqual(bytes_a, bytes_b)
+        # Double-NFKC idempotence and iterative deep-nesting safety
+        self.assertEqual(normalize_str(normalize_str(raw_ligature)), normalize_str(raw_ligature))
+        deep: JsonObject = {"leaf": "ok\u200b"}
+        for _ in range(1100):
+            deep = {"n": deep}
+        self.assertTrue(has_invisible_unicode(deep))
 
         expected_text = json.dumps(
             {"b": [1, True, None, 0.0], "toolname": "fix café"},

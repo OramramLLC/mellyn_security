@@ -289,6 +289,20 @@ class TestFullKillChainLifecycle(unittest.TestCase):
         self.assertIn("Canary Recall", md_res.stdout)
         self.assertIn("Latency (us/KB)", md_res.stdout)
 
+        both_res = _run_cli(CLI_MODULES["mellyn-bench"], ["--surface", "both", "--iterations", "2", "--json"])
+        self.assertEqual(both_res.returncode, 0, both_res.stderr)
+        both_metrics = json.loads(both_res.stdout)
+        self.assertEqual(both_metrics["surface"], "both")
+        self.assertTrue(both_metrics["passed"])
+        self.assertEqual(both_metrics["airlock"]["canary_recall"], 1.0)
+        self.assertEqual(both_metrics["gateway"]["canary_recall"], 1.0)
+        self.assertEqual(both_metrics["gateway"]["false_positives"], 0)
+        self.assertEqual(both_metrics["gateway"]["false_negatives"], 0)
+
+        gw_md = _run_cli(CLI_MODULES["mellyn-bench"], ["--surface", "gateway", "--iterations", "2"])
+        self.assertEqual(gw_md.returncode, 0, gw_md.stderr)
+        self.assertIn("[gateway] (PASS)", gw_md.stdout)
+
     def test_pin_refuses_poisoned_server_and_cli_entrypoints_and_ir_dag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

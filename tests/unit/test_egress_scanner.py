@@ -9,9 +9,12 @@ from pathlib import Path
 
 from mellyn.airlock.engine import evaluate_tool_call
 from mellyn.airlock.models import AirlockPolicy, JsonRpcRequest
+from mellyn.audit import redact_text as gateway_redact_text
 from mellyn.core.normalize import JsonObject, sha256_exact
+from mellyn.core.scan import KNOWN_SECRET_RULES, redact_core_secrets
 from mellyn.egress.guards import EgressValidator, WorkspacePathGuard
 from mellyn.egress.scanner import scan_payload, scan_text, shannon_entropy
+from mellyn.scanner import ScannerConfig, scan_value
 
 
 class TestEgressScanner(unittest.TestCase):
@@ -164,6 +167,99 @@ class TestEgressScanner(unittest.TestCase):
                 verdict = evaluate_tool_call(bad_req, policy)
                 self.assertFalse(verdict.verdict_allow)
                 self.assertEqual(verdict.rule_id, "airlock.arg_regex_violation")
+
+    def test_shared_core_rules_depth_and_wrappers_stay_in_step(self) -> None:
+        self.assertEqual(len(KNOWN_SECRET_RULES), 13)
+        canary_a = "MELLYN_CANARY_" + "ALPHA_4242"
+        canary_b = "MELLYN_CANARY_" + "BETA_7373"
+        aws_key = "AKIA" + ("1234ABCD" * 2)
+        gh_key = "gh" + "p_" + ("X" * 24)
+        url_secret = "https://" + "alice:top_secret_pw_99@api.example.com/v1"
+        pem_secret = (
+            "-----BEGIN RSA "
+            + "PRIVATE KEY-----\n"
+            + ("MIIEowIBAAKCAQEAt0FakeTestBodyOnly1234567890\n" * 2)
+            + "-----END RSA "
+            + "PRIVATE KEY-----"
+        )
+        all_13_samples = (
+            url_secret,
+            "sk-" + "proj-" + ("Z" * 24),
+            "sk-" + "ant-api03-" + ("A" * 20),
+            "AIza" + ("B" * 35),
+            "hf_" + ("C" * 30),
+            "lsv2_pt_" + ("a" * 32) + "_" + ("b" * 10),
+            gh_key,
+            "github_pat_" + ("D" * 30),
+            aws_key,
+            "xoxb-" + ("1" * 24),
+            "sk_live_" + ("Z" * 24),
+            pem_secret,
+            "Bearer " + ("Y" * 24),
+        )
+        gw_cfg = ScannerConfig(canary_tokens=(canary_a, canary_b))
+        for sample in all_13_samples:
+            with self.subTest(sample_prefix=sample[:12]):
+                air = scan_payload({"v": sample}, canary_tokens=(canary_a, canary_b))
+                gw = scan_value({"v": sample}, gw_cfg)
+                self.assertTrue(air.secret_matched)
+                self.assertTrue(gw.secret_matched)
+                redacted = redact_core_secrets(f"x={sample}")
+                self.assertIn("[REDACTED_SECRET]", redacted)
+                self.assertEqual(gateway_redact_text(f"x={sample}"), redacted)
+
+        # No early break: multiple secrets + multiple canaries all report findings in both wrappers.
+        multi = {"secrets": f"{aws_key} {gh_key} {url_secret}", "canaries": f"{canary_a} {canary_b}"}
+        air_multi = scan_payload(multi, canary_tokens=(canary_a, canary_b))
+        gw_multi = scan_value(multi, gw_cfg)
+        self.assertEqual(
+            {f.rule_id for f in air_multi.findings if f.kind == "secret"},
+            {"aws-access-key", "github-token", "url-userinfo-password"},
+        )
+        self.assertEqual(
+            {f.rule_id for f in gw_multi.findings if f.kind == "secret"},
+            {"aws-access-key", "github-token", "url-userinfo-password"},
+        )
+        self.assertEqual(
+            {f.rule_id for f in air_multi.findings if f.kind == "canary"},
+            {"canary-0", "canary-1"},
+        )
+        self.assertEqual(
+            {f.rule_id for f in gw_multi.findings if f.kind == "canary"},
+            {"canary-0", "canary-1"},
+        )
+
+        # Punctuation skeleton + deep nesting > 64 + canary at depth 70 both caught through both wrappers.
+        skel = ";".join(canary_a.split("_"))
+        self.assertTrue(scan_payload({"s": skel}, canary_tokens=(canary_a,)).canary_matched)
+        self.assertTrue(scan_value({"s": skel}, gw_cfg).canary_matched)
+        self.assertTrue(scan_value((canary_a[:8], "gap", canary_a[8:]), gw_cfg).canary_matched)
+
+        deep_benign: JsonObject = {"leaf": "ok"}
+        deep_canary: JsonObject = {"leaf": canary_a}
+        for _ in range(70):
+            deep_benign = {"n": deep_benign}
+            deep_canary = {"n": deep_canary}
+        air_deep = scan_payload(deep_benign, canary_tokens=(canary_a,))
+        gw_deep = scan_value(deep_benign, gw_cfg)
+        self.assertFalse(air_deep.clean)
+        self.assertFalse(gw_deep.clean)
+        self.assertIn("nesting-too-deep", {f.rule_id for f in air_deep.findings})
+        self.assertIn("nesting-too-deep", {f.rule_id for f in gw_deep.findings})
+
+        air_deep_c = scan_payload(deep_canary, canary_tokens=(canary_a,))
+        gw_deep_c = scan_value(deep_canary, gw_cfg)
+        self.assertTrue(air_deep_c.canary_matched)
+        self.assertTrue(gw_deep_c.canary_matched)
+        self.assertIn("nesting-too-deep", {f.rule_id for f in air_deep_c.findings})
+        self.assertIn("nesting-too-deep", {f.rule_id for f in gw_deep_c.findings})
+
+        # High entropy stays off for gateway default & ledger redaction, and matches when enabled.
+        high_ent = "token=" + "aZ9$kL2mP8qR4vW7xN3bY5cQ"
+        self.assertTrue(scan_value({"v": high_ent}, gw_cfg).clean)
+        self.assertFalse(scan_value({"v": high_ent}, ScannerConfig(detect_high_entropy=True)).clean)
+        self.assertEqual(redact_core_secrets(high_ent), high_ent)
+        self.assertEqual(gateway_redact_text(high_ent), high_ent)
 
 
 class TestMigratedEgressAndWorkspaceGuards(unittest.TestCase):
