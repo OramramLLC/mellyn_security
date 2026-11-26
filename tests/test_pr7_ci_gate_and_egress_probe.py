@@ -18,8 +18,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-BACKEND_DIR = REPO_ROOT / "backend"
-for p in (BACKEND_DIR, SCRIPTS_DIR):
+SRC_DIR = REPO_ROOT / "src"
+for p in (SRC_DIR, SCRIPTS_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 

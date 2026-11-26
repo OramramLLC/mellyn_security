@@ -17,7 +17,7 @@ from typing import Any
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (REPO_ROOT, REPO_ROOT / "backend", REPO_ROOT / "src"):
+for _import_dir in (REPO_ROOT, REPO_ROOT / "src"):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 
@@ -38,7 +38,6 @@ from mellyn.pin_gateway import (  # noqa: E402
     upsert_server_in_unified_toml,
 )
 from mellyn.policy_loader import parse_policy_dict  # noqa: E402
-
 from tests.test_unified_engine import _FakeDownstream  # noqa: E402
 
 LINE_BREAK_CHARS = {"U+2028": " ", "U+2029": " ", "U+0085": "\u0085"}

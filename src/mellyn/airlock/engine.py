@@ -2,7 +2,7 @@
 Pure Airlock policy enforcement engine.
 
 Strict DAG & Invariants:
-  - Imports ONLY from `mcp_airlock.core` and `mcp_airlock.egress` (+ stdlib / pydantic).
+  - Imports ONLY from `mellyn.core` and `mellyn.egress` (+ stdlib / pydantic).
   - Performs no network, subprocess, stdout, or disk write I/O. Path checks call `Path.resolve(strict=False)`,
     which does read symlinks that already exist, so run the engine with the same filesystem view as the
     downstream server it guards.
@@ -24,7 +24,7 @@ from urllib.parse import unquote, urlparse
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.models import (
+from mellyn.airlock.models import (
     AirlockPolicy,
     JsonRpcErrorResponse,
     JsonRpcRequest,
@@ -33,7 +33,7 @@ from mcp_airlock.airlock.models import (
     ToolDefinition,
     ToolPolicyRule,
 )
-from mcp_airlock.core.normalize import (
+from mellyn.core.normalize import (
     JsonObject,
     JsonValue,
     canonical_json_bytes,
@@ -42,9 +42,9 @@ from mcp_airlock.core.normalize import (
     normalize_str,
     sha256_exact,
 )
-from mcp_airlock.core.schemas import RedactionRecord, Verdict
-from mcp_airlock.egress.guards import WorkspacePathGuard
-from mcp_airlock.egress.scanner import EgressScanResult, scan_payload
+from mellyn.core.schemas import RedactionRecord, Verdict
+from mellyn.egress.guards import WorkspacePathGuard
+from mellyn.egress.scanner import EgressScanResult, scan_payload
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _URI_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")

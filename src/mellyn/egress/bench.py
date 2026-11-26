@@ -4,7 +4,7 @@ Deterministic egress scanner benchmark runner (`mellyn-bench`).
 The corpus is a fixed set of regression cases (largely the scanner's own unit-test vectors). A PASS means no
 regressions and the latency numbers are real; it is not a measurement of precision or recall on real traffic.
 
-Strict DAG invariant: imports ONLY from `mcp_airlock.core` and `mcp_airlock.egress` (+ stdlib / pydantic).
+Strict DAG invariant: imports ONLY from `mellyn.core` and `mellyn.egress` (+ stdlib / pydantic).
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mcp_airlock.core.normalize import JsonValue, exact_json_bytes
-from mcp_airlock.egress.scanner import scan_payload
+from mellyn.core.normalize import JsonValue, exact_json_bytes
+from mellyn.egress.scanner import scan_payload
 
 BENCH_CANARY = "MELLYN_BENCH_CANARY_9944"
 
@@ -379,7 +379,7 @@ def render_benchmark_markdown(report: BenchmarkReport) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mellyn-bench",
-        description="Run deterministic accuracy and latency benchmarks for mcp_airlock.egress.scanner.",
+        description="Run deterministic accuracy and latency benchmarks for mellyn.egress.scanner.",
     )
     parser.add_argument("--iterations", type=int, default=10, help="Corpus repetitions for latency percentiles.")
     parser.add_argument("--json", action="store_true", help="Emit deterministic machine-readable JSON metrics.")

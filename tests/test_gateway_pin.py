@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-# Importable on its own, not only after another test file has put backend/ on sys.path.
+# Importable on its own, not only after another test file has put src/ on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (_REPO_ROOT / "backend", _REPO_ROOT / "src"):
+for _import_dir in (_REPO_ROOT / "src",):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 _HAS_PYDANTIC = importlib.util.find_spec("pydantic") is not None or os.environ.get("MELLYN_REQUIRE_API_TESTS") == "1"
@@ -391,7 +391,7 @@ tools_sha256 = "{alpha_pin}"
 
     def test_cli_routing_and_module_entrypoint_clean(self) -> None:
         # `mellyn pin --help` routes to Airlock pin_cli (`--output`), while `--name` routes to `pin_gateway`.
-        if _HAS_PYDANTIC:  # the Airlock pinner (mcp_airlock) needs pydantic
+        if _HAS_PYDANTIC:  # the Airlock pinner (mellyn.airlock) needs pydantic
             air_out = io.StringIO()
             with contextlib.redirect_stdout(air_out):
                 rc_air = cli_main(["pin", "--help"])
@@ -413,7 +413,7 @@ tools_sha256 = "{alpha_pin}"
             env={
                 **os.environ,
                 "PYTHONUTF8": "1",
-                "PYTHONPATH": os.pathsep.join(str(_REPO_ROOT / d) for d in ("backend", "src")),
+                "PYTHONPATH": str(_REPO_ROOT / "src"),
             },
             check=False,
         )

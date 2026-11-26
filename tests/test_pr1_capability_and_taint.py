@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-for _p in (REPO_ROOT, BACKEND_DIR):
+SRC_DIR = REPO_ROOT / "src"
+for _p in (REPO_ROOT, SRC_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -35,7 +35,6 @@ from mellyn.mcp_gateway import (  # noqa: E402
 )
 from mellyn.models import canonical_json  # noqa: E402
 from mellyn.policy import normalize_arg_value  # noqa: E402
-
 from tests.fakes import FakeDownstream  # noqa: E402
 
 

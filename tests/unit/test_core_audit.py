@@ -1,4 +1,4 @@
-"""Deterministic unit tests for `mcp_airlock.core.audit` tamper-evident JSONL ledger."""
+"""Deterministic unit tests for `mellyn.core.audit` tamper-evident JSONL ledger."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcp_airlock.core.audit import AuditLedger, verify_ledger
-from mcp_airlock.core.normalize import JsonObject, sha256_exact
-from mcp_airlock.core.schemas import GENESIS_PREV_HASH, ZoneEvent
+from mellyn.core.audit import AuditLedger, verify_ledger
+from mellyn.core.normalize import JsonObject, sha256_exact
+from mellyn.core.schemas import GENESIS_PREV_HASH, ZoneEvent
 
 
 def _make_event(

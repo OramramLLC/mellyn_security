@@ -8,11 +8,11 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# Ensure backend/ is importable when running `python -m unittest discover -s tests`
+# Ensure src/ is importable when running `python -m unittest discover -s tests`
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from mellyn import (  # noqa: E402
     Authorizer,
@@ -169,7 +169,7 @@ class TestWorkspaceBoundaries(AuthorizerTestCase):
             ".git/config",
             "AGENTS.md",
             ".gitattributes",
-            # This repository's own security core (backend/mellyn/, scripts/, tests/, ...) is protected by
+            # This repository's own security core (src/mellyn/, scripts/, tests/, ...) is protected by
             # config/mellyn-self-policy.toml, not by the built-in list; see test_pr2_runtime_and_scanners.py.
             # Case variants, which reach the same file on Windows and macOS
             "claude.md",

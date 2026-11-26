@@ -11,9 +11,9 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env, legacy_env_names  # noqa: E402
 from mellyn.mcp_gateway import downstream_environment  # noqa: E402
@@ -111,8 +111,10 @@ class TestUnifiedMellynIdentityAndDocs(unittest.TestCase):
             "Aegis" + "AI",
             "aegis-ai" + "-security",
         )
-        self.assertFalse((REPO_ROOT / "backend" / ("aegis" + "_ai")).exists())
-        self.assertTrue((REPO_ROOT / "backend" / "mellyn").is_dir())
+        self.assertFalse((REPO_ROOT / "backend").exists())
+        self.assertFalse((REPO_ROOT / "src" / "mcp_airlock").exists())
+        self.assertFalse((REPO_ROOT / "src" / ("aegis" + "_ai")).exists())
+        self.assertTrue((REPO_ROOT / "src" / "mellyn").is_dir())
 
         for path in repository_files():
             try:

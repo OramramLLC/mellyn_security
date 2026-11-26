@@ -33,24 +33,22 @@ dev = [
 
 [project.scripts]
 mellyn = "mellyn.cli:main"
-mellyn-airlock = "mcp_airlock.airlock.proxy:main"
-mellyn-pin = "mcp_airlock.airlock.pin_cli:main"
-mellyn-ir = "mcp_airlock.ir_lab.reconstruct:main"
-mellyn-bench = "mcp_airlock.egress.bench:main"
+mellyn-airlock = "mellyn.airlock.proxy:main"
+mellyn-pin = "mellyn.airlock.pin_cli:main"
+mellyn-ir = "mellyn.ir_lab.reconstruct:main"
+mellyn-bench = "mellyn.egress.bench:main"
 
 [tool.setuptools]
 packages = [
-    "mcp_airlock",
-    "mcp_airlock.core",
-    "mcp_airlock.egress",
-    "mcp_airlock.airlock",
-    "mcp_airlock.ir_lab",
     "mellyn",
+    "mellyn.core",
+    "mellyn.egress",
+    "mellyn.airlock",
+    "mellyn.ir_lab",
 ]
 
 [tool.setuptools.package-dir]
-mcp_airlock = "src/mcp_airlock"
-mellyn = "backend/mellyn"
+"" = "src"
 
 [tool.ruff]
 line-length = 120
@@ -70,4 +68,4 @@ warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["backend", "scripts", "src"]
+pythonpath = ["scripts", "src"]

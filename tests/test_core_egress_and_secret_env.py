@@ -20,7 +20,7 @@ from typing import Any
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (REPO_ROOT, REPO_ROOT / "backend", REPO_ROOT / "src"):
+for _import_dir in (REPO_ROOT, REPO_ROOT / "src"):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 

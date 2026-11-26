@@ -27,14 +27,14 @@ from unittest import mock
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import evaluate_tool_call
-from mcp_airlock.airlock.models import JsonRpcRequest, ToolCallParams, parse_airlock_policy_toml
-from mcp_airlock.airlock.pin_cli import inspect_mcp_server
-from mcp_airlock.airlock.proxy import AAD_EXIT_CODE, AirlockProxy, BoundedLineReader, BoundedStdinReader
-from mcp_airlock.core.audit import AuditLedger, verify_ledger, verify_ledger_bytes
-from mcp_airlock.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, ZoneEvent
-from mcp_airlock.egress import bench
-from mcp_airlock.ir_lab.reconstruct import reconstruct_incident, render_markdown
+from mellyn.airlock.engine import evaluate_tool_call
+from mellyn.airlock.models import JsonRpcRequest, ToolCallParams, parse_airlock_policy_toml
+from mellyn.airlock.pin_cli import inspect_mcp_server
+from mellyn.airlock.proxy import AAD_EXIT_CODE, AirlockProxy, BoundedLineReader, BoundedStdinReader
+from mellyn.core.audit import AuditLedger, verify_ledger, verify_ledger_bytes
+from mellyn.core.schemas import AAD_CONTAINMENT_CONFIRMED_RULE_ID, ZoneEvent
+from mellyn.egress import bench
+from mellyn.ir_lab.reconstruct import reconstruct_incident, render_markdown
 
 from .test_proxy_aad import CANARY, HOSTILE_SERVER, REPO_ROOT, ProxyHarness, _pid_is_alive
 
@@ -176,7 +176,7 @@ class TestDownstreamCannotOutliveTheProxy(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "mcp_airlock.airlock.proxy",
+                "mellyn.airlock.proxy",
                 "--policy",
                 str(policy),
                 "--audit-log",
@@ -231,7 +231,7 @@ class TestPinPaginatedServer(ProxyHarness):
     async def test_policy_from_a_paginated_server_works_in_the_proxy(self) -> None:
         inspection = await inspect_mcp_server([sys.executable, str(HOSTILE_SERVER), "--mode", "paginate"])
         self.assertTrue(inspection.paginated)
-        from mcp_airlock.airlock.pin_cli import render_starter_policy_toml
+        from mellyn.airlock.pin_cli import render_starter_policy_toml
 
         text = render_starter_policy_toml(inspection)
         self.assertNotIn("manifest_sha256", tomllib.loads(text))
@@ -478,7 +478,7 @@ class TestBenchAndTimeouts(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "mcp_airlock.airlock.proxy",
+                "mellyn.airlock.proxy",
                 "--policy",
                 "p",
                 "--audit-log",

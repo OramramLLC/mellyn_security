@@ -15,7 +15,7 @@ from typing import Any
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (REPO_ROOT, REPO_ROOT / "backend", REPO_ROOT / "src"):
+for _import_dir in (REPO_ROOT, REPO_ROOT / "src"):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 
@@ -29,7 +29,6 @@ from mellyn.mcp_gateway import (  # noqa: E402
 )
 from mellyn.scanner import ScannerConfig, canary_present_in_text, scan_value  # noqa: E402
 from mellyn.unified_config import load_policy_any, parse_unified_dict, render_unified_config  # noqa: E402
-
 from tests.test_unified_engine import _FakeDownstream  # noqa: E402
 
 HAS_PYDANTIC = importlib.util.find_spec("pydantic") is not None or os.environ.get("MELLYN_REQUIRE_API_TESTS") == "1"
@@ -245,12 +244,12 @@ class TestUnifiedConfigLoadsInTheAuthorizer(unittest.TestCase):
                 self.assertIsNotNone(create_app_from_env())
 
 
-@unittest.skipUnless(HAS_PYDANTIC, "comparing against mcp_airlock needs pydantic")
+@unittest.skipUnless(HAS_PYDANTIC, "comparing against mellyn.core.audit needs pydantic")
 class TestScannerParityWithAirlock(unittest.TestCase):
     """The gateway scanner is a port of the Airlock's detection. Until they share one copy, keep them in step."""
 
     def test_both_scanners_agree_on_every_encoding_and_split(self) -> None:
-        from mcp_airlock.core.audit import canary_present, canary_present_in_json
+        from mellyn.core.audit import canary_present, canary_present_in_json
 
         canary = "MELLYN-" + secrets.token_urlsafe(16)
         raw = canary.encode()

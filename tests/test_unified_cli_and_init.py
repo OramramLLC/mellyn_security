@@ -14,9 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
 SRC_DIR = REPO_ROOT / "src"
-for _p in (BACKEND_DIR, SRC_DIR):
+for _p in (SRC_DIR,):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -38,6 +37,8 @@ from mellyn.cli import MELLYN_VERSION  # noqa: E402
 from mellyn.cli import main as mellyn_cli_main  # noqa: E402
 from mellyn.egress import EgressValidator as GatewayEgressValidator  # noqa: E402
 from mellyn.egress import WorkspacePathGuard as GatewayPathGuard  # noqa: E402
+from mellyn.egress.guards import EgressValidator as AirlockEgressValidator  # noqa: E402
+from mellyn.egress.guards import WorkspacePathGuard as AirlockPathGuard  # noqa: E402
 from mellyn.egress_proxy import generate_squid_config  # noqa: E402
 from mellyn.gateway_config import SERVER_NAME, load_gateway_config  # noqa: E402
 from mellyn.init_cmd import (  # noqa: E402
@@ -50,9 +51,6 @@ from mellyn.init_cmd import (  # noqa: E402
 )
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError  # noqa: E402
 from mellyn.policy import validate_argv  # noqa: E402
-
-from mcp_airlock.egress.guards import EgressValidator as AirlockEgressValidator  # noqa: E402
-from mcp_airlock.egress.guards import WorkspacePathGuard as AirlockPathGuard  # noqa: E402
 
 
 class TestSmbPresets(unittest.TestCase):
@@ -379,12 +377,15 @@ class TestUnifiedCli(unittest.TestCase):
         self.assertIn("Unknown mellyn subcommand", err.getvalue())
 
     def test_optional_airlock_commands_fail_cleanly_when_package_absent(self) -> None:
-        with mock.patch("mellyn.cli.importlib.import_module", side_effect=ModuleNotFoundError("mcp_airlock")):
+        with mock.patch(
+            "mellyn.cli.importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'pydantic'", name="pydantic"),
+        ):
             for subcmd in ("airlock", "pin", "verify", "bench"):
                 err = io.StringIO()
                 with self.subTest(subcmd=subcmd), contextlib.redirect_stderr(err):
                     self.assertEqual(mellyn_cli_main([subcmd, "--help"]), 2)
-                self.assertIn("mcp_airlock", err.getvalue())
+                self.assertIn("pydantic", err.getvalue())
 
 
 class TestGuardParity(unittest.TestCase):

@@ -18,7 +18,7 @@ with a password hash, and compared with hmac.compare_digest. Configuration comes
     MELLYN_APPROVER_KEY_DIGEST   hex HMAC-SHA256 digest of the approver key
     MELLYN_VIEWER_KEY_DIGEST     hex HMAC-SHA256 digest of the read-only viewer key (viewer server only)
 
-Generate a key and its digest (with MELLYN_API_KEY_PEPPER set in the environment) by running, from backend/:
+Generate a key and its digest (with MELLYN_API_KEY_PEPPER set in the environment) by running with PYTHONPATH=src:
 
     python -m mellyn.credentials
 """

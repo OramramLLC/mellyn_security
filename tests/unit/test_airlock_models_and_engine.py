@@ -1,5 +1,5 @@
 """
-Deterministic unit tests for `mcp_airlock.airlock.models` and `mcp_airlock.airlock.engine`.
+Deterministic unit tests for `mellyn.airlock.models` and `mellyn.airlock.engine`.
 
 Validates TOML policy parsing (stdlib `tomllib`), strict JSON-RPC 2.0 frame discrimination,
 AgBOM pinning with invisible Unicode tag injection detection, lexical path traversal
@@ -14,14 +14,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import (
+from mellyn.airlock.engine import (
     compute_manifest_pin,
     compute_tool_pin,
     evaluate_tool_call,
     evaluate_tool_response,
     verify_tools_list,
 )
-from mcp_airlock.airlock.models import (
+from mellyn.airlock.models import (
     AirlockPolicy,
     JsonRpcErrorResponse,
     JsonRpcNotification,

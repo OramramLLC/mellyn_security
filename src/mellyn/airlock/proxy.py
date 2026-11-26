@@ -2,7 +2,7 @@
 Async fail-closed MCP stdio proxy with Automatic Activation Device (AAD) containment kill switch.
 
 Architectural invariants (per AGENTS.md):
-  - Imports ONLY from `mcp_airlock.core`, `mcp_airlock.egress`, and `mcp_airlock.airlock.{engine,models}`.
+  - Imports ONLY from `mellyn.core`, `mellyn.egress`, and `mellyn.airlock.{engine,models}`.
   - Stdio wire purity: NEVER writes logs, warnings, or tracebacks to `sys.stdout`. All diagnostics and sanitized
     downstream `stderr` lines go exclusively to `err_stream` (default `sys.stderr`) or `core.audit.AuditLedger`.
   - Subprocess isolation: spawns downstream MCP server via `asyncio.create_subprocess_exec(..., start_new_session=True)`
@@ -47,7 +47,7 @@ from typing import BinaryIO, Literal, Protocol, TextIO, cast
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import (
+from mellyn.airlock.engine import (
     MAX_OPAQUE_TOKEN_CHARS,
     compute_instructions_pin,
     evaluate_resource_read,
@@ -58,7 +58,7 @@ from mcp_airlock.airlock.engine import (
     scan_rpc_id,
     verify_tools_list,
 )
-from mcp_airlock.airlock.models import (
+from mellyn.airlock.models import (
     AirlockPolicy,
     JsonRpcErrorResponse,
     JsonRpcNotification,
@@ -68,9 +68,9 @@ from mcp_airlock.airlock.models import (
     parse_airlock_policy_toml,
     parse_jsonrpc_bytes,
 )
-from mcp_airlock.core.audit import AuditLedger, redact_core_secrets
-from mcp_airlock.core.normalize import JsonObject, JsonValue, exact_json_bytes, has_invisible_unicode, strip_invisible
-from mcp_airlock.core.schemas import (
+from mellyn.core.audit import AuditLedger, redact_core_secrets
+from mellyn.core.normalize import JsonObject, JsonValue, exact_json_bytes, has_invisible_unicode, strip_invisible
+from mellyn.core.schemas import (
     AAD_CONTAINMENT_CONFIRMED_RULE_ID,
     SESSION_STARTED_RULE_ID,
     RedactionRecord,
@@ -78,7 +78,7 @@ from mcp_airlock.core.schemas import (
     Verdict,
     ZoneEvent,
 )
-from mcp_airlock.egress.scanner import scan_payload
+from mellyn.egress.scanner import scan_payload
 
 AAD_EXIT_CODE = 78
 INTERNAL_FAULT_EXIT_CODE = 70  # EX_SOFTWARE: a proxy task raised; the session was shut down fail-closed

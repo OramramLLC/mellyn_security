@@ -12,9 +12,9 @@ import secrets
 from typing import Any
 from unittest import mock
 
-from mcp_airlock.airlock.engine import compute_instructions_pin
-from mcp_airlock.airlock.models import AirlockPolicy
-from mcp_airlock.airlock.proxy import (
+from mellyn.airlock.engine import compute_instructions_pin
+from mellyn.airlock.models import AirlockPolicy
+from mellyn.airlock.proxy import (
     AAD_EXIT_CODE,
     INTERNAL_FAULT_EXIT_CODE,
     JSONRPC_INTERNAL_ERROR,
@@ -23,7 +23,7 @@ from mcp_airlock.airlock.proxy import (
     JSONRPC_POLICY_VIOLATION,
     JSONRPC_REQUEST_TIMEOUT,
 )
-from mcp_airlock.core.schemas import ZoneEvent
+from mellyn.core.schemas import ZoneEvent
 
 from .test_proxy_aad import ProxyHarness, _pid_is_alive
 

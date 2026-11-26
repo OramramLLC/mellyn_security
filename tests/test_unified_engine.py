@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-# Make the module importable on its own, not only after another test file has put backend/ on sys.path.
+# Make the module importable on its own, not only after another test file has put src/ on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (_REPO_ROOT / "backend", _REPO_ROOT / "src"):
+for _import_dir in (_REPO_ROOT / "src",):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 
@@ -266,7 +266,7 @@ class TestGatewayHashChainedAudit(unittest.TestCase):
 
     @unittest.skipUnless(
         importlib.util.find_spec("pydantic") is not None or os.environ.get("MELLYN_REQUIRE_API_TESTS") == "1",
-        "verifying an Airlock ledger needs mcp_airlock, which needs pydantic",
+        "verifying an Airlock ledger needs mellyn.core.audit, which needs pydantic",
     )
     def test_cli_verify_routes_gateway_and_airlock_ledgers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

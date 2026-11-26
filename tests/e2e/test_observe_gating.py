@@ -20,12 +20,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import evaluate_tool_response
-from mcp_airlock.airlock.models import AirlockPolicy, JsonRpcSuccessResponse, parse_airlock_policy_toml
-from mcp_airlock.airlock.proxy import AirlockProxy
-from mcp_airlock.core.audit import AuditLedger
-from mcp_airlock.core.schemas import SESSION_STARTED_RULE_ID
-from mcp_airlock.ir_lab.reconstruct import reconstruct_incident, render_markdown
+from mellyn.airlock.engine import evaluate_tool_response
+from mellyn.airlock.models import AirlockPolicy, JsonRpcSuccessResponse, parse_airlock_policy_toml
+from mellyn.airlock.proxy import AirlockProxy
+from mellyn.core.audit import AuditLedger
+from mellyn.core.schemas import SESSION_STARTED_RULE_ID
+from mellyn.ir_lab.reconstruct import reconstruct_incident, render_markdown
 
 from .test_proxy_aad import CANARY, HOSTILE_SERVER, REPO_ROOT, ProxyHarness, _QueueClientWriter
 
@@ -63,7 +63,7 @@ class TestObserveModeNeedsPolicyConsent(ProxyHarness):
                 [
                     sys.executable,
                     "-m",
-                    "mcp_airlock.airlock.proxy",
+                    "mellyn.airlock.proxy",
                     "--policy",
                     str(policy),
                     "--audit-log",

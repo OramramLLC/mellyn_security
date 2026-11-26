@@ -29,7 +29,6 @@ allowed_egress_domains = [
 #   protected_paths = ["infra/", "migrations/", "src/auth/"]
 # The gateway also protects its own config, this policy and its audit log when they sit in the workspace.
 protected_paths = [
-    "backend/mellyn/",
     "src/",
     "scripts/",
     "tests/",

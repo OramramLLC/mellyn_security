@@ -27,6 +27,5 @@
 /deploy/                    @OramramLLC
 /Dockerfile                 @OramramLLC
 /.dockerignore              @OramramLLC
-/backend/mellyn/          @OramramLLC
 /src/                       @OramramLLC
 /tests/                     @OramramLLC

@@ -1,10 +1,10 @@
 # CLAUDE.md — Project Context & OWASP AI Security Guardrails
 
 ## Project Overview
-This repository houses **Mellyn Security**, the core MCP runtime security engine:
+This repository houses **Mellyn Security**, the core MCP runtime security engine (`src/mellyn/`):
 
-- **MCP Airlock (`src/mcp_airlock/`)**: zero-dependency (`pydantic`-only) stdio containment proxy (`mellyn-airlock`), quarantined AgBOM manifest/instructions pinner (`mellyn-pin`), scanner benchmark (`mellyn-bench`), and cryptographic incident reconstructor (`mellyn-ir`).
-- **Runtime Authorization Engine & Multi-Server Gateway (`backend/mellyn/`)**: server-issued sessions, cross-server taint tracking, capability bindings, exact-arg/`argv` rules, durable SQLite session/grant persistence, Streamable HTTP downstream transport with OAuth 2.1, loopback exact-call approvals, hash-chained audit ledger (`mellyn verify`), and optional Docker + Squid egress stack (`deploy/`).
+- **MCP Airlock (`src/mellyn/airlock/`, `core/`, `egress/`, `ir_lab/`)**: stdio containment proxy (`mellyn-airlock`), quarantined AgBOM manifest/instructions pinner (`mellyn-pin`), scanner benchmark (`mellyn-bench`), and cryptographic incident reconstructor (`mellyn-ir`).
+- **Runtime Authorization Engine & Multi-Server Gateway (`src/mellyn/`)**: server-issued sessions, cross-server taint tracking, capability bindings, exact-arg/`argv` rules, durable SQLite session/grant persistence, Streamable HTTP downstream transport with OAuth 2.1, loopback exact-call approvals, hash-chained audit ledger (`mellyn verify`), and optional Docker + Squid egress stack (`deploy/`).
 - **Sibling repositories**: `OramramLLC/mellyn-guardrails` (AI coding rules, SAST/secret configs, supply-chain verifier, pre-commit pack, and reusable CI gate consumed here by commit SHA) and `mellyn-redteam` (adversarial red-team harness and OWASP/ATLAS conformance suite; Plane 4 Console, PR #29, and PR #30 are parked at `archive/v1-monolith-full`).
 
 ## Essential Commands

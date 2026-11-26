@@ -13,7 +13,7 @@ FROM python:3.12.15-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/backend \
+    PYTHONPATH=/app/src \
     MELLYN_POLICY_PATH=/etc/mellyn/policy.toml \
     MELLYN_WORKSPACE_ROOT=/workspace \
     MELLYN_REQUIRE_WORKSPACE_MOUNT=1 \
@@ -39,7 +39,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check --require-h
         -r /tmp/requirements.lock \
     && rm /tmp/requirements.lock
 
-COPY --chown=root:root backend/ /app/backend/
+COPY --chown=root:root src/ /app/src/
 
 USER mellyn
 

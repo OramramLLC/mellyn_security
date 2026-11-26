@@ -3,7 +3,7 @@ Deterministic egress content scanner for planted canary tokens, known API/bearer
 high-entropy secret candidates, and policy-defined blocked patterns.
 
 Architectural invariants:
-  - Imports ONLY from `mcp_airlock.core` (+ stdlib / pydantic).
+  - Imports ONLY from `mellyn.core` (+ stdlib / pydantic).
   - Always computes `artifact_sha256` on the unredacted payload first via `sha256_exact()`.
   - Returns structured `RedactionRecord` hashes and `redacted_payload`; never leaks raw matches.
 """
@@ -18,14 +18,14 @@ from urllib.parse import unquote
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mcp_airlock.core.audit import (
+from mellyn.core.audit import (
     canary_present_in_json,
     redact_canary_in_text,
     redact_encoded_secret_tokens,
     unescape_text,
 )
-from mcp_airlock.core.normalize import JsonValue, normalize_str, sha256_exact
-from mcp_airlock.core.schemas import RedactionRecord
+from mellyn.core.normalize import JsonValue, normalize_str, sha256_exact
+from mellyn.core.schemas import RedactionRecord
 
 KNOWN_SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (

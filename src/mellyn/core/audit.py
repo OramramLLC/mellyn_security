@@ -28,7 +28,7 @@ from urllib.parse import unquote
 
 from pydantic import ValidationError
 
-from mcp_airlock.core.normalize import (
+from mellyn.core.normalize import (
     JsonObject,
     JsonValue,
     canonical_json_bytes,
@@ -37,7 +37,7 @@ from mcp_airlock.core.normalize import (
     sha256_canonical,
     sha256_exact,
 )
-from mcp_airlock.core.schemas import (
+from mellyn.core.schemas import (
     GENESIS_PREV_HASH,
     AuditLedgerEntry,
     LedgerVerification,

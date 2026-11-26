@@ -14,29 +14,28 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from mcp_airlock.airlock.models import parse_airlock_policy_toml
+from mellyn.airlock.models import parse_airlock_policy_toml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 HOSTILE_SERVER = REPO_ROOT / "tests" / "fixtures" / "hostile_mcp_server.py"
-IR_LAB_DIR = SRC_DIR / "mcp_airlock" / "ir_lab"
+IR_LAB_DIR = SRC_DIR / "mellyn" / "ir_lab"
 
 CLI_MODULES: dict[str, str] = {
     "mellyn": "mellyn.cli",
-    "mellyn-airlock": "mcp_airlock.airlock.proxy",
-    "mellyn-pin": "mcp_airlock.airlock.pin_cli",
-    "mellyn-ir": "mcp_airlock.ir_lab.reconstruct",
-    "mellyn-bench": "mcp_airlock.egress.bench",
+    "mellyn-airlock": "mellyn.airlock.proxy",
+    "mellyn-pin": "mellyn.airlock.pin_cli",
+    "mellyn-ir": "mellyn.ir_lab.reconstruct",
+    "mellyn-bench": "mellyn.egress.bench",
 }
 
 
 def _subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
     existing = env.get("PYTHONPATH", "")
-    roots = f"{SRC_DIR}{os.pathsep}{BACKEND_DIR}"
+    roots = str(SRC_DIR)
     env["PYTHONPATH"] = f"{roots}{os.pathsep}{existing}" if existing else roots
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -351,14 +350,20 @@ class TestFullKillChainLifecycle(unittest.TestCase):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         parts = alias.name.split(".")
-                        if len(parts) >= 2 and parts[0] == "mcp_airlock":
+                        if parts[0] == "mellyn":
+                            self.assertGreaterEqual(
+                                len(parts), 2, f"Invalid top-level import {alias.name} in {py_file.name}"
+                            )
                             self.assertIn(
                                 parts[1], {"core", "ir_lab"}, f"Invalid import {alias.name} in {py_file.name}"
                             )
                 elif isinstance(node, ast.ImportFrom):
                     self.assertEqual(node.level, 0, f"Relative import forbidden in {py_file.name}")
                     parts = (node.module or "").split(".")
-                    if len(parts) >= 2 and parts[0] == "mcp_airlock":
+                    if parts[0] == "mellyn":
+                        self.assertGreaterEqual(
+                            len(parts), 2, f"Invalid top-level import {node.module} in {py_file.name}"
+                        )
                         self.assertIn(parts[1], {"core", "ir_lab"}, f"Invalid import {node.module} in {py_file.name}")
 
 

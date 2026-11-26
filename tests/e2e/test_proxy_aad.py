@@ -1,4 +1,4 @@
-"""Real subprocess end-to-end tests for `mcp_airlock.airlock.proxy` and the AAD containment kill switch."""
+"""Real subprocess end-to-end tests for `mellyn.airlock.proxy` and the AAD containment kill switch."""
 
 from __future__ import annotations
 
@@ -13,17 +13,17 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from mcp_airlock.airlock.engine import compute_tool_pin
-from mcp_airlock.airlock.models import AirlockPolicy, ToolDefinition
-from mcp_airlock.airlock.proxy import (
+from mellyn.airlock.engine import compute_tool_pin
+from mellyn.airlock.models import AirlockPolicy, ToolDefinition
+from mellyn.airlock.proxy import (
     AAD_EXIT_CODE,
     JSONRPC_AAD_CONTAINMENT_SEVERED,
     JSONRPC_POLICY_VIOLATION,
     JSONRPC_REQUEST_TIMEOUT,
     AirlockProxy,
 )
-from mcp_airlock.core.audit import AuditLedger, verify_ledger
-from mcp_airlock.core.normalize import JsonObject
+from mellyn.core.audit import AuditLedger, verify_ledger
+from mellyn.core.normalize import JsonObject
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOSTILE_SERVER = REPO_ROOT / "tests" / "fixtures" / "hostile_mcp_server.py"

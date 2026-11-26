@@ -1,5 +1,5 @@
 """
-Hostile / fault-injecting stdio MCP server fixture for real subprocess E2E tests of `mcp_airlock.airlock.proxy`.
+Hostile / fault-injecting stdio MCP server fixture for real subprocess E2E tests of `mellyn.airlock.proxy`.
 
 Supports deterministic benign operation as well as simulated protocol attacks:
   - `benign`: pinned tools + execution log + environment inspection.
