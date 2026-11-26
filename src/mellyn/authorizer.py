@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from urllib.request import url2pathname
 
 from mellyn.audit import MAX_TAINT_ENTRY_CHARS, AuditLogger, format_taint_entry, hash_untrusted_identifier, redact_text
 from mellyn.egress import _CONTROL_CHARACTERS, EgressValidator, WorkspacePathGuard
+from mellyn.egress.guards import OwnedFile, owned_file_entries
 from mellyn.models import (
     ApprovalGrant,
     AuthorizationResult,
@@ -43,6 +45,12 @@ MAX_GRANT_USES = 100
 DEFAULT_SESSION_TTL_SECONDS = 86400
 DEFAULT_MAX_SESSIONS = 10_000
 DEFAULT_MAX_TAINT_SAMPLE = 16
+
+
+def _declared_owned_files(component: object) -> tuple[OwnedFile, ...]:
+    """A component's own `owned_files()`; one without the method (an in-memory store) owns none."""
+    declare = getattr(component, "owned_files", None)
+    return tuple(declare()) if callable(declare) else ()
 
 
 class Authorizer:
@@ -78,7 +86,12 @@ class Authorizer:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         max_taint_sample: int = DEFAULT_MAX_TAINT_SAMPLE,
         state_store: AuthorizerStateStore | None = None,
+        owned_files: Sequence[OwnedFile] = (),
     ) -> None:
+        """
+        `owned_files` names the entry point's own files (its config and policy), which the agent must not edit.
+        The audit logger's and state store's files are added here from their own `owned_files()`.
+        """
         # session_ttl_seconds=None: sessions never expire (the stdio gateway's single session lives as long
         # as the process, so an idle client is not locked out after a day).
         if session_ttl_seconds is not None and session_ttl_seconds <= 0:
@@ -89,7 +102,6 @@ class Authorizer:
             raise ValueError("max_taint_sample must be positive.")
         self.policy = PolicyEngine(policy_config)
         self.egress = EgressValidator(self.policy.config.allowed_egress_domains)
-        self.path_guard = WorkspacePathGuard(workspace_root, self.policy.config.protected_paths)
         self.audit = audit_logger or AuditLogger()
         self.session_ttl_seconds = session_ttl_seconds
         self.max_sessions = max_sessions
@@ -97,6 +109,14 @@ class Authorizer:
         # FastAPI runs sync handlers in a thread pool; one lock keeps taint and grant use atomic.
         self._lock = threading.Lock()
         self._state: AuthorizerStateStore = state_store if state_store is not None else InMemoryStateStore()
+        # The agent must never be able to edit the files that configure or record its own enforcement: an
+        # approved write could otherwise rewrite the policy, truncate the ledger, plant a directory at the
+        # ledger's lock path (every restart then fails) or reset taint in the state database.
+        own = (*owned_files, *_declared_owned_files(self.audit), *_declared_owned_files(self._state))
+        self.path_guard = WorkspacePathGuard(
+            workspace_root,
+            (*self.policy.config.protected_paths, *owned_file_entries(workspace_root, own)),
+        )
 
     @property
     def _grants(self) -> dict[str, ApprovalGrant]:

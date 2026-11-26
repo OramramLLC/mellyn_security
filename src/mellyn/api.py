@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tomllib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -18,6 +18,7 @@ from mellyn.audit import AuditLogger
 from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer, SessionLimitError
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import check_workspace_root
+from mellyn.egress.guards import OwnedFile
 from mellyn.legacy_env import check_no_legacy_env
 from mellyn.models import RiskSignals, TaintSource, ToolCallRequest, canonical_json
 from mellyn.policy import PolicyConfig
@@ -78,6 +79,7 @@ def create_app(
     audit_logger: AuditLogger | None = None,
     state_store: AuthorizerStateStore | None = None,
     *,
+    owned_files: Sequence[OwnedFile] = (),
     _owned_sink: IO[str] | None = None,
     _owned_state_store: AuthorizerStateStore | None = None,
 ) -> FastAPI:
@@ -86,6 +88,9 @@ def create_app(
 
     Credentials come from the environment unless passed in. If they are missing or malformed the app
     still starts, but every route except /healthz answers 503 (fail closed).
+
+    `owned_files` names the service's own files (its policy) for the path guard to protect; the Authorizer adds
+    the audit ledger's and state database's files itself.
     """
 
     @asynccontextmanager
@@ -106,6 +111,7 @@ def create_app(
         policy_config=policy_config,
         audit_logger=audit_logger,
         state_store=state_store,
+        owned_files=owned_files,
     )
 
     @app.exception_handler(StateStoreError)
@@ -279,6 +285,9 @@ def create_app_from_env() -> FastAPI:
             policy_config=policy_config,
             audit_logger=audit_logger,
             state_store=state_store,
+            # The agent must not edit the policy it runs under. The Authorizer adds the ledger and state database;
+            # before this the service protected none of its own files.
+            owned_files=((Path(policy_path_raw), ("",)),) if policy_path_raw else (),
             _owned_sink=sink,
             _owned_state_store=state_store,
         )

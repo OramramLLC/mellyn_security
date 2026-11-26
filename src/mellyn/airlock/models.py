@@ -14,9 +14,11 @@ import json
 import math
 import re
 import tomllib
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from mellyn.core.normalize import JsonObject, JsonValue
 
@@ -310,6 +312,19 @@ class AirlockPolicy(_StrictAirlockModel):
     # `--mode observe` forwards every policy violation (it only records them), so the reviewed policy must opt in
     # as well as the launch arguments: editing an MCP client's launch command alone cannot switch enforcement off.
     allow_observe_mode: bool = False
+    # Set at startup by `with_owned_files`, never read from the TOML: the policy file and audit ledger the proxy
+    # runs with, as `(path, suffixes)` pairs for `mellyn.egress.guards.owned_file_entries`.
+    _owned_files: tuple[tuple[Path, tuple[str, ...]], ...] = PrivateAttr(default=())
+
+    @property
+    def owned_files(self) -> tuple[tuple[Path, tuple[str, ...]], ...]:
+        return self._owned_files
+
+    def with_owned_files(self, files: Iterable[tuple[Path, tuple[str, ...]]]) -> AirlockPolicy:
+        """A copy whose path checks also refuse writes to `files` (the proxy's own policy file and audit ledger)."""
+        copy = self.model_copy()
+        copy._owned_files = (*self._owned_files, *files)
+        return copy
 
     @model_validator(mode="after")
     def _tool_rule_keys_match_names(self) -> AirlockPolicy:
