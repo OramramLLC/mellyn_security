@@ -20,8 +20,8 @@ from typing import Any
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-for p in (REPO_ROOT, BACKEND_DIR):
+SRC_DIR = REPO_ROOT / "src"
+for p in (REPO_ROOT, SRC_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -45,7 +45,6 @@ from mellyn.mcp_gateway import (  # noqa: E402
     run_stdio_proxy,
 )
 from mellyn.models import canonical_json, canonical_json_value  # noqa: E402
-
 from tests.fakes import FakeDownstream  # noqa: E402
 
 

@@ -7,6 +7,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Changed
+- **Breaking: one `mellyn` package (Phase 2, Pass 2A).** The Airlock package (`src/mcp_airlock/`) and the runtime
+  (`backend/mellyn/`) are now one package under `src/mellyn/`. `backend/` and `src/mcp_airlock/` are gone.
+  - **Imports:** `mcp_airlock.core`, `.egress`, `.airlock` and `.ir_lab` are now `mellyn.core`, `mellyn.egress`,
+    `mellyn.airlock` and `mellyn.ir_lab`; the runtime modules keep their `mellyn.*` names. `import mcp_airlock` and
+    `mcp_airlock.__version__` no longer work (use `mellyn version` or
+    `importlib.metadata.version("mellyn-security")`). The console scripts keep their names.
+  - **One path and URL guard:** the Airlock now uses the authorizer's `WorkspacePathGuard` and `EgressValidator`
+    (`mellyn.egress.guards`). The protected paths are unchanged, but non-string paths and URLs are now refused, and
+    the refusal messages changed.
+  - **Dependencies are unchanged:** the Airlock commands need only `pydantic`, and the gateway and `import mellyn`
+    need nothing beyond the standard library (`mellyn.egress` loads the scanner, and so `pydantic`, only on first
+    use).
+  - **Deployments:** the image now copies `src/` and sets `PYTHONPATH=/app/src`, so it also contains the Airlock
+    code. Local checkouts installed with `pip install -e .` must reinstall, because the old editable install points
+    at the deleted folders.
 - **Hash-chained audit logs.** The authorizer's and gateway's audit logs are now hash-chained JSONL, verified before
   every append. On upgrade, an existing log in the old unchained format is moved aside, unchanged, as
   `<name>.pre-chain-<UTC time>`, and a new chain starts with a `ledger_rotated` record. A log that is partly chained

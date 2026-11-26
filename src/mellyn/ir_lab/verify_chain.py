@@ -1,7 +1,7 @@
 """
-Cryptographic ledger verifier for `audit.jsonl` inside `mcp_airlock.ir_lab`.
+Cryptographic ledger verifier for `audit.jsonl` inside `mellyn.ir_lab`.
 
-Strict DAG invariant: imports ONLY from `mcp_airlock.core` (+ stdlib / pydantic).
+Strict DAG invariant: imports ONLY from `mellyn.core` (+ stdlib / pydantic).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mcp_airlock.core.audit import LedgerAnchor, verify_ledger_bytes
+from mellyn.core.audit import LedgerAnchor, verify_ledger_bytes
 
 
 class ChainVerificationReport(BaseModel):

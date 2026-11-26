@@ -2,10 +2,10 @@
 
 **Mellyn Security** is a fail-closed runtime security runtime for Model Context Protocol (MCP) tool ecosystems. This repository contains the focused **Core Runtime**:
 
-1. **MCP Airlock (`src/mcp_airlock/airlock/`)** — A fail-closed stdio JSON-RPC proxy enforcing strict schema typing, exact-byte AgBOM tool-definition and capability pins, payload size limits, invisible-character rejection, and downstream subprocess environment isolation.
-2. **Runtime Authorization Engine & Multi-Server Gateway (`backend/mellyn/`)** — Default-deny policy enforcement (`authorizer.py`, `policy.py`, `policy_loader.py`), single-use approval tokens and approval relay (`approvals.py`, `approval_relay.py`, `state_store.py`), multi-server stdio/HTTP-downstream MCP Gateway with OAuth 2.1 support (`mcp_gateway.py`, `pin_gateway.py`, `http_downstream.py`, `oauth_client.py`), and FastAPI service (`api.py`).
-3. **Egress Guard & Scanner (`src/mcp_airlock/egress/`, `backend/mellyn/egress*.py`)** — Pre-egress secret, token-shape, and canary leakage detection (`scanner.py`, `guards.py`), egress benchmarking (`bench.py`), and domain-filtering forward proxy support.
-4. **Forensic Flight Recorder (`src/mcp_airlock/core/audit.py`, `src/mcp_airlock/ir_lab/`, `backend/mellyn/audit.py`)** — Redact-before-disk SHA-256 hash-chained JSONL audit logs with `artifact_sha256` digests, timeline reconstruction (`reconstruct.py`), and tamper verification (`verify_chain.py`).
+1. **MCP Airlock (`src/mellyn/airlock/`)** — A fail-closed stdio JSON-RPC proxy enforcing strict schema typing, exact-byte AgBOM tool-definition and capability pins, payload size limits, invisible-character rejection, and downstream subprocess environment isolation.
+2. **Runtime Authorization Engine & Multi-Server Gateway (`src/mellyn/`)** — Default-deny policy enforcement (`authorizer.py`, `policy.py`, `policy_loader.py`), single-use approval tokens and approval relay (`approvals.py`, `approval_relay.py`, `state_store.py`), multi-server stdio/HTTP-downstream MCP Gateway with OAuth 2.1 support (`mcp_gateway.py`, `pin_gateway.py`, `http_downstream.py`, `oauth_client.py`), and FastAPI service (`api.py`).
+3. **Egress Guard & Scanner (`src/mellyn/egress/`, `src/mellyn/scanner.py`)** — Pre-egress secret, token-shape, and canary leakage detection (`scanner.py`, `guards.py`), egress benchmarking (`bench.py`), and domain-filtering forward proxy support.
+4. **Forensic Flight Recorder (`src/mellyn/core/audit.py`, `src/mellyn/ir_lab/`, `src/mellyn/audit.py`)** — Redact-before-disk SHA-256 hash-chained JSONL audit logs with `artifact_sha256` digests, timeline reconstruction (`reconstruct.py`), and tamper verification (`verify_chain.py`).
 5. **Optional Container & Squid Egress Stack (`deploy/`, `Dockerfile`)** — Hardened Docker Compose deployment with isolated internal networks, Squid egress allowlisting (`deploy/egress/squid.conf`), Gateway profile (`--profile gateway`), and optional Approval Relay profile (`--profile relay`).
 
 ---
@@ -23,8 +23,7 @@ See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), [docs/ARCHITECTURE.md](d
 
 ## Repository Layout
 
-- `src/mcp_airlock/` — Focused MCP Airlock (`airlock/`), core framing/normalization/audit (`core/`), egress scanning & benchmarking (`egress/`), and forensic IR verification (`ir_lab/`).
-- `backend/mellyn/` — Runtime authorizer, policy engine, state store, multi-server gateway, HTTP/OAuth downstream adapters, egress proxy, API server, and `mellyn` CLI.
+- `src/mellyn/` — Unified Mellyn Security package combining the MCP Airlock (`airlock/`), core framing/normalization/audit (`core/`), egress guards/scanning/benchmarking (`egress/`), forensic IR verification (`ir_lab/`), and runtime authorizer, policy engine, state store, multi-server gateway, HTTP/OAuth downstream adapters, egress proxy, API server, and `mellyn` CLI.
 - `config/` — Example configurations (`mellyn.example.toml`, `mellyn-gateway.example.toml`, `mellyn-policy.example.toml`, `mellyn-self-policy.toml`).
 - `deploy/` — Optional container & Squid egress deployment (`docker-compose.yml`, `egress/`, pinned lockfiles `requirements.lock`, `requirements-ci-lint.lock`, `requirements-ci-tests.lock`, and [deploy/README.md](deploy/README.md)).
 - `examples/airlock_demo/` — End-to-end Airlock walkthrough (`run_demo.py`, `sample_mcp_server.py`, `reviewed_policy.toml`).
@@ -49,7 +48,7 @@ ruff check .
 ruff format --check .
 ```
 
-Generate local credentials, bring up the optional container stack, or run egress scanning benchmarks via the `mellyn` CLI (`backend/mellyn/cli.py`):
+Generate local credentials, bring up the optional container stack, or run egress scanning benchmarks via the `mellyn` CLI (`src/mellyn/cli.py`):
 
 ```bash
 mellyn init

@@ -1,4 +1,4 @@
-"""Deterministic unit tests for `mcp_airlock.egress.scanner` and `mcp_airlock.egress.guards`."""
+"""Deterministic unit tests for `mellyn.egress.scanner` and `mellyn.egress.guards`."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcp_airlock.airlock.engine import evaluate_tool_call
-from mcp_airlock.airlock.models import AirlockPolicy, JsonRpcRequest
-from mcp_airlock.core.normalize import JsonObject, sha256_exact
-from mcp_airlock.egress.guards import EgressValidator, WorkspacePathGuard
-from mcp_airlock.egress.scanner import scan_payload, scan_text, shannon_entropy
+from mellyn.airlock.engine import evaluate_tool_call
+from mellyn.airlock.models import AirlockPolicy, JsonRpcRequest
+from mellyn.core.normalize import JsonObject, sha256_exact
+from mellyn.egress.guards import EgressValidator, WorkspacePathGuard
+from mellyn.egress.scanner import scan_payload, scan_text, shannon_entropy
 
 
 class TestEgressScanner(unittest.TestCase):

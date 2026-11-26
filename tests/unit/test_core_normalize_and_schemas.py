@@ -1,4 +1,4 @@
-"""Deterministic unit tests for `mcp_airlock.core.normalize`, `mcp_airlock.core.schemas`, and AST DAG invariants."""
+"""Deterministic unit tests for `mellyn.core.normalize`, `mellyn.core.schemas`, and AST DAG invariants."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from mcp_airlock.core.normalize import (
+from mellyn.core.normalize import (
     JsonObject,
     canonical_json_bytes,
     has_invisible_unicode,
@@ -20,7 +20,7 @@ from mcp_airlock.core.normalize import (
     sha256_canonical,
     strip_invisible,
 )
-from mcp_airlock.core.schemas import (
+from mellyn.core.schemas import (
     GENESIS_PREV_HASH,
     AuditLedgerEntry,
     RedactionRecord,
@@ -29,7 +29,7 @@ from mcp_airlock.core.schemas import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_PACKAGE = REPO_ROOT / "src" / "mcp_airlock"
+SRC_PACKAGE = REPO_ROOT / "src" / "mellyn"
 
 
 class TestCoreNormalize(unittest.TestCase):
@@ -190,16 +190,16 @@ class TestDependencyDag(unittest.TestCase):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     parts = alias.name.split(".")
-                    if len(parts) >= 2 and parts[0] == "mcp_airlock":
-                        zones.add(parts[1])
+                    if parts[0] == "mellyn":
+                        zones.add(parts[1] if len(parts) >= 2 else "<root>")
             elif isinstance(node, ast.ImportFrom):
                 if node.level:
                     # Relative imports would slip past the absolute-name check below.
                     zones.add(f"<relative import: {'.' * node.level}{node.module or ''}>")
                     continue
                 parts = (node.module or "").split(".")
-                if len(parts) >= 2 and parts[0] == "mcp_airlock":
-                    zones.add(parts[1])
+                if parts[0] == "mellyn":
+                    zones.add(parts[1] if len(parts) >= 2 else "<root>")
         return zones
 
     def test_strict_one_way_dag(self) -> None:

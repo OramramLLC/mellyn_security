@@ -36,7 +36,7 @@ mellyn-authorizer (HTTP API, 127.0.0.1:8000) — for custom harnesses; makes no 
 ```bash
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # put this in MELLYN_API_KEY_PEPPER
-PYTHONPATH=backend python -m mellyn.credentials              # run twice: agent key, approver key
+PYTHONPATH=src python -m mellyn.credentials              # run twice: agent key, approver key
 ```
 
 Store only the **digests** in `.env`. The gateway never passes `MELLYN_*` variables to the MCP servers it launches.
@@ -73,7 +73,7 @@ Read-only MCP servers only need `u:10002:rX`.
 ### 3. Sync the egress proxy config from your policy
 
 ```bash
-PYTHONPATH=backend python -m mellyn.egress_proxy \
+PYTHONPATH=src python -m mellyn.egress_proxy \
   --policy config/mellyn-policy.example.toml \
   --output deploy/egress/squid.conf
 ```
@@ -120,8 +120,8 @@ servers from the client's own MCP config** so it cannot reach them directly:
 `mellyn-approval-relay` publishes `127.0.0.1:8765` on the host and forwards **only** the three exact approval routes (`GET /v1/pending` and `POST /v1/pending/apr_.../(approve|reject)`) to `mellyn-gateway:8765` across `mellyn-internal`—keeping `mellyn-gateway` completely cut off from direct internet routes while letting you run the approver CLI directly on the host:
 
 ```bash
-PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 list
-PYTHONPATH=backend python -m mellyn.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
+PYTHONPATH=src python -m mellyn.approve --url http://127.0.0.1:8765 list
+PYTHONPATH=src python -m mellyn.approve --url http://127.0.0.1:8765 approve apr_... --by you@example.com
 ```
 
 Running on the host keeps the raw approver key completely outside `mellyn-gateway`'s container process tree (`mellyn-approval-relay` does not mount `.env` and holds zero credentials). Inside `mellyn-gateway`, downstream MCP servers run under the dedicated unprivileged `mellyn-mcp` (`10002`) UID while the gateway drops to `mellyn` (`10001`), keeping `/var/log/mellyn` (`0700`, mounted from its own isolated `mellyn-gateway-audit-logs` volume) inaccessible to child MCP processes. If you prefer not to run Python on the host, run `docker exec -it -u mellyn mellyn-gateway python -m mellyn.approve --url http://127.0.0.1:8765 ...` (or pipe the key with `docker exec -i -u mellyn ... --key-stdin`); never pass the key via `docker exec -e`.

@@ -18,13 +18,14 @@ from mellyn.policy_loader import PolicyLoadError
 
 MELLYN_VERSION = "1.0.0"
 
-_AIRLOCK_VERIFY_MODULE = "mcp_airlock.ir_lab.reconstruct"
+_AIRLOCK_VERIFY_MODULE = "mellyn.ir_lab.reconstruct"
 _AIRLOCK_VERIFY_HINT = (
-    "The `verify` command on Airlock ledgers requires the `mcp_airlock` package "
-    "(not installed in gateway-only containers)."
+    "The `verify` command on Airlock ledgers requires pydantic "
+    "(install with `pip install pydantic>=2.10.0` or `pip install mellyn-security`)."
 )
-_AIRLOCK_PIN_MODULE = "mcp_airlock.airlock.pin_cli"
-_AIRLOCK_PIN_HINT = "The `pin` command requires the `mcp_airlock` package (not installed in gateway-only containers)."
+_AIRLOCK_PIN_MODULE = "mellyn.airlock.pin_cli"
+_PYDANTIC_INSTALL_HINT = "install with `pip install pydantic>=2.10.0` or `pip install mellyn-security`"
+_AIRLOCK_PIN_HINT = f"The `pin` command requires pydantic ({_PYDANTIC_INSTALL_HINT})."
 _GATEWAY_PIN_FLAGS = frozenset(
     {"--name", "--config", "--preset", "--trusted", "--untrusted", "--cwd", "--json", "--url"}
 )
@@ -34,14 +35,8 @@ _PASSTHROUGH_MODULES: dict[str, tuple[str, str | None]] = {
     "proxy": ("mellyn.mcp_gateway", None),
     "approve": ("mellyn.approve", None),
     "sync-egress": ("mellyn.egress_proxy", None),
-    "airlock": (
-        "mcp_airlock.airlock.proxy",
-        "The `airlock` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
-    ),
-    "bench": (
-        "mcp_airlock.egress.bench",
-        "The `bench` command requires the `mcp_airlock` package (not installed in gateway-only containers).",
-    ),
+    "airlock": ("mellyn.airlock.proxy", f"The `airlock` command requires pydantic ({_PYDANTIC_INSTALL_HINT})."),
+    "bench": ("mellyn.egress.bench", f"The `bench` command requires pydantic ({_PYDANTIC_INSTALL_HINT})."),
 }
 
 _HELP_TEXT = """\

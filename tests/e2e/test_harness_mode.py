@@ -11,17 +11,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import compute_tool_pin
-from mcp_airlock.airlock.models import AirlockPolicy, parse_airlock_policy_toml
-from mcp_airlock.airlock.proxy import (
+from mellyn.airlock.engine import compute_tool_pin
+from mellyn.airlock.models import AirlockPolicy, parse_airlock_policy_toml
+from mellyn.airlock.proxy import (
     AAD_EXIT_CODE,
     JSONRPC_POLICY_VIOLATION,
     MAX_RECORDED_REDACTED_PAYLOAD_BYTES,
     AirlockProxy,
     _build_cli_parser,
 )
-from mcp_airlock.core.audit import AuditLedger, verify_ledger
-from mcp_airlock.ir_lab.reconstruct import reconstruct_incident
+from mellyn.core.audit import AuditLedger, verify_ledger
+from mellyn.ir_lab.reconstruct import reconstruct_incident
 from tests.e2e.test_full_killchain import CLI_MODULES, _run_cli
 from tests.e2e.test_proxy_aad import (
     CANARY,

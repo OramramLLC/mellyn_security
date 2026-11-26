@@ -1,7 +1,7 @@
 """
 Post-incident forensic timeline reconstructor (`mellyn-ir`).
 
-Strict DAG invariant: imports ONLY from `mcp_airlock.core` and `mcp_airlock.ir_lab` (+ stdlib / pydantic).
+Strict DAG invariant: imports ONLY from `mellyn.core` and `mellyn.ir_lab` (+ stdlib / pydantic).
 Always verifies the `audit.jsonl` cryptographic hash chain BEFORE reconstructing any incident timeline.
 """
 
@@ -16,16 +16,16 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcp_airlock.core.audit import LedgerAnchor, redact_core_secrets
-from mcp_airlock.core.normalize import is_invisible_codepoint
-from mcp_airlock.core.schemas import (
+from mellyn.core.audit import LedgerAnchor, redact_core_secrets
+from mellyn.core.normalize import is_invisible_codepoint
+from mellyn.core.schemas import (
     AAD_CONTAINMENT_CONFIRMED_RULE_ID,
     SESSION_STARTED_RULE_ID,
     AuditLedgerEntry,
     Severity,
     Zone,
 )
-from mcp_airlock.ir_lab.verify_chain import ChainVerificationReport, read_and_verify_chain
+from mellyn.ir_lab.verify_chain import ChainVerificationReport, read_and_verify_chain
 
 _MD_UNSAFE_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _MD_ESCAPES = str.maketrans(

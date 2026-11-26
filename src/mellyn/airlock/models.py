@@ -18,7 +18,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from mcp_airlock.core.normalize import JsonObject, JsonValue
+from mellyn.core.normalize import JsonObject, JsonValue
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")

@@ -25,15 +25,12 @@ from typing import Any
 DEMO_DIR = Path(__file__).resolve().parent
 REPO_ROOT = DEMO_DIR.parents[1]
 SRC_DIR = REPO_ROOT / "src"
-BACKEND_DIR = REPO_ROOT / "backend"
 
-for _import_dir in (SRC_DIR, BACKEND_DIR):
-    if str(_import_dir) not in sys.path:
-        sys.path.insert(0, str(_import_dir))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
+from mellyn.ir_lab.reconstruct import IncidentReport, reconstruct_incident, render_markdown  # noqa: E402
 from mellyn.legacy_env import check_no_legacy_env  # noqa: E402
-
-from mcp_airlock.ir_lab.reconstruct import IncidentReport, reconstruct_incident, render_markdown  # noqa: E402
 
 POLICY_PATH = DEMO_DIR / "reviewed_policy.toml"
 SERVER_PATH = DEMO_DIR / "sample_mcp_server.py"
@@ -108,7 +105,7 @@ def run_demo_session(
     cmd = [
         python_executable,
         "-m",
-        "mcp_airlock.airlock.proxy",
+        "mellyn.airlock.proxy",
         "--policy",
         str(POLICY_PATH),
         "--audit-log",

@@ -9,9 +9,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from mellyn.authorizer import Authorizer, SessionLimitError  # noqa: E402
 from mellyn.egress import WorkspaceConfigError, check_workspace_root  # noqa: E402
@@ -138,7 +138,7 @@ class TestContainerSupplyChain(unittest.TestCase):
         ]
         self.assertEqual(lines[0], "*")  # deny everything, then re-include only what the Dockerfile copies
         included = [line[1:] for line in lines if line.startswith("!")]
-        self.assertEqual(sorted(included), ["backend/", "deploy/requirements.lock"])
+        self.assertEqual(sorted(included), ["deploy/requirements.lock", "src/"])
 
     def test_lockfile_pins_every_package_with_hashes(self) -> None:
         lock = (REPO_ROOT / "deploy" / "requirements.lock").read_text(encoding="utf-8")

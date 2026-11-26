@@ -1,6 +1,6 @@
-"""Mellyn Incident Response Lab (`mcp_airlock.ir_lab`): ledger verification & forensic timeline reconstruction."""
+"""Mellyn Incident Response Lab (`mellyn.ir_lab`): ledger verification & forensic timeline reconstruction."""
 
-from mcp_airlock.ir_lab.reconstruct import (
+from mellyn.ir_lab.reconstruct import (
     REASON_CODE_MAP,
     IncidentReport,
     SessionTimeline,
@@ -10,7 +10,7 @@ from mcp_airlock.ir_lab.reconstruct import (
     reconstruct_incident,
     render_markdown,
 )
-from mcp_airlock.ir_lab.verify_chain import ChainVerificationReport, verify_chain
+from mellyn.ir_lab.verify_chain import ChainVerificationReport, verify_chain
 
 __all__ = [
     "REASON_CODE_MAP",

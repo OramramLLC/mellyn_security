@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -18,19 +19,15 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-BACKEND_DIR = REPO_ROOT / "backend"
-for _path in (SRC_DIR, BACKEND_DIR):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 if importlib.util.find_spec("pydantic") is None and os.environ.get("MELLYN_REQUIRE_API_TESTS") != "1":
     raise unittest.SkipTest("pydantic is not installed; adversarial hardening tests skipped")
 
-from mellyn.egress import WorkspacePathGuard as BackendWorkspacePathGuard  # noqa: E402
-
-from mcp_airlock.airlock.engine import evaluate_tool_call  # noqa: E402
-from mcp_airlock.airlock.models import AirlockPolicy, JsonRpcRequest, ToolPolicyRule  # noqa: E402
-from mcp_airlock.core.audit import (  # noqa: E402
+from mellyn.airlock.engine import evaluate_tool_call  # noqa: E402
+from mellyn.airlock.models import AirlockPolicy, JsonRpcRequest, ToolPolicyRule  # noqa: E402
+from mellyn.core.audit import (  # noqa: E402
     AuditLedger,
     _split_fragments_cover_canary,
     canary_present,
@@ -38,10 +35,10 @@ from mcp_airlock.core.audit import (  # noqa: E402
     redact_core_secrets,
     split_fragment_length,
 )
-from mcp_airlock.core.normalize import is_invisible_codepoint, normalize_str  # noqa: E402
-from mcp_airlock.core.schemas import ZoneEvent  # noqa: E402
-from mcp_airlock.egress.guards import WorkspacePathGuard as AirlockWorkspacePathGuard  # noqa: E402
-from mcp_airlock.egress.scanner import scan_payload, scan_text  # noqa: E402
+from mellyn.core.normalize import is_invisible_codepoint, normalize_str  # noqa: E402
+from mellyn.core.schemas import ZoneEvent  # noqa: E402
+from mellyn.egress.guards import WorkspacePathGuard  # noqa: E402
+from mellyn.egress.scanner import scan_payload, scan_text  # noqa: E402
 
 CANARY = "MELLYN_CANARY_ALPHA_9472"
 # Documentation-style sample credentials, assembled at runtime so no secret-shaped literal sits in the source.
@@ -50,13 +47,33 @@ SAMPLE_AWS_PCT = SAMPLE_AWS[:4] + "%49" + SAMPLE_AWS[5:]
 SAMPLE_OPENAI = "sk-" + "proj-" + "exampleDummy1234567890"
 
 
-class TestNtfsAdsAndPathParity(unittest.TestCase):
+class TestNtfsAdsAndPathGuard(unittest.TestCase):
+    def test_airlock_gateway_and_authorizer_share_one_path_and_url_guard(self) -> None:
+        """
+        The Airlock and the authorizer once had separate path guards, and this test compared them. Since the
+        namespace merge there is one: a second copy appearing again (and drifting) must fail here.
+        """
+        import mellyn.authorizer
+        import mellyn.egress
+        import mellyn.egress.guards
+
+        for name in ("WorkspacePathGuard", "EgressValidator", "check_workspace_root"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(mellyn.egress, name), getattr(mellyn.egress.guards, name))
+        self.assertIs(mellyn.authorizer.WorkspacePathGuard, mellyn.egress.guards.WorkspacePathGuard)
+        self.assertIs(mellyn.authorizer.EgressValidator, mellyn.egress.guards.EgressValidator)
+        defining = sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in (REPO_ROOT / "src" / "mellyn").rglob("*.py")
+            if re.search(r"^class (WorkspacePathGuard|EgressValidator)\b", path.read_text(encoding="utf-8"), re.M)
+        )
+        self.assertEqual(defining, ["src/mellyn/egress/guards.py"])
+
     def test_ads_and_trailing_dot_denied_while_benign_windows_paths_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp).resolve()
             (ws / "notes.txt").write_text("ok", encoding="utf-8")
-            ag = AirlockWorkspacePathGuard(ws)
-            bg = BackendWorkspacePathGuard(ws)
+            guard = WorkspacePathGuard(ws)
             pol = AirlockPolicy(
                 allowed_tools=["read_file"],
                 workspace_roots=[str(ws)],
@@ -65,8 +82,7 @@ class TestNtfsAdsAndPathParity(unittest.TestCase):
 
             for bad_path in (".env::$DATA", "secret.key::$DATA", ".env:stream", ".env.", "sub/foo:bar/notes.txt"):
                 with self.subTest(bad_path=bad_path):
-                    self.assertFalse(ag.validate_path(bad_path, is_write=False)[0])
-                    self.assertFalse(bg.validate_path(bad_path, is_write=False)[0])
+                    self.assertFalse(guard.validate_path(bad_path, is_write=False)[0])
                     req = JsonRpcRequest(
                         jsonrpc="2.0",
                         id=1,
@@ -78,8 +94,7 @@ class TestNtfsAdsAndPathParity(unittest.TestCase):
 
             for good_path in ("notes.txt", str(ws / "notes.txt")):
                 with self.subTest(good_path=good_path):
-                    self.assertTrue(ag.validate_path(good_path, is_write=False)[0])
-                    self.assertTrue(bg.validate_path(good_path, is_write=False)[0])
+                    self.assertTrue(guard.validate_path(good_path, is_write=False)[0])
 
 
 class TestEncodedAndSplitCanaryHardening(unittest.TestCase):
@@ -306,23 +321,19 @@ class TestTrailingDotOrSpaceSegments(unittest.TestCase):
     def test_absent_protected_files_cannot_be_created_with_a_trailing_dot_or_space(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp).resolve()
-            guards: dict[str, Any] = {
-                "airlock": AirlockWorkspacePathGuard(ws),
-                "backend": BackendWorkspacePathGuard(ws),
-            }
-            for name, guard in guards.items():
-                for target in (
-                    ".gitleaks.toml.",
-                    ".mellyn-allowlist.toml ",
-                    ".claude./settings.json",
-                    ".github./workflows/x.yml",
-                    "docs/notes.txt.",
-                ):
-                    with self.subTest(guard=name, denied=target):
-                        self.assertFalse(guard.validate_path(target, is_write=True)[0])
-                for target in ("notes.txt", "docs/guide.md", ".env.example"):
-                    with self.subTest(guard=name, allowed=target):
-                        self.assertTrue(guard.validate_path(target, is_write=True)[0])
+            guard = WorkspacePathGuard(ws)
+            for target in (
+                ".gitleaks.toml.",
+                ".mellyn-allowlist.toml ",
+                ".claude./settings.json",
+                ".github./workflows/x.yml",
+                "docs/notes.txt.",
+            ):
+                with self.subTest(denied=target):
+                    self.assertFalse(guard.validate_path(target, is_write=True)[0])
+            for target in ("notes.txt", "docs/guide.md", ".env.example"):
+                with self.subTest(allowed=target):
+                    self.assertTrue(guard.validate_path(target, is_write=True)[0])
 
 
 class TestEscapedNestedAndEncodedSecrets(unittest.TestCase):

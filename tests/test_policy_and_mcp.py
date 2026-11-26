@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
+SRC_DIR = REPO_ROOT / "src"
 FAKE_SERVER = Path(__file__).resolve().parent / "fixtures" / "fake_mcp_server.py"
-for _p in (REPO_ROOT, BACKEND_DIR):
+for _p in (REPO_ROOT, SRC_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -49,7 +49,6 @@ from mellyn.mcp_gateway import (  # noqa: E402
     initialize_downstream,
     run_stdio_proxy,
 )
-
 from tests.fakes import FakeDownstream  # noqa: E402
 
 EXAMPLE_POLICY = REPO_ROOT / "config" / "mellyn-policy.example.toml"
@@ -407,7 +406,7 @@ class TestGatewayEndToEnd(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 5, "method": "ping"},
             ]
             env = {k: v for k, v in os.environ.items() if not k.startswith("MELLYN_")}
-            env["PYTHONPATH"] = str(BACKEND_DIR)
+            env["PYTHONPATH"] = str(SRC_DIR)
             proc = subprocess.run(  # noqa: S603 - fixed argv, test only
                 [
                     sys.executable,

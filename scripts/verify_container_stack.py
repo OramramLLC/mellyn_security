@@ -35,8 +35,8 @@ import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
-for _p in (REPO_ROOT, BACKEND_DIR):
+SRC_DIR = REPO_ROOT / "src"
+for _p in (REPO_ROOT, SRC_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 

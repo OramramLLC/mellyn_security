@@ -27,7 +27,7 @@ from unittest import mock
 
 # Importable on its own without requiring PYTHONPATH.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-for _import_dir in (_REPO_ROOT / "backend", _REPO_ROOT / "src"):
+for _import_dir in (_REPO_ROOT / "src",):
     if str(_import_dir) not in sys.path:
         sys.path.insert(0, str(_import_dir))
 

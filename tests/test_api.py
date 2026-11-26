@@ -14,9 +14,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 HAS_FASTAPI = all(importlib.util.find_spec(name) is not None for name in ("fastapi", "httpx"))
 REQUIRE_API_TESTS = os.environ.get("MELLYN_REQUIRE_API_TESTS") == "1"
@@ -32,6 +32,7 @@ class TestApiDependenciesPresent(unittest.TestCase):
 class TestAuthorizerApi(unittest.TestCase):
     def setUp(self) -> None:
         from fastapi.testclient import TestClient
+
         from mellyn.api import create_app
         from mellyn.credentials import CredentialConfig, key_digest
 
@@ -134,6 +135,7 @@ class TestAuthorizerApi(unittest.TestCase):
 class TestApiFailsClosedWithoutCredentials(unittest.TestCase):
     def test_every_protected_route_answers_503(self) -> None:
         from fastapi.testclient import TestClient
+
         from mellyn.api import create_app
 
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict("os.environ", {}, clear=True):
@@ -159,6 +161,7 @@ class TestCreateAppFromEnv(unittest.TestCase):
 
     def test_writes_audit_log_and_closes_sink_on_lifespan_shutdown(self) -> None:
         from fastapi.testclient import TestClient
+
         from mellyn.api import create_app_from_env
         from mellyn.credentials import key_digest
 
@@ -194,6 +197,7 @@ class TestCreateAppFromEnv(unittest.TestCase):
 
     def test_persists_sessions_taint_and_grants_across_app_restart_when_state_db_configured(self) -> None:
         from fastapi.testclient import TestClient
+
         from mellyn.api import create_app_from_env
         from mellyn.credentials import key_digest
         from mellyn.state_store import StateStoreError

@@ -9,13 +9,14 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = REPO_ROOT / "backend"
+SRC_DIR = REPO_ROOT / "src"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-for p in (BACKEND_DIR, SCRIPTS_DIR):
+for p in (SRC_DIR, SCRIPTS_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
 import verify_container_stack as vcs  # noqa: E402
+
 from mellyn.egress_proxy import generate_squid_config  # noqa: E402
 from mellyn.policy_loader import load_policy_file  # noqa: E402
 
@@ -27,7 +28,7 @@ class TestPyprojectAndContainerCiWiring(unittest.TestCase):
         self.assertNotIn("pydantic-settings", deps)
         codebase = "\n".join(
             p.read_text(encoding="utf-8")
-            for folder in ("backend", "src", "tests", "scripts")
+            for folder in ("src", "tests", "scripts")
             for p in (REPO_ROOT / folder).rglob("*.py")
         )
         # uvicorn is invoked as the container ASGI server in Dockerfile

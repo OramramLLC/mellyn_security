@@ -1,5 +1,5 @@
 """
-Regression tests for the first `mcp_airlock` review: each test pins a bypass or defect that was reproduced against
+Regression tests for the first Airlock review: each test pins a bypass or defect that was reproduced against
 the original code (package clash, path/URI bypasses, opt-in guardrails, normalized size caps and pins, scanner
 slowdown, canary evasion, duplicate keys, and undetected ledger truncation), plus the second review's false
 positives (random string ids, non-path keys) and per-write full-ledger reads.
@@ -20,8 +20,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from mcp_airlock.airlock.engine import compute_tool_pin, evaluate_tool_call, evaluate_tool_response, verify_tools_list
-from mcp_airlock.airlock.models import (
+from mellyn.airlock.engine import compute_tool_pin, evaluate_tool_call, evaluate_tool_response, verify_tools_list
+from mellyn.airlock.models import (
     AirlockPolicy,
     JsonRpcRequest,
     JsonRpcSuccessResponse,
@@ -29,10 +29,10 @@ from mcp_airlock.airlock.models import (
     parse_airlock_policy_toml,
     parse_jsonrpc_bytes,
 )
-from mcp_airlock.core.audit import AuditLedger, verify_ledger
-from mcp_airlock.core.normalize import JsonObject, sha256_canonical, sha256_exact
-from mcp_airlock.core.schemas import Verdict, ZoneEvent
-from mcp_airlock.egress.scanner import scan_payload, scan_text
+from mellyn.core.audit import AuditLedger, verify_ledger
+from mellyn.core.normalize import JsonObject, sha256_canonical, sha256_exact
+from mellyn.core.schemas import Verdict, ZoneEvent
+from mellyn.egress.scanner import scan_payload, scan_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CANARY = "CANARY_SECRET_XYZ_7788"
@@ -65,21 +65,22 @@ class _WorkspaceCase(unittest.TestCase):
 
 
 class TestPackageLayoutAndConfig(unittest.TestCase):
-    def test_new_package_coexists_with_backend_mellyn(self) -> None:
-        backend = str(REPO_ROOT / "backend")
-        if backend not in sys.path:
-            sys.path.insert(0, backend)
-        # Both packages must import in one process (the old `src/mellyn` shadowed `backend/mellyn`).
+    def test_consolidated_src_mellyn_layout_imports_cleanly(self) -> None:
+        src = str(REPO_ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
         importlib.import_module("mellyn.approvals")
-        importlib.import_module("mcp_airlock.airlock")
-        self.assertFalse((REPO_ROOT / "src" / "mellyn").exists(), "src/mellyn would shadow backend/mellyn")
+        importlib.import_module("mellyn.airlock")
+        self.assertTrue((REPO_ROOT / "src" / "mellyn").is_dir())
+        self.assertFalse((REPO_ROOT / "backend").exists(), "legacy backend/ directory must be removed")
+        self.assertFalse((REPO_ROOT / "src" / "mcp_airlock").exists(), "legacy mcp_airlock/ directory must be removed")
 
     def test_ci_discovery_and_pytest_cover_the_new_tests(self) -> None:
         self.assertTrue((REPO_ROOT / "tests" / "unit" / "__init__.py").is_file())
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         pytest_cfg = pyproject["tool"]["pytest"]["ini_options"]
         self.assertEqual(pytest_cfg["testpaths"], ["tests"])
-        self.assertTrue({"backend", "scripts", "src"} <= set(pytest_cfg["pythonpath"]))
+        self.assertTrue({"scripts", "src"} <= set(pytest_cfg["pythonpath"]))
 
     def test_no_yaml_dependency(self) -> None:
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -105,7 +106,7 @@ class TestPackageLayoutAndConfig(unittest.TestCase):
         match = re.search(r"^\s*files:\s*(.+)$", unit_section, re.MULTILINE)
         if match is None:
             self.fail("Expected 'files:' regex on unit-tests hook in .pre-commit-config.yaml")
-        self.assertRegex("src/mcp_airlock/core/audit.py", match.group(1).strip())
+        self.assertRegex("src/mellyn/core/audit.py", match.group(1).strip())
 
 
 class TestPolicyParsing(unittest.TestCase):

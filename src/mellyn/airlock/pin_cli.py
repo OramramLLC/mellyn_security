@@ -20,8 +20,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcp_airlock.airlock.engine import compute_instructions_pin, compute_manifest_pin, compute_tool_pin
-from mcp_airlock.airlock.models import (
+from mellyn.airlock.engine import compute_instructions_pin, compute_manifest_pin, compute_tool_pin
+from mellyn.airlock.models import (
     AirlockPolicy,
     JsonRpcErrorResponse,
     JsonRpcNotification,
@@ -31,14 +31,14 @@ from mcp_airlock.airlock.models import (
     parse_airlock_policy_toml,
     parse_jsonrpc_bytes,
 )
-from mcp_airlock.airlock.proxy import (
+from mellyn.airlock.proxy import (
     BoundedLineReader,
     _hard_kill_subprocess,
     build_minimal_subprocess_env,
     parse_allow_env_keys,
     spawn_contained_subprocess,
 )
-from mcp_airlock.core.normalize import JsonObject, exact_json_bytes, has_invisible_unicode, normalize_value
+from mellyn.core.normalize import JsonObject, exact_json_bytes, has_invisible_unicode, normalize_value
 
 MAX_PIN_PAGES = 20
 MAX_PIN_FRAME_BYTES = 1_048_576

@@ -8,34 +8,34 @@ This document describes the architecture of the **Mellyn Security Core Runtime**
 
 Mellyn mediates every action between an untrusted AI agent client and external tools, servers, or network destinations across four coordinated runtime layers:
 
-1. **MCP Airlock (`src/mcp_airlock/airlock/`):** Fail-closed stdio JSON-RPC proxy enforcing strict Pydantic wire schemas (`extra="forbid"`, `strict=True`, `frozen=True`), duplicate JSON key rejection, exact-byte AgBOM tool-definition and capability pins, Unicode normalization rules (stricter-only for deny/canary checks; non-NFKC or invisible tag/zero-width characters denied in allow/tool contexts), payload caps, and isolated downstream subprocess environments.
-2. **Runtime Authorization Engine & Multi-Server Gateway (`backend/mellyn/`):**
+1. **MCP Airlock (`src/mellyn/airlock/`):** Fail-closed stdio JSON-RPC proxy enforcing strict Pydantic wire schemas (`extra="forbid"`, `strict=True`, `frozen=True`), duplicate JSON key rejection, exact-byte AgBOM tool-definition and capability pins, Unicode normalization rules (stricter-only for deny/canary checks; non-NFKC or invisible tag/zero-width characters denied in allow/tool contexts), payload caps, and isolated downstream subprocess environments.
+2. **Runtime Authorization Engine & Multi-Server Gateway (`src/mellyn/`):**
    - Policy and risk evaluation (`authorizer.py`, `policy.py`, `policy_loader.py`) supporting default-deny capability checks, taint tracking, and human-in-the-loop single-use approvals (`approvals.py`, `approval_relay.py`, `approve.py`, `state_store.py`).
    - Multi-server stdio and HTTP/OAuth 2.1 downstream gateway (`mcp_gateway.py`, `pin_gateway.py`, `gateway_config.py`, `http_downstream.py`, `oauth_client.py`) with pinned tool manifests.
    - CLI (`cli.py`, `init_cmd.py`) and HTTP control API (`api.py`).
-3. **Egress Guard & Scanner (`src/mcp_airlock/egress/`, `backend/mellyn/egress*.py`):** Inspects outbound arguments, tool outputs, and HTTP egress requests for high-entropy secrets, provider token patterns, and canary tokens (`scanner.py`, `guards.py`), paired with forwarding proxy controls (`egress_proxy.py`, `egress.py`) and throughput benchmarking (`bench.py`).
-4. **Forensic Flight Recorder (`src/mcp_airlock/core/audit.py`, `src/mcp_airlock/ir_lab/`, `backend/mellyn/audit.py`):** Captures `artifact_sha256` digests before redacting sensitive values, writes redacted records into SHA-256 hash-chained JSONL logs, and supports offline timeline reconstruction (`reconstruct.py`) and ledger verification (`verify_chain.py`).
+3. **Egress Guard & Scanner (`src/mellyn/egress/`, `src/mellyn/scanner.py`):** Inspects outbound arguments, tool outputs, and HTTP egress requests for high-entropy secrets, provider token patterns, and canary tokens (`scanner.py`, `guards.py`), paired with forwarding proxy controls (`egress_proxy.py`) and throughput benchmarking (`bench.py`).
+4. **Forensic Flight Recorder (`src/mellyn/core/audit.py`, `src/mellyn/ir_lab/`, `src/mellyn/audit.py`):** Captures `artifact_sha256` digests before redacting sensitive values, writes redacted records into SHA-256 hash-chained JSONL logs, and supports offline timeline reconstruction (`reconstruct.py`) and ledger verification (`verify_chain.py`).
 
 ---
 
-## 2. Internal Package DAG (`src/mcp_airlock/`)
+## 2. Internal Package DAG (`src/mellyn/`)
 
-`src/mcp_airlock/` maintains a strict one-way import graph with absolute imports only:
+`src/mellyn/` keeps strict one-way layering for the Airlock subpackages with absolute imports only:
 
 ```text
-mcp_airlock.core        (imports nothing from airlock, egress, or ir_lab)
+mellyn.core             (imports nothing from airlock, egress, ir_lab, or top-level mellyn)
    ▲          ▲
    │          └──────────────────────────┐
-mcp_airlock.egress  (imports core only)  │
+mellyn.egress       (imports core only)  │
    ▲                                     │
    └──────────────┬──────────────────────┤
-mcp_airlock.airlock   mcp_airlock.ir_lab
+mellyn.airlock        mellyn.ir_lab
 ```
 
-- `mcp_airlock.core`: Wire models (`schemas.py`), NFKC & invisible-character helpers (`normalize.py`), and hash-chained redact-before-disk JSONL audit writer (`audit.py`).
-- `mcp_airlock.egress`: Secret, token-shape, and canary scanning (`scanner.py`, `guards.py`) plus scanner benchmark (`bench.py`).
-- `mcp_airlock.airlock`: Airlock models (`models.py`), decision engine (`engine.py`), AgBOM pin CLI (`pin_cli.py`), and stdio wire proxy (`proxy.py`).
-- `mcp_airlock.ir_lab`: Post-incident JSONL timeline reconstruction (`reconstruct.py`) and hash-chain verification (`verify_chain.py`).
+- `mellyn.core`: Wire models (`schemas.py`), NFKC & invisible-character helpers (`normalize.py`), and hash-chained redact-before-disk JSONL audit writer (`audit.py`).
+- `mellyn.egress`: Destination/workspace confinement guards (`guards.py`, stdlib-only), lazy-loaded secret/canary scanner (`scanner.py`), and scanner benchmark (`bench.py`).
+- `mellyn.airlock`: Airlock models (`models.py`), decision engine (`engine.py`), AgBOM pin CLI (`pin_cli.py`), and stdio wire proxy (`proxy.py`).
+- `mellyn.ir_lab`: Post-incident JSONL timeline reconstruction (`reconstruct.py`) and hash-chain verification (`verify_chain.py`).
 
 ---
 
@@ -65,32 +65,6 @@ mcp_airlock.airlock   mcp_airlock.ir_lab
 ├── SECURITY.md
 ├── pyproject.toml
 ├── README.md
-├── backend/
-│   └── mellyn/
-│       ├── __init__.py
-│       ├── api.py
-│       ├── approval_relay.py
-│       ├── approvals.py
-│       ├── approve.py
-│       ├── audit.py
-│       ├── authorizer.py
-│       ├── cli.py
-│       ├── credentials.py
-│       ├── egress.py
-│       ├── egress_proxy.py
-│       ├── gateway_config.py
-│       ├── http_downstream.py
-│       ├── init_cmd.py
-│       ├── legacy_env.py
-│       ├── mcp_gateway.py
-│       ├── models.py
-│       ├── oauth_client.py
-│       ├── pin_gateway.py
-│       ├── policy.py
-│       ├── policy_loader.py
-│       ├── scanner.py
-│       ├── state_store.py
-│       └── unified_config.py
 ├── config/
 │   ├── mellyn.example.toml
 │   ├── mellyn-gateway.example.toml
@@ -117,8 +91,30 @@ mcp_airlock.airlock   mcp_airlock.ir_lab
 ├── scripts/
 │   └── verify_container_stack.py
 ├── src/
-│   └── mcp_airlock/
+│   └── mellyn/
 │       ├── __init__.py
+│       ├── api.py
+│       ├── approval_relay.py
+│       ├── approvals.py
+│       ├── approve.py
+│       ├── audit.py
+│       ├── authorizer.py
+│       ├── cli.py
+│       ├── credentials.py
+│       ├── egress_proxy.py
+│       ├── gateway_config.py
+│       ├── http_downstream.py
+│       ├── init_cmd.py
+│       ├── legacy_env.py
+│       ├── mcp_gateway.py
+│       ├── models.py
+│       ├── oauth_client.py
+│       ├── pin_gateway.py
+│       ├── policy.py
+│       ├── policy_loader.py
+│       ├── scanner.py
+│       ├── state_store.py
+│       ├── unified_config.py
 │       ├── airlock/
 │       │   ├── __init__.py
 │       │   ├── engine.py

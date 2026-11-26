@@ -1,4 +1,4 @@
-"""Network egress (SSRF) and workspace path confinement guards migrated into mcp_airlock.egress."""
+"""Network egress (SSRF) and workspace path confinement guards."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ SENSITIVE_FILENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\.(?:pem|key|p12|pfx|jks|kdbx)$", re.IGNORECASE),
     re.compile(r"^credentials\.json$", re.IGNORECASE),
     re.compile(r"^id_(?:rsa|ed25519|ecdsa|dsa)$", re.IGNORECASE),
+    # Package-registry, git, and HTTP credential stores
     re.compile(r"^(?:\.git-credentials|\.npmrc|\.pypirc|[._]netrc|\.htpasswd)$", re.IGNORECASE),
 )
 
@@ -22,8 +23,16 @@ SENSITIVE_PATH_PARTS: frozenset[str] = frozenset(
     {".ssh", ".aws", ".kube", ".gnupg", ".docker", ".azure", "gcloud", "secrets"}
 )
 
+# Exact workspace files that may hold credentials (e.g. a token embedded in a git remote URL).
 SENSITIVE_RELATIVE_PATHS: frozenset[str] = frozenset({".git/config"})
 
+# Paths an agent must never modify in ANY workspace: its own steering rules, the CI and scanner gates, and
+# .git/ (a written hook or core.hooksPath runs code on the developer's next commit). This list applies to
+# every repository the authorizer protects, so it must hold only files that are guardrails everywhere.
+# Paths that matter to one repository (its security core, its tests, its deployment) belong in that
+# repository's policy `protected_paths` (see config/mellyn-self-policy.toml for this repository's own).
+# Entries ending in "/" protect a directory; others protect one file. Matching ignores case so that
+# case-insensitive filesystems (Windows, macOS) cannot be used to dodge it.
 GUARDRAIL_PATHS: tuple[str, ...] = (
     ".git/",
     ".agent/",
@@ -44,11 +53,20 @@ GUARDRAIL_PATHS: tuple[str, ...] = (
     "GEMINI.md",
 )
 
+
+# NUL and other C0/DEL control characters. They have no business in a path or URL, and they are where
+# validators and the programs that later open the path or URL disagree (NUL truncates C strings; CR/LF
+# split HTTP headers and log lines).
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class EgressValidator:
-    """Application-layer SSRF and destination allowlist validator."""
+    """
+    Application-layer SSRF and destination allowlist validator.
+
+    Note: Per docs/THREAT_MODEL.md (TM-02), pair this with a network-layer egress
+    proxy in production to defeat DNS rebinding and cross-host HTTP redirects.
+    """
 
     def __init__(self, allowed_domains: frozenset[str] | None = None) -> None:
         self.allowed_domains: frozenset[str] = frozenset(
@@ -57,8 +75,8 @@ class EgressValidator:
 
     def validate_url(self, raw_url: str) -> tuple[bool, str]:
         """Return (is_allowed, reason) for an outbound URL."""
-        if not raw_url.strip():
-            return False, "URL is empty."
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            return False, "URL is empty or not a string."
         if _CONTROL_CHARACTERS.search(raw_url):
             return False, "URL contains control characters."
 
@@ -108,7 +126,11 @@ class EgressValidator:
 
     @staticmethod
     def _is_ip_literal(hostname: str) -> bool:
-        """Detect IPv4 and IPv6 literals."""
+        """
+        Detect IPv4 and IPv6 literals (including IPv4-mapped IPv6). Every literal is rejected, public or
+        private, so no range check is needed here. Numeric forms such as '2130706433' are not parsed as
+        IPs, but they also never match a domain in the allowlist, so they are rejected there.
+        """
         try:
             ipaddress.ip_address(hostname)
         except ValueError:
@@ -117,20 +139,27 @@ class EgressValidator:
 
 
 class WorkspaceConfigError(RuntimeError):
-    """The workspace root cannot be trusted for path checks (fail closed)."""
+    """The workspace root cannot be trusted for path checks. Callers refuse to start (fail closed)."""
 
 
 def check_workspace_root(workspace_root: Path, *, require_mount: bool) -> None:
-    """Verify workspace root exists and is a mount point when `require_mount` is enabled."""
+    """
+    The path guard resolves symlinks against the authorizer's own filesystem. If that is not the filesystem the
+    agent's tools use (an authorizer container with no workspace mounted), a link to a secret looks like an
+    ordinary file. With `require_mount`, refuse a workspace root that is not a mount point.
+    """
     if not workspace_root.is_dir():
         raise WorkspaceConfigError(f"Workspace root '{workspace_root}' is not an existing directory.")
     if require_mount and not os.path.ismount(workspace_root):
-        raise WorkspaceConfigError(f"Workspace root '{workspace_root}' is not a mount point.")
+        raise WorkspaceConfigError(
+            f"Workspace root '{workspace_root}' is not a mount point. Mount the agent's workspace there "
+            "(read-only is enough), or the path guard cannot see where symlinks lead."
+        )
 
 
 @dataclass(frozen=True)
 class SearchMatch:
-    """One permitted line match returned by `WorkspacePathGuard.search_content()`."""
+    """One permitted line match returned by WorkspacePathGuard.search_content()."""
 
     path: str
     line_number: int
@@ -145,7 +174,11 @@ class WorkspacePathGuard:
         self.protected_paths = tuple(p.casefold() for p in (*GUARDRAIL_PATHS, *extra_protected_paths))
 
     def is_protected(self, rel_posix: str) -> bool:
-        """True when a workspace-relative POSIX path is, is inside, or is an ancestor of a protected path."""
+        """
+        True when a workspace-relative POSIX path is, is inside, or is an ancestor directory of a
+        guardrail/protected path (case-insensitive). Denying ancestor directories prevents moving or
+        deleting a parent tree (e.g. 'src/') whose subtree contains 'src/mellyn/'.
+        """
         norm_path = "" if rel_posix == "." else rel_posix.casefold().strip("/")
         if norm_path == "":
             return bool(self.protected_paths)
@@ -163,15 +196,15 @@ class WorkspacePathGuard:
 
     def validate_path(self, raw_path: str, *, is_write: bool = False) -> tuple[bool, str]:
         """Return (is_allowed, reason) for a workspace file read or write."""
-        if not raw_path.strip():
-            return False, "Path is empty."
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return False, "Path is empty or not a string."
         if _CONTROL_CHARACTERS.search(raw_path):
-            return False, "Path contains control characters."
+            return False, "Path contains control characters (for example a NUL byte)."
 
         candidate = Path(raw_path)
         try:
             resolved = (candidate if candidate.is_absolute() else self.workspace_root / candidate).resolve()
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:  # e.g. invalid names, symlink loops
             return False, f"Workspace path could not be resolved ({type(exc).__name__})."
 
         try:
@@ -190,10 +223,12 @@ class WorkspacePathGuard:
 
         rel_posix = rel_path.as_posix()
 
+        # Check sensitive directory components (e.g., .ssh, .aws, secrets)
         for part in rel_path.parts:
             if part.lower() in SENSITIVE_PATH_PARTS:
                 return False, f"Access to sensitive directory '{part.lower()}' is denied."
 
+        # Check sensitive filenames (.env, *.pem, *.key, credentials.json, .npmrc, ...)
         filename = rel_path.name
         if filename.lower() != ".env.example":
             for pattern in SENSITIVE_FILENAME_PATTERNS:
@@ -202,6 +237,7 @@ class WorkspacePathGuard:
         if rel_posix.casefold() in SENSITIVE_RELATIVE_PATHS:
             return False, "Access to sensitive file is denied."
 
+        # Block agent self-modification of security guardrails (and ancestor directories containing them)
         if is_write and self.is_protected(rel_posix):
             return False, "Modifying protected guardrail path is denied."
 
@@ -215,8 +251,12 @@ class WorkspacePathGuard:
         max_matches: int = 200,
         max_file_bytes: int = 1024 * 1024,
     ) -> list[SearchMatch]:
-        """Recursively search workspace files while validating each file before reading."""
-        if not query:
+        """
+        Recursively search workspace text files while applying `validate_path(..., is_write=False)`
+        to every directory and file BEFORE opening it, so secret files (`.env`, `*.pem`, `.ssh/`, ...)
+        are never read even when `start_path` is the workspace root.
+        """
+        if not isinstance(query, str) or not query:
             raise ValueError("Search query must be a non-empty string.")
         ok, reason = self.validate_path(start_path, is_write=False)
         if not ok:

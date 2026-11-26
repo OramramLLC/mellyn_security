@@ -14,9 +14,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-BACKEND_DIR = REPO_ROOT / "backend"
 
-for _path in (REPO_ROOT, SRC_DIR, BACKEND_DIR):
+for _path in (REPO_ROOT, SRC_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
@@ -25,9 +24,9 @@ if importlib.util.find_spec("pydantic") is None and os.environ.get("MELLYN_REQUI
 
 from examples.airlock_demo.run_demo import POLICY_PATH, SERVER_PATH, run_demo_session  # noqa: E402
 from examples.airlock_demo.run_demo import main as demo_main  # noqa: E402
-from mcp_airlock.airlock.models import parse_airlock_policy_toml  # noqa: E402
-from mcp_airlock.airlock.pin_cli import inspect_mcp_server  # noqa: E402
-from mcp_airlock.airlock.proxy import JSONRPC_POLICY_VIOLATION  # noqa: E402
+from mellyn.airlock.models import parse_airlock_policy_toml  # noqa: E402
+from mellyn.airlock.pin_cli import inspect_mcp_server  # noqa: E402
+from mellyn.airlock.proxy import JSONRPC_POLICY_VIOLATION  # noqa: E402
 
 
 class TestDemoWalkthrough(unittest.TestCase):
