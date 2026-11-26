@@ -10,7 +10,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mellyn.core.audit import LedgerAnchor, verify_ledger_bytes
+from mellyn.core.audit import LedgerAnchor, verify_ledger_bytes_core
+from mellyn.core.schemas import LedgerFormat
 
 
 class ChainVerificationReport(BaseModel):
@@ -29,15 +30,30 @@ class ChainVerificationReport(BaseModel):
     # False when no external anchor was supplied: entries deleted from the END of the ledger (or a ledger rewritten
     # from genesis) still verify as a valid chain, so a "valid" result does not rule those out.
     anchored: bool = False
+    ledger_format: LedgerFormat | None = None
 
 
 def verify_chain_bytes(
     raw_bytes: bytes, *, ledger_path: str, anchor: LedgerAnchor | None = None
 ) -> ChainVerificationReport:
-    """Verify ledger bytes already read into memory (see `verify_chain`)."""
-    check = verify_ledger_bytes(raw_bytes, anchor=anchor)
+    """Verify ledger bytes already read into memory (via the unified `mellyn.core.audit` verifier)."""
+    check = verify_ledger_bytes_core(raw_bytes, anchor=anchor)
     first_invalid_line = (
-        check.first_invalid_seq + 1 if (not check.valid and check.first_invalid_seq is not None) else None
+        check.first_invalid_line
+        if check.first_invalid_line is not None
+        else (check.first_invalid_seq + 1 if (not check.valid and check.first_invalid_seq is not None) else None)
+    )
+    fmt: LedgerFormat | None = (
+        check.ledger_format
+        if check.ledger_format
+        in {  # type: ignore[assignment]
+            "empty",
+            "v2",
+            "v1_airlock",
+            "v1_gateway",
+            "pre_chain",
+        }
+        else None
     )
     return ChainVerificationReport(
         valid=check.valid,
@@ -49,6 +65,7 @@ def verify_chain_bytes(
         first_invalid_line=first_invalid_line,
         reason=check.reason,
         anchored=anchor is not None,
+        ledger_format=fmt,
     )
 
 
@@ -56,10 +73,22 @@ def read_and_verify_chain(
     path: Path, *, anchor: LedgerAnchor | None = None
 ) -> tuple[ChainVerificationReport, bytes | None]:
     """
-    Read `path` ONCE and verify those bytes. Returns the report and the verified bytes (None if unreadable), so a
-    caller that goes on to parse the ledger reports on exactly the content that was verified, even if the file is
-    being appended to or edited at the same time.
+    Read `path` ONCE and verify those bytes. Refuses symlink ledger paths fail-closed and returns
+    the report plus the exact verified bytes so callers never reconstruct from unverified content.
     """
+    if path.is_symlink() or path.parent.is_symlink():
+        return (
+            ChainVerificationReport(
+                valid=False,
+                ledger_path=str(path),
+                entry_count=0,
+                first_invalid_seq=0,
+                first_invalid_line=1,
+                reason=f"Refusing symlink audit ledger path '{path}'.",
+                anchored=anchor is not None,
+            ),
+            None,
+        )
     if not path.is_file():
         return (
             ChainVerificationReport(
@@ -67,6 +96,7 @@ def read_and_verify_chain(
                 ledger_path=str(path),
                 entry_count=0,
                 first_invalid_seq=0,
+                first_invalid_line=1,
                 reason="Audit ledger does not exist.",
                 anchored=anchor is not None,
             ),
@@ -81,6 +111,7 @@ def read_and_verify_chain(
                 ledger_path=str(path),
                 entry_count=0,
                 first_invalid_seq=0,
+                first_invalid_line=1,
                 reason=f"Could not read audit ledger: {exc}",
                 anchored=anchor is not None,
             ),
@@ -90,12 +121,7 @@ def read_and_verify_chain(
 
 
 def verify_chain(path: Path, *, anchor: LedgerAnchor | None = None) -> ChainVerificationReport:
-    """
-    Verify an `audit.jsonl` ledger from genesis (`seq == 0`, `prev_hash == "0" * 64`) using `core.audit`.
-
-    Returns a strict `ChainVerificationReport` pinpointing both `first_invalid_seq` and 1-based `first_invalid_line`
-    on tamper or truncation.
-    """
+    """Verify an `audit.jsonl` ledger from genesis (`v2`, `v1_airlock`, `v1_gateway`) via `core.audit`."""
     report, _ = read_and_verify_chain(path, anchor=anchor)
     return report
 

@@ -13,8 +13,8 @@ Mellyn mediates every action between an untrusted AI agent client and external t
    - Policy and risk evaluation (`authorizer.py`, `policy.py`, `policy_loader.py`) supporting default-deny capability checks, taint tracking, and human-in-the-loop single-use approvals (`approvals.py`, `approval_relay.py`, `approve.py`, `state_store.py`).
    - Multi-server stdio and HTTP/OAuth 2.1 downstream gateway (`mcp_gateway.py`, `pin_gateway.py`, `gateway_config.py`, `http_downstream.py`, `oauth_client.py`) with pinned tool manifests.
    - CLI (`cli.py`, `init_cmd.py`) and HTTP control API (`api.py`).
-3. **Egress Guard & Scanner (`src/mellyn/egress/`, `src/mellyn/scanner.py`):** Inspects outbound arguments, tool outputs, and HTTP egress requests for high-entropy secrets, provider token patterns, and canary tokens (`scanner.py`, `guards.py`), paired with forwarding proxy controls (`egress_proxy.py`) and throughput benchmarking (`bench.py`).
-4. **Forensic Flight Recorder (`src/mellyn/core/audit.py`, `src/mellyn/ir_lab/`, `src/mellyn/audit.py`):** Captures `artifact_sha256` digests before redacting sensitive values, writes redacted records into SHA-256 hash-chained JSONL logs, and supports offline timeline reconstruction (`reconstruct.py`) and ledger verification (`verify_chain.py`).
+3. **Egress Guard & Scanner (`src/mellyn/egress/`, `src/mellyn/scanner.py`):** Inspects outbound arguments, tool outputs, and HTTP egress requests through one shared stdlib scanning core (`mellyn.core.scan`) for high-entropy secrets (Airlock default on; gateway configurable off by default), provider token patterns, and canary tokens (`scanner.py`, `guards.py`), paired with forwarding proxy controls (`egress_proxy.py`) and throughput benchmarking (`bench.py`).
+4. **Forensic Flight Recorder (`src/mellyn/core/audit.py`, `src/mellyn/ir_lab/`, `src/mellyn/audit.py`):** Captures `artifact_sha256` digests before redacting sensitive values, writes redacted records through one unified `schema_version = 2` SHA-256 hash-chained JSONL engine (`core/audit.py`) shared by Airlock, Gateway, and Authorizer (with read-only v1 verification and move-aside rotation on upgrade), and supports offline timeline reconstruction (`reconstruct.py`) and ledger verification (`verify_chain.py`, `mellyn verify`) for both Airlock and gateway/authorizer sessions.
 
 ---
 
@@ -32,10 +32,10 @@ mellyn.egress       (imports core only)  │
 mellyn.airlock        mellyn.ir_lab
 ```
 
-- `mellyn.core`: Wire models (`schemas.py`), NFKC & invisible-character helpers (`normalize.py`), and hash-chained redact-before-disk JSONL audit writer (`audit.py`).
-- `mellyn.egress`: Destination/workspace confinement guards (`guards.py`, stdlib-only), lazy-loaded secret/canary scanner (`scanner.py`), and scanner benchmark (`bench.py`).
+- `mellyn.core`: Wire models (`schemas.py`), NFKC & invisible-character helpers (`normalize.py`), shared stdlib secret/canary scanning & redaction core (`scan.py`), and the unified `schema_version = 2` hash-chained JSONL ledger writer & universal verifier (`audit.py`).
+- `mellyn.egress`: Destination/workspace confinement guards (`guards.py`, stdlib-only), lazy-loaded Pydantic scanner wrapper (`scanner.py`), and dual-surface scanner benchmark (`bench.py`).
 - `mellyn.airlock`: Airlock models (`models.py`), decision engine (`engine.py`), AgBOM pin CLI (`pin_cli.py`), and stdio wire proxy (`proxy.py`).
-- `mellyn.ir_lab`: Post-incident JSONL timeline reconstruction (`reconstruct.py`) and hash-chain verification (`verify_chain.py`).
+- `mellyn.ir_lab`: Post-incident JSONL timeline reconstruction across Airlock, gateway, and authorizer ledgers (`reconstruct.py`) and hash-chain verification (`verify_chain.py`).
 
 ---
 
@@ -43,7 +43,7 @@ mellyn.airlock        mellyn.ir_lab
 
 - **Client ↔ Airlock/Gateway (`stdio` or Gateway):** Untrusted JSON-RPC frames and tool call payloads are validated strictly on ingress; `stdout` stays purely reserved for JSON-RPC wire traffic while diagnostics go to `stderr` or the audit ledger.
 - **Airlock/Gateway ↔ Downstream MCP Server:** Local stdio child processes receive minimal explicit environment variables (never ambient `os.environ`). HTTP downstreams validate TLS, SSRF/private-IP restrictions, and OAuth 2.1 tokens (`http_downstream.py`, `oauth_client.py`).
-- **Runtime ↔ Disk (`audit.py` / `state_store.py`):** Raw secrets and canary values are digested (`artifact_sha256`) and redacted prior to JSONL serialization and hash-chaining.
+- **Runtime ↔ Disk (`core/audit.py` / `audit.py` / `state_store.py`):** Raw secrets and canary values are digested (`artifact_sha256` / `args_sha256`) and redacted via `mellyn.core.scan` prior to canonical `schema_version = 2` JSONL serialization, zero-canary assertion, `0o600` locked `fsync` writes with symlink refusal and line-break escaping.
 - **Containerized Stack (`deploy/docker-compose.yml`):** Optional Docker Compose topology isolates runtime containers on an internal bridge network (`mellyn-internal`), routing allowed outbound HTTP traffic exclusively through the hardened Squid egress proxy (`deploy/egress/squid.conf`) under `--profile gateway` and optional `--profile relay`.
 
 ---
@@ -125,6 +125,7 @@ mellyn.airlock        mellyn.ir_lab
 │       │   ├── __init__.py
 │       │   ├── audit.py
 │       │   ├── normalize.py
+│       │   ├── scan.py
 │       │   └── schemas.py
 │       ├── egress/
 │       │   ├── __init__.py

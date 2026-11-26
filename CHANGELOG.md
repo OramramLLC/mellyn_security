@@ -7,6 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Changed
+- **Breaking: unified audit ledger (`schema_version = 2`, Phase 2, Pass 2C).** Consolidated the Airlock
+  (`mellyn.core.audit`) and gateway/authorizer (`mellyn.audit`) flight recorders into one writer
+  (`CoreAuditLedger`) and one universal verifier (`verify_ledger_file_core` / `verify_ledger_bytes_core`) inside
+  stdlib-importable `mellyn.core.audit`.
+  - **Breaking v2 JSONL envelope:** New ledger entries across `mellyn-airlock`, `mellyn proxy`, and the HTTP
+    authorizer (`mellyn.api`) wrap each record as `{schema_version: 2, seq, prev_hash, entry_hash, source, event}`
+    where `source` is `"airlock"`, `"gateway"`, or `"authorizer"`. Scripts parsing raw gateway JSONL lines must read
+    event fields from `row["event"]` instead of the top level.
+  - **One verifier & read-only legacy support:** `verify_ledger`, `verify_ledger_bytes`, `verify_gateway_audit_file`,
+    and `verify_gateway_audit_lines` share the single core verifier, auto-detecting and verifying `v2`, `v1_airlock`,
+    and `v1_gateway` ledgers read-only while rejecting mixed-format or unchained files.
+  - **Automatic upgrade rotation:** Opening an existing clean v1 ledger moves it aside unchanged as
+    `<name>.v1-<UTC>` (alongside `*.pre-chain-<UTC>` for unchained pre-1.1 logs) and writes a `schema_version = 2`
+    `ledger_rotated` genesis record at `seq = 0`. Mixed-version, symlinked, or tampered files still refuse startup.
+  - **Unified CLI & forensics:** `mellyn verify` supports `--anchor-seq` and `--anchor-hash` on gateway ledgers as
+    well as Airlock ledgers, and `mellyn-ir` reconstructs session timelines (`--json` and Markdown) for both Airlock
+    and gateway/authorizer ledgers (`v2`, `v1_airlock`, and `v1_gateway`).
 - **Unified scanning and redaction core (Phase 2, Pass 2B).** Consolidated the Airlock scanner
   (`mellyn.egress.scanner`), gateway scanner (`mellyn.scanner`), and core ledger regexes into one stdlib-only
   module, `mellyn.core.scan`. `CORE_SECRET_PATTERNS` and `KNOWN_SECRET_RULE_PATTERNS` are removed in favor of
@@ -71,6 +88,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `gitleaks` binary and fails the commit if none is found.
 
 ### Security
+- **Unified ledger hardening (`schema_version = 2`, Pass 2C).** Both Airlock (`AuditLedger`) and
+  gateway/authorizer (`AuditLogger`) now enforce the union of ledger controls: symlink refusal (`is_symlink` and
+  `O_NOFOLLOW`), `0o600` file creation, cross-process OS locks (`.lock` sidecar), per-append `fsync`, constant-time
+  `hmac.compare_digest` verification, U+0085/U+2028/U+2029 escaping, full `mellyn.core.scan` redaction with a
+  pre-flush zero-canary assertion, and external `(seq, entry_hash)` anchor support.
+- **The gateway protects its ledger's siblings (Pass 2C).** When the audit ledger is inside the workspace, the
+  gateway now also protects `<ledger>.*`: the `.lock` file and the `.v1-*` / `.pre-chain-*` files older ledgers
+  are moved aside to. Before, an approved agent write could plant a directory at the lock path (every restart then
+  failed) or delete a moved-aside ledger. Policy `protected_paths` entries ending in `.*` now mean "every
+  `<name>.<suffix>` sibling in that folder".
+
+### Changed (performance)
+- **Ledger appends hold their files open (Pass 2C).** The gateway/authorizer logger keeps the ledger and its lock
+  file open between appends, re-checking before each one that neither path is a symlink and that both still name
+  the same file (by device and inode), so a swapped file is re-verified rather than written through a stale
+  handle. Before, every append opened the lock file once and the ledger twice: about 13 ms per append on Windows,
+  now about 4.4 ms. The remaining cost is the per-append `fsync` and the zero-canary check. The Airlock's writer
+  still opens per append.
 - **Unified scanning & full-rule coverage across Airlock, gateway, and ledgers (Pass 2B).** Airlock now
   blocks payloads nested deeper than 64 levels (`nesting-too-deep`), both scanners run all 13 secret rules
   and all canaries without early short-circuiting, and the gateway + audit redactor (`mellyn.audit.redact_text`)

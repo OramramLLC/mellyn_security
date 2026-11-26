@@ -18,9 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from mellyn.core.normalize import JsonObject, JsonValue
 
 type Severity = Literal["ALLOW", "INFO", "WARN", "BLOCK", "AAD_FIRE"]
-type Zone = Literal["core", "egress", "airlock", "ir_lab"]
+type Zone = Literal["core", "egress", "airlock", "ir_lab", "gateway", "authorizer"]
+type LedgerSource = Literal["airlock", "gateway", "authorizer"]
+type LedgerFormat = Literal["empty", "v2", "v1_airlock", "v1_gateway", "pre_chain"]
 type RedactionKind = Literal["canary", "secret", "high_entropy", "blocked_pattern", "structure"]
 
+LEDGER_SCHEMA_VERSION: Literal[2] = 2
 GENESIS_PREV_HASH = "0" * 64
 AAD_CONTAINMENT_CONFIRMED_RULE_ID = "airlock.aad_containment_confirmed"
 # First event of every proxy session; its metadata records `enforcement_mode` and the operator flags.
@@ -137,11 +140,13 @@ class ZoneEvent(_StrictModel):
 
 
 class AuditLedgerEntry(_StrictModel):
-    """Hash-chained JSONL entry persisted by `core.audit.AuditLedger`."""
+    """Hash-chained JSONL entry persisted by `core.audit.AuditLedger` (`schema_version = 2`)."""
 
+    schema_version: Literal[2] = LEDGER_SCHEMA_VERSION
     seq: int = Field(ge=0)
     prev_hash: str
     entry_hash: str
+    source: LedgerSource = "airlock"
     event: ZoneEvent
 
     @field_validator("prev_hash", "entry_hash")
@@ -167,3 +172,4 @@ class LedgerVerification(_StrictModel):
     last_hash: str | None = None
     first_invalid_seq: int | None = None
     reason: str | None = None
+    ledger_format: LedgerFormat | None = None

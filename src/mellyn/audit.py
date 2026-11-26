@@ -1,26 +1,39 @@
-"""Redacted, hash-chained structured audit logger for Mellyn Security authorization decisions."""
+"""Redacted, hash-chained structured audit logger wrapping the unified `mellyn.core.audit` v2 ledger."""
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
-import os
 import secrets
-import threading
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Any, TextIO
+from typing import IO, Any, TextIO, cast
 
+from mellyn.core.audit import (
+    GENESIS_PREV_HASH as _CORE_GENESIS_PREV_HASH,
+)
+from mellyn.core.audit import (
+    CoreAuditLedger,
+    CoreLedgerVerification,
+    LedgerAnchor,
+    LedgerIntegrityError,
+    encode_ledger_line,
+    is_legacy_unchained_bytes,
+    verify_ledger_file_core,
+    verify_ledger_lines_core,
+)
+from mellyn.core.audit import (
+    split_audit_lines as split_audit_lines,
+)
 from mellyn.core.scan import (
     SECRET_REDACTION_PATTERNS as SECRET_REDACTION_PATTERNS,
 )
 from mellyn.core.scan import redact_core_secrets
 from mellyn.models import Decision, RiskTier, TaintSource, canonical_json, canonical_json_value, utc_now
 
-GENESIS_PREV_HASH = "0" * 64
+GENESIS_PREV_HASH = _CORE_GENESIS_PREV_HASH
 MAX_AUDIT_REASON_CHARS = 512
 MAX_TAINT_ENTRY_CHARS = 256
 EMPTY_ARGS_SHA256 = hashlib.sha256(b"{}").hexdigest()
@@ -32,7 +45,7 @@ class AuditChainError(RuntimeError):
 
 @dataclass(frozen=True)
 class ChainVerificationResult:
-    """Result of verifying a gateway JSONL hash chain."""
+    """Result of verifying a JSONL audit hash chain."""
 
     valid: bool
     entry_count: int
@@ -40,6 +53,7 @@ class ChainVerificationResult:
     last_hash: str
     first_invalid_line: int | None
     reason: str | None
+    ledger_format: str | None = None
 
 
 def redact_text(value: str) -> str:
@@ -83,170 +97,72 @@ def format_taint_entry(source: TaintSource, *, max_chars: int = MAX_TAINT_ENTRY_
 
 
 def compute_audit_entry_hash(event_dict: Mapping[str, Any]) -> str:
-    """Compute canonical SHA-256 hash over an `AuditEvent` dictionary excluding `entry_hash`."""
+    """Compute v1 gateway canonical SHA-256 hash over an `AuditEvent` dictionary excluding `entry_hash`."""
     body = {k: v for k, v in event_dict.items() if k != "entry_hash"}
     encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-# Characters Python's str.splitlines() treats as line breaks but json.dumps(ensure_ascii=False) leaves raw. Written
-# unescaped, one of them inside a logged string split that record in two on read, so the whole ledger failed
-# verification and the next start refused. They are escaped on write, and ledgers are split on "\n" only.
-_LINE_BREAK_ESCAPES = str.maketrans({"\u0085": "\\u0085", " ": "\\u2028", " ": "\\u2029"})
-_CHAIN_FIELDS = ("seq", "prev_hash", "entry_hash")
-
-
-def _dump_audit_line(record: Mapping[str, Any]) -> str:
-    """One JSON line for the ledger. Escaping the line-break characters changes the text, not the parsed value."""
-    return json.dumps(record, sort_keys=True, ensure_ascii=False).translate(_LINE_BREAK_ESCAPES)
-
-
-def split_audit_lines(text: str) -> list[str]:
-    """Split a ledger into records on "\\n" only; the verifier strips any trailing "\\r"."""
-    return text.split("\n")
-
-
-def _strict_json_loads(raw_line: str) -> Any:
-    def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for k, v in pairs:
-            if k in out:
-                raise ValueError(f"Duplicate JSON key '{k}' in audit entry.")
-            out[k] = v
-        return out
-
-    return json.loads(raw_line, object_pairs_hook=_reject_dup_keys)
-
-
-def verify_gateway_audit_lines(lines: Sequence[str]) -> ChainVerificationResult:
-    """Verify sequential `seq`, `prev_hash`, and `entry_hash` links across gateway JSONL lines."""
-    expected_seq = 0
-    expected_prev = GENESIS_PREV_HASH
-    entry_count = 0
-
-    for line_no, raw_line in enumerate(lines, start=1):
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        try:
-            obj = _strict_json_loads(stripped)
-        except (ValueError, json.JSONDecodeError) as exc:
-            return ChainVerificationResult(
-                valid=False,
-                entry_count=entry_count,
-                last_seq=expected_seq - 1 if entry_count else None,
-                last_hash=expected_prev,
-                first_invalid_line=line_no,
-                reason=f"Malformed JSON or duplicate key on line {line_no}: {exc}",
-            )
-        if not isinstance(obj, dict):
-            return ChainVerificationResult(
-                valid=False,
-                entry_count=entry_count,
-                last_seq=expected_seq - 1 if entry_count else None,
-                last_hash=expected_prev,
-                first_invalid_line=line_no,
-                reason=f"Audit entry on line {line_no} is not a JSON object.",
-            )
-
-        seq = obj.get("seq")
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq != expected_seq:
-            return ChainVerificationResult(
-                valid=False,
-                entry_count=entry_count,
-                last_seq=expected_seq - 1 if entry_count else None,
-                last_hash=expected_prev,
-                first_invalid_line=line_no,
-                reason=f"Sequence mismatch on line {line_no}: expected seq={expected_seq}, got {seq!r}.",
-            )
-
-        prev_hash = obj.get("prev_hash")
-        if not isinstance(prev_hash, str) or not hmac.compare_digest(prev_hash, expected_prev):
-            return ChainVerificationResult(
-                valid=False,
-                entry_count=entry_count,
-                last_seq=expected_seq - 1 if entry_count else None,
-                last_hash=expected_prev,
-                first_invalid_line=line_no,
-                reason=f"Chain link mismatch on line {line_no}: prev_hash does not match previous entry_hash.",
-            )
-
-        entry_hash = obj.get("entry_hash")
-        expected_hash = compute_audit_entry_hash(obj)
-        if not isinstance(entry_hash, str) or not hmac.compare_digest(entry_hash, expected_hash):
-            return ChainVerificationResult(
-                valid=False,
-                entry_count=entry_count,
-                last_seq=expected_seq - 1 if entry_count else None,
-                last_hash=expected_prev,
-                first_invalid_line=line_no,
-                reason=f"Entry digest mismatch on line {line_no} (tampered record).",
-            )
-
-        entry_count += 1
-        expected_seq += 1
-        expected_prev = entry_hash
-
+def _to_chain_result(res: CoreLedgerVerification) -> ChainVerificationResult:
     return ChainVerificationResult(
-        valid=True,
-        entry_count=entry_count,
-        last_seq=expected_seq - 1 if entry_count else None,
-        last_hash=expected_prev,
-        first_invalid_line=None,
-        reason=None,
+        valid=res.valid,
+        entry_count=res.entry_count,
+        last_seq=res.last_seq,
+        last_hash=res.last_hash if res.last_hash is not None else GENESIS_PREV_HASH,
+        first_invalid_line=res.first_invalid_line,
+        reason=res.reason,
+        ledger_format=res.ledger_format,
     )
 
 
-def verify_gateway_audit_file(path: Path) -> ChainVerificationResult:
-    """Verify hash-chain integrity on a gateway JSONL file on disk (fails closed on unreadable/missing files)."""
+def verify_gateway_audit_lines(lines: Sequence[str], *, anchor: LedgerAnchor | None = None) -> ChainVerificationResult:
+    """Verify hash-chain links across JSONL lines via the single `mellyn.core.audit` verifier."""
+    return _to_chain_result(verify_ledger_lines_core(lines, anchor=anchor))
+
+
+def verify_gateway_audit_file(path: Path, *, anchor: LedgerAnchor | None = None) -> ChainVerificationResult:
+    """Verify hash-chain integrity on a ledger file on disk (fails closed on symlink/unreadable/missing files)."""
     if path.is_symlink() or path.parent.is_symlink():
         raise AuditChainError(f"Refusing symlink audit log path '{path}'.")
     if not path.is_file():
         raise AuditChainError(f"Audit log file does not exist: '{path}'.")
-    try:
-        raw_lines = split_audit_lines(path.read_bytes().decode("utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise AuditChainError(f"Unable to read audit log '{path}': {exc}") from exc
-    return verify_gateway_audit_lines(raw_lines)
+    res = verify_ledger_file_core(path, anchor=anchor)
+    if not res.valid and res.reason and res.reason.startswith("Could not read audit ledger:"):
+        raise AuditChainError(res.reason)
+    return _to_chain_result(res)
 
 
 def _is_legacy_unchained_log(path: Path) -> bool:
-    """
-    True only for a log written before the hash chain existed: every record is a JSON object and none carries any
-    chain field. A file with even one chained record, or anything unparseable, is not legacy.
-    """
-    try:
-        lines = split_audit_lines(path.read_bytes().decode("utf-8"))
-    except (OSError, UnicodeDecodeError):
+    """True only when `path` is a non-empty unchained pre-1.1 log with no chain or schema fields."""
+    if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
         return False
-    records = 0
-    for raw in lines:
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        try:
-            obj = _strict_json_loads(stripped)
-        except (ValueError, json.JSONDecodeError):
-            return False
-        if not isinstance(obj, dict) or any(field in obj for field in _CHAIN_FIELDS):
-            return False
-        records += 1
-    return records > 0
-
-
-def _rotate_legacy_log(path: Path) -> Path:
-    """Rename a legacy log to `<name>.pre-chain-<UTC time>[-N]` in the same folder, never overwriting anything."""
-    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
-    target = path.with_name(f"{path.name}.pre-chain-{stamp}")
-    counter = 1
-    while target.exists() or target.is_symlink():
-        target = path.with_name(f"{path.name}.pre-chain-{stamp}-{counter}")
-        counter += 1
     try:
-        path.rename(target)
-    except OSError as exc:
-        raise AuditChainError(f"Could not move the unchained audit log '{path}' aside: {exc}") from exc
-    return target
+        return is_legacy_unchained_bytes(path.read_bytes())
+    except OSError:
+        return False
+
+
+class _LedgerHandle:
+    """File-like close/context-manager handle returned by `AuditLogger.open_chained()`."""
+
+    def __init__(self, core: CoreAuditLedger) -> None:
+        self._core = core
+
+    @property
+    def closed(self) -> bool:
+        return self._core.closed
+
+    def flush(self) -> None:
+        self._core.flush()
+
+    def close(self) -> None:
+        self._core.close()
+
+    def __enter__(self) -> _LedgerHandle:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -274,11 +190,64 @@ class AuditEvent:
     enforcement_mode: str = "enforce"
 
 
+def _gateway_event_payload(event: AuditEvent) -> dict[str, Any]:
+    """Extract the `event` object stored inside a `schema_version = 2` gateway/authorizer envelope."""
+    return {
+        "audit_id": event.audit_id,
+        "timestamp": event.timestamp,
+        "session_id": event.session_id,
+        "tool_name": event.tool_name,
+        "mcp_server": event.mcp_server,
+        "decision": event.decision,
+        "risk_tier": event.risk_tier,
+        "tainted": event.tainted,
+        "taint_sources": list(event.taint_sources),
+        "args_sha256": event.args_sha256,
+        "reasons": list(event.reasons),
+        "policy_id": event.policy_id,
+        "grant_id": event.grant_id,
+        "event_type": event.event_type,
+        "taint_count": event.taint_count,
+        "enforcement_mode": event.enforcement_mode,
+    }
+
+
+def _audit_event_from_core(
+    *,
+    seq: int,
+    prev_hash: str,
+    entry_hash: str,
+    ev: Mapping[str, Any],
+) -> AuditEvent:
+    return AuditEvent(
+        audit_id=str(ev["audit_id"]),
+        timestamp=str(ev["timestamp"]),
+        session_id=str(ev["session_id"]),
+        tool_name=str(ev["tool_name"]),
+        mcp_server=cast(str | None, ev.get("mcp_server")),
+        decision=str(ev["decision"]),
+        risk_tier=str(ev["risk_tier"]),
+        tainted=bool(ev["tainted"]),
+        taint_sources=[str(item) for item in ev.get("taint_sources", ())],
+        args_sha256=str(ev["args_sha256"]),
+        reasons=[str(item) for item in ev.get("reasons", ())],
+        policy_id=cast(str | None, ev.get("policy_id")),
+        grant_id=cast(str | None, ev.get("grant_id")),
+        event_type=str(ev.get("event_type", "authorization")),
+        taint_count=int(ev.get("taint_count", 0)),
+        seq=seq,
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
+        enforcement_mode=str(ev.get("enforcement_mode", "enforce")),
+    )
+
+
 class AuditLogger:
     """
-    Redacted, hash-chained audit sink. Keeps the most recent events in memory and, when `sink` is given,
-    appends each event as one JSON line and flushes. The gateway points `sink` at a dedicated file: never at a
-    stream a downstream process can also write to (such as a shared stderr), or entries can be forged.
+    Redacted, hash-chained `schema_version = 2` audit sink backed by `CoreAuditLedger`.
+
+    Keeps the most recent events in memory and persists each record with symlink refusal, `0o600` file
+    creation, cross-process locking, `fsync`, zero-canary assertion before flush, and line-break escaping.
     """
 
     def __init__(
@@ -290,16 +259,49 @@ class AuditLogger:
         start_seq: int = 0,
         prev_hash: str = GENESIS_PREV_HASH,
         enforcement_mode: str = "enforce",
+        source: str = "gateway",
+        _core: CoreAuditLedger | None = None,
     ) -> None:
         self._events: deque[AuditEvent] = deque(maxlen=max_in_memory)
-        self._sink = sink
-        self._lock = threading.Lock()
+        self._lines: deque[str] = deque(maxlen=max_in_memory)
         self._canary_tokens = tuple(t for t in canary_tokens if t)
-        self._next_seq = start_seq
-        self._last_hash = prev_hash
         self._enforcement_mode = enforcement_mode
-        # Set by open_chained() when it moved an unchained 1.0.0 log aside; callers report it to the operator.
-        self.rotated_legacy_path: Path | None = None
+        self._source = source
+        self._core = (
+            _core
+            if _core is not None
+            else CoreAuditLedger(
+                sink=sink,
+                source=source,
+                canary_tokens=self._canary_tokens,
+                start_seq=start_seq,
+                prev_hash=prev_hash,
+            )
+        )
+        # Set by open_chained() when it moved an existing pre-chain or v1 ledger aside; callers report it.
+        self.rotated_legacy_path: Path | None = self._core.rotated_legacy_path
+        self.rotated_legacy_format: str | None = self._core.rotated_legacy_format
+        if self._core.rotation_entry is not None:
+            rot = self._core.rotation_entry
+            rot_event = _audit_event_from_core(
+                seq=rot.seq,
+                prev_hash=rot.prev_hash,
+                entry_hash=rot.entry_hash,
+                ev=rot.event,
+            )
+            self._events.append(rot_event)
+            self._lines.append(
+                encode_ledger_line(
+                    {
+                        "schema_version": rot.schema_version,
+                        "seq": rot.seq,
+                        "prev_hash": rot.prev_hash,
+                        "entry_hash": rot.entry_hash,
+                        "source": rot.source,
+                        "event": rot.event,
+                    }
+                ).decode("utf-8")
+            )
 
     @classmethod
     def open_chained(
@@ -308,105 +310,114 @@ class AuditLogger:
         *,
         canary_tokens: Sequence[str] = (),
         enforcement_mode: str = "enforce",
+        anchor: LedgerAnchor | None = None,
+        source: str = "gateway",
     ) -> tuple[AuditLogger, IO[str]]:
         """
-        Verify any existing ledger at `path` fail-closed, then open for append (mode 0600 on POSIX).
+        Verify any existing ledger at `path` fail-closed (rotating unchained or v1 logs aside), then open for
+        locked `fsync` appends (`0o600` on POSIX, `schema_version = 2`).
         """
-        if path.is_symlink() or path.parent.is_symlink():
-            raise AuditChainError(f"Refusing symlink audit log path '{path}'.")
-        if path.exists() and path.is_dir():
-            raise AuditChainError(f"Audit log path '{path}' is a directory.")
 
-        start_seq = 0
-        prev_hash = GENESIS_PREV_HASH
-        rotated_from: Path | None = None
-        if path.exists():
-            res = verify_gateway_audit_file(path)
-            if not res.valid:
-                if not _is_legacy_unchained_log(path):
-                    raise AuditChainError(res.reason or f"Existing audit log '{path}' failed hash-chain check.")
-                # A 1.0.0 log has no chain to verify, so it cannot be appended to. Keep it, unchanged, beside the new
-                # ledger. Anything partly chained is not legacy and still fails closed above.
-                rotated_from = _rotate_legacy_log(path)
-            elif res.last_seq is not None:
-                start_seq = res.last_seq + 1
-                prev_hash = res.last_hash
+        def _rotation_event(rotated: Path, rotated_format: str, rotated_sha: str) -> dict[str, Any]:
+            if rotated_format == "pre_chain":
+                decision = "legacy_log_rotated"
+                reason = f"Moved the unchained pre-1.1 audit log to '{rotated.name}' and started a new v2 chain."
+            else:
+                decision = "v1_log_rotated"
+                reason = f"Moved the {rotated_format} audit log to '{rotated.name}' and started a new v2 chain."
+            return {
+                "audit_id": f"aud_{secrets.token_hex(12)}",
+                "timestamp": utc_now().isoformat(),
+                "session_id": "system",
+                "tool_name": "audit/ledger",
+                "mcp_server": None,
+                "decision": decision,
+                "risk_tier": RiskTier.LOW.value,
+                "tainted": False,
+                "taint_sources": [],
+                "args_sha256": rotated_sha,
+                "reasons": [reason],
+                "policy_id": "audit.migration",
+                "grant_id": None,
+                "event_type": "ledger_rotated",
+                "taint_count": 0,
+                "enforcement_mode": enforcement_mode,
+            }
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        handle = os.fdopen(fd, "a", encoding="utf-8")
-        if os.name == "posix" and path.exists() and not path.is_symlink():
-            os.chmod(path, 0o600)
-        logger = cls(
-            sink=handle,
-            canary_tokens=canary_tokens,
-            start_seq=start_seq,
-            prev_hash=prev_hash,
-            enforcement_mode=enforcement_mode,
-        )
-        logger.rotated_legacy_path = rotated_from
-        if rotated_from is not None:
-            # First record of the new chain, so the move itself is tamper-evident.
-            logger._emit(
-                AuditEvent(
-                    audit_id=f"aud_{secrets.token_hex(12)}",
-                    timestamp=utc_now().isoformat(),
-                    session_id="system",
-                    tool_name="audit/ledger",
-                    mcp_server=None,
-                    decision="legacy_log_rotated",
-                    risk_tier=RiskTier.LOW.value,
-                    tainted=False,
-                    taint_sources=[],
-                    args_sha256=EMPTY_ARGS_SHA256,
-                    reasons=[
-                        f"Moved the unchained pre-1.1 audit log to '{rotated_from.name}' and started a new chain."
-                    ],
-                    policy_id="audit.migration",
-                    grant_id=None,
-                    event_type="ledger_rotated",
-                    enforcement_mode=enforcement_mode,
-                )
+        try:
+            core = CoreAuditLedger(
+                path,
+                source=source,
+                canary_tokens=canary_tokens,
+                anchor=anchor,
+                create_empty=True,
+                now_fn=utc_now,
+                rotation_event_factory=_rotation_event,
+                keep_open=True,  # closed through the returned handle
             )
-        return logger, handle
+        except (LedgerIntegrityError, OSError) as exc:
+            raise AuditChainError(str(exc)) from exc
+
+        logger = cls(
+            canary_tokens=canary_tokens,
+            enforcement_mode=enforcement_mode,
+            source=source,
+            _core=core,
+        )
+        return logger, cast(IO[str], _LedgerHandle(core))
 
     @property
     def events(self) -> tuple[AuditEvent, ...]:
         return tuple(self._events)
 
+    @property
+    def head(self) -> LedgerAnchor | None:
+        return self._core.head
+
     def _scrub(self, text: str) -> str:
         return redact_core_secrets(text, canary_tokens=self._canary_tokens)
 
     def _emit(self, event: AuditEvent) -> AuditEvent:
-        with self._lock:
-            redacted_reasons = [self._scrub(reason)[:MAX_AUDIT_REASON_CHARS] for reason in event.reasons]
-            redacted_taints = [self._scrub(item)[:MAX_TAINT_ENTRY_CHARS] for item in event.taint_sources]
-            redacted_session = self._scrub(event.session_id)[:128]
-            redacted_tool = self._scrub(event.tool_name)[:128]
-            redacted_server = self._scrub(event.mcp_server)[:128] if event.mcp_server is not None else None
+        redacted_reasons = [self._scrub(reason)[:MAX_AUDIT_REASON_CHARS] for reason in event.reasons]
+        redacted_taints = [self._scrub(item)[:MAX_TAINT_ENTRY_CHARS] for item in event.taint_sources]
+        redacted_session = self._scrub(event.session_id)[:128]
+        redacted_tool = self._scrub(event.tool_name)[:128]
+        redacted_server = self._scrub(event.mcp_server)[:128] if event.mcp_server is not None else None
 
-            draft = replace(
-                event,
-                session_id=redacted_session,
-                tool_name=redacted_tool,
-                mcp_server=redacted_server,
-                taint_sources=redacted_taints,
-                reasons=redacted_reasons,
-                seq=self._next_seq,
-                prev_hash=self._last_hash,
-                entry_hash="",
-                enforcement_mode=event.enforcement_mode or self._enforcement_mode,
-            )
-            entry_hash = compute_audit_entry_hash(asdict(draft))
-            final = replace(draft, entry_hash=entry_hash)
+        draft = replace(
+            event,
+            session_id=redacted_session,
+            tool_name=redacted_tool,
+            mcp_server=redacted_server,
+            taint_sources=redacted_taints,
+            reasons=redacted_reasons,
+            enforcement_mode=event.enforcement_mode or self._enforcement_mode,
+        )
+        try:
+            core_entry = self._core.append(_gateway_event_payload(draft), source=self._source)
+        except (LedgerIntegrityError, OSError) as exc:
+            raise AuditChainError(str(exc)) from exc
 
-            self._next_seq += 1
-            self._last_hash = entry_hash
-            self._events.append(final)
-            if self._sink is not None:
-                self._sink.write(_dump_audit_line(asdict(final)) + "\n")
-                self._sink.flush()
-            return final
+        final = _audit_event_from_core(
+            seq=core_entry.seq,
+            prev_hash=core_entry.prev_hash,
+            entry_hash=core_entry.entry_hash,
+            ev=core_entry.event,
+        )
+        self._events.append(final)
+        self._lines.append(
+            encode_ledger_line(
+                {
+                    "schema_version": core_entry.schema_version,
+                    "seq": core_entry.seq,
+                    "prev_hash": core_entry.prev_hash,
+                    "entry_hash": core_entry.entry_hash,
+                    "source": core_entry.source,
+                    "event": core_entry.event,
+                }
+            ).decode("utf-8")
+        )
+        return final
 
     def record(
         self,
@@ -529,5 +540,5 @@ class AuditLogger:
         return self._emit(event)
 
     def to_jsonl(self) -> str:
-        """Export all recorded audit events as newline-delimited JSON."""
-        return "\n".join(_dump_audit_line(asdict(event)) for event in self._events)
+        """Export all recorded v2 audit entries as newline-delimited JSON."""
+        return "\n".join(self._lines)

@@ -178,6 +178,9 @@ class WorkspacePathGuard:
         True when a workspace-relative POSIX path is, is inside, or is an ancestor directory of a
         guardrail/protected path (case-insensitive). Denying ancestor directories prevents moving or
         deleting a parent tree (e.g. 'src/') whose subtree contains 'src/mellyn/'.
+
+        An entry ending in `.*` protects every sibling named `<name>.<suffix>` in the same directory, such as an
+        audit ledger's `.lock` file and the timestamped `.v1-*` / `.pre-chain-*` files it is moved aside to.
         """
         norm_path = "" if rel_posix == "." else rel_posix.casefold().strip("/")
         if norm_path == "":
@@ -188,6 +191,10 @@ class WorkspacePathGuard:
                 continue
             if norm_path == norm_prot:
                 return True
+            if norm_prot.endswith(".*"):
+                stem = norm_prot[:-1]  # "<name>."
+                if norm_path.startswith(stem) and len(norm_path) > len(stem) and "/" not in norm_path[len(stem) :]:
+                    return True
             if protected.endswith("/") and norm_path.startswith(f"{norm_prot}/"):
                 return True
             if norm_prot.startswith(f"{norm_path}/"):

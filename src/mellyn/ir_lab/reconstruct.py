@@ -11,21 +11,25 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mellyn.core.audit import LedgerAnchor, redact_core_secrets
+from mellyn.core.audit import EMPTY_JSON_OBJECT_SHA256, LedgerAnchor, redact_core_secrets
 from mellyn.core.normalize import is_invisible_codepoint
 from mellyn.core.schemas import (
     AAD_CONTAINMENT_CONFIRMED_RULE_ID,
     SESSION_STARTED_RULE_ID,
-    AuditLedgerEntry,
+    LedgerSource,
     Severity,
     Zone,
+    ZoneEvent,
 )
 from mellyn.ir_lab.verify_chain import ChainVerificationReport, read_and_verify_chain
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _MD_UNSAFE_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _MD_ESCAPES = str.maketrans(
@@ -166,29 +170,178 @@ class IncidentReport(BaseModel):
     terminal_event: TerminalTrigger | None = None
 
 
-def _parse_verified_entries(raw_bytes: bytes) -> list[AuditLedgerEntry]:
-    """Parse the exact bytes that `read_and_verify_chain` verified (never a second read of the file)."""
-    entries: list[AuditLedgerEntry] = []
+@dataclass(frozen=True)
+class _ParsedRecord:
+    seq: int
+    session_id: str
+    timestamp_utc: str
+    zone: Zone
+    action: str
+    verdict_allow: bool
+    severity: Severity
+    rule_id: str
+    reason: str
+    tool_name: str | None
+    rpc_id: int | str | None
+    artifact_sha256: str
+    event_id: str
+    enforcement_mode: Literal["enforce", "observe"] | None
+    is_observed: bool
+    trigger_event_id: str | None
+
+
+def _parse_airlock_record(seq: int, ev_raw: dict[str, Any]) -> _ParsedRecord:
+    ev = ZoneEvent.model_validate(ev_raw)
+    raw_sid = ev.metadata.get("session_id")
+    if isinstance(raw_sid, str) and raw_sid:
+        sid = raw_sid
+    elif ev.rule_id == "core.ledger_rotated":
+        sid = "system"
+    else:
+        sid = "default"
+    mode_raw = ev.metadata.get("enforcement_mode")
+    enf_mode: Literal["enforce", "observe"] | None = (
+        cast(Literal["enforce", "observe"], mode_raw) if mode_raw in ("enforce", "observe") else None
+    )
+    trig = ev.metadata.get("trigger_event_id")
+    return _ParsedRecord(
+        seq=seq,
+        session_id=sid,
+        timestamp_utc=ev.timestamp_utc,
+        zone=ev.zone,
+        action=ev.action,
+        verdict_allow=ev.verdict_allow,
+        severity=ev.severity,
+        rule_id=ev.rule_id,
+        reason=redact_core_secrets(ev.reason),
+        tool_name=ev.tool_name,
+        rpc_id=ev.request_id,
+        artifact_sha256=ev.artifact_sha256,
+        event_id=ev.event_id,
+        enforcement_mode=enf_mode,
+        is_observed=enf_mode == "observe",
+        trigger_event_id=trig if isinstance(trig, str) else None,
+    )
+
+
+def _gateway_decision_mapping(
+    decision: str, enf_mode: Literal["enforce", "observe"] | None
+) -> tuple[Severity, bool, bool]:
+    if decision == "allow":
+        return "ALLOW", True, False
+    if decision in ("tainted", "legacy_log_rotated", "v1_log_rotated"):
+        return "INFO", True, False
+    if decision == "require_approval":
+        return "WARN", False, False
+    if decision in ("deny", "blocked_egress", "blocked_listing"):
+        return "BLOCK", False, False
+    if decision in ("observed_block", "observed_hidden_unicode", "observed_require_approval"):
+        return "BLOCK", False, True
+    if decision == "aad_fire":
+        return "AAD_FIRE", False, False
+    if decision == "observed_aad":
+        return "AAD_FIRE", False, True
+    if decision.startswith("observed_") and enf_mode == "observe":
+        return "BLOCK", False, True
+    return "BLOCK", False, False
+
+
+def _parse_gateway_record(seq: int, source: LedgerSource, ev_raw: dict[str, Any]) -> _ParsedRecord:
+    raw_sid = ev_raw.get("session_id")
+    sid = raw_sid if (isinstance(raw_sid, str) and raw_sid) else "default"
+    event_type = str(ev_raw.get("event_type") or "authorization")
+    decision = str(ev_raw.get("decision") or "deny")
+    policy_id = ev_raw.get("policy_id")
+    mode_raw = ev_raw.get("enforcement_mode")
+    enf_mode: Literal["enforce", "observe"] | None = (
+        cast(Literal["enforce", "observe"], mode_raw) if mode_raw in ("enforce", "observe") else None
+    )
+    severity, verdict_allow, is_observed = _gateway_decision_mapping(decision, enf_mode)
+
+    zone: Zone
+    if event_type == "ledger_rotated":
+        zone = "core"
+    elif event_type == "containment" and policy_id == "scanner.egress":
+        zone = "egress"
+    elif source == "authorizer":
+        zone = "authorizer"
+    else:
+        zone = "gateway"
+
+    rule_id = (
+        f"{policy_id}.{decision}" if isinstance(policy_id, str) and policy_id else f"{source}.{event_type}.{decision}"
+    )
+    reasons = ev_raw.get("reasons")
+    raw_reason = "; ".join(str(r) for r in reasons) if isinstance(reasons, list) and reasons else decision
+    raw_sha = ev_raw.get("args_sha256")
+    art_sha = (
+        raw_sha
+        if (isinstance(raw_sha, str) and _SHA256_HEX_RE.fullmatch(raw_sha) is not None)
+        else EMPTY_JSON_OBJECT_SHA256
+    )
+    tool_raw = ev_raw.get("tool_name")
+    return _ParsedRecord(
+        seq=seq,
+        session_id=sid,
+        timestamp_utc=str(ev_raw.get("timestamp") or ""),
+        zone=zone,
+        action=event_type,
+        verdict_allow=verdict_allow,
+        severity=severity,
+        rule_id=rule_id,
+        reason=redact_core_secrets(raw_reason),
+        tool_name=tool_raw if isinstance(tool_raw, str) else None,
+        rpc_id=None,
+        artifact_sha256=art_sha,
+        event_id=str(ev_raw.get("audit_id") or f"gw-{seq}"),
+        enforcement_mode=enf_mode,
+        is_observed=is_observed,
+        trigger_event_id=None,
+    )
+
+
+def _parse_verified_records(raw_bytes: bytes) -> list[_ParsedRecord]:
+    """Parse verified bytes across v2 (Airlock/Gateway/Authorizer), v1 Airlock, and v1 Gateway ledgers."""
+    records: list[_ParsedRecord] = []
     for line in raw_bytes.split(b"\n"):
-        if line:
-            entries.append(AuditLedgerEntry.model_validate(json.loads(line.decode("utf-8"))))
-    return entries
+        if not line:
+            continue
+        obj = json.loads(line.decode("utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError("Verified ledger line is not a JSON object.")
+        seq = int(obj["seq"])
+        if obj.get("schema_version") == 2:
+            source = cast(LedgerSource, obj["source"])
+            event_obj = obj["event"]
+            if not isinstance(event_obj, dict):
+                raise ValueError("Verified v2 event must be a JSON object.")
+            if source == "airlock":
+                records.append(_parse_airlock_record(seq, event_obj))
+            else:
+                records.append(_parse_gateway_record(seq, source, event_obj))
+        elif "event" in obj:
+            event_obj = obj["event"]
+            if not isinstance(event_obj, dict):
+                raise ValueError("Verified v1 Airlock event must be a JSON object.")
+            records.append(_parse_airlock_record(seq, event_obj))
+        else:
+            records.append(_parse_gateway_record(seq, "gateway", obj))
+    return records
 
 
 def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> IncidentReport:
     """
-    Step 1: Verify the `audit.jsonl` hash chain fail-closed. If compromised, abort reconstruction and return
-    `status="INTEGRITY_COMPROMISED"`.
-    Step 2: Group verified events by `session_id`, recording zone transitions, `BLOCK` precursors, and the
-    terminal `AAD_FIRE` trigger.
+    Step 1: Verify the `audit.jsonl` hash chain fail-closed (v2, v1 Airlock, or v1 Gateway). If compromised,
+    abort reconstruction and return `status="INTEGRITY_COMPROMISED"`.
+    Step 2: Group verified events by `session_id`, recording zone transitions, `BLOCK` precursors, and
+    `AAD_FIRE` containment state.
     """
     verification, raw_bytes = read_and_verify_chain(path, anchor=anchor)
-    entries: list[AuditLedgerEntry] = []
+    records: list[_ParsedRecord] = []
     if verification.valid and raw_bytes is not None:
         try:
-            entries = _parse_verified_entries(raw_bytes)
-        except (UnicodeDecodeError, ValueError, ValidationError):
-            # Cannot happen for bytes that passed verification; fail closed rather than crash if it ever does.
+            records = _parse_verified_records(raw_bytes)
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError, ValidationError):
             verification = verification.model_copy(
                 update={"valid": False, "reason": "Verified ledger bytes could not be parsed."}
             )
@@ -206,11 +359,9 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
             terminal_event=None,
         )
 
-    grouped: dict[str, list[AuditLedgerEntry]] = {}
-    for entry in entries:
-        raw_sid = entry.event.metadata.get("session_id")
-        sid = raw_sid if (isinstance(raw_sid, str) and raw_sid) else "default"
-        grouped.setdefault(sid, []).append(entry)
+    grouped: dict[str, list[_ParsedRecord]] = {}
+    for rec in records:
+        grouped.setdefault(rec.session_id, []).append(rec)
 
     sessions: list[SessionTimeline] = []
     all_aad_triggers: list[TerminalTrigger] = []
@@ -218,7 +369,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
     observed_aad_count = 0
     observed_block_count = 0
 
-    for sid, sid_entries in grouped.items():
+    for sid, sid_records in grouped.items():
         zones_traversed: list[Zone] = []
         zone_transitions: list[str] = []
         block_precursors: list[TimelineEvent] = []
@@ -228,76 +379,77 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         prev_zone: Zone | None = None
         session_mode: Literal["enforce", "observe"] | None = None
 
-        for entry in sid_entries:
-            ev = entry.event
-            reason_code = map_reason_code(ev.rule_id)
-            safe_reason = redact_core_secrets(ev.reason)
-            is_observed = ev.metadata.get("enforcement_mode") == "observe"
-            if ev.rule_id == SESSION_STARTED_RULE_ID:
-                started_mode = ev.metadata.get("enforcement_mode")
-                if started_mode == "observe":
-                    session_mode = "observe"
-                elif started_mode == "enforce":
-                    session_mode = "enforce"
+        for rec in sid_records:
+            reason_code = map_reason_code(rec.rule_id)
+            if rec.rule_id == SESSION_STARTED_RULE_ID and rec.enforcement_mode is not None:
+                session_mode = rec.enforcement_mode
+            elif (
+                rec.zone in ("gateway", "egress", "authorizer")
+                and sid != "system"
+                and session_mode is None
+                and rec.enforcement_mode is not None
+            ):
+                session_mode = rec.enforcement_mode
+
             t_ev = TimelineEvent(
-                seq=entry.seq,
-                timestamp_utc=ev.timestamp_utc,
+                seq=rec.seq,
+                timestamp_utc=rec.timestamp_utc,
                 session_id=sid,
-                zone=ev.zone,
-                action=ev.action,
-                severity=ev.severity,
-                verdict_allow=ev.verdict_allow,
-                rule_id=ev.rule_id,
+                zone=rec.zone,
+                action=rec.action,
+                severity=rec.severity,
+                verdict_allow=rec.verdict_allow,
+                rule_id=rec.rule_id,
                 reason_code=reason_code,
-                reason=safe_reason,
-                tool_name=ev.tool_name,
-                rpc_id=ev.request_id,
-                artifact_sha256=ev.artifact_sha256,
+                reason=rec.reason,
+                tool_name=rec.tool_name,
+                rpc_id=rec.rpc_id,
+                artifact_sha256=rec.artifact_sha256,
             )
             events.append(t_ev)
 
-            if ev.zone not in zones_traversed:
-                zones_traversed.append(ev.zone)
-            if prev_zone is not None and prev_zone != ev.zone:
-                zone_transitions.append(f"{prev_zone} -> {ev.zone}")
-            prev_zone = ev.zone
+            if rec.zone not in zones_traversed:
+                zones_traversed.append(rec.zone)
+            if prev_zone is not None and prev_zone != rec.zone:
+                zone_transitions.append(f"{prev_zone} -> {rec.zone}")
+            prev_zone = rec.zone
 
-            if ev.severity == "BLOCK":
-                if is_observed:
+            if rec.severity == "BLOCK":
+                if rec.is_observed:
                     observed_block_count += 1
                 else:
                     saw_enforced_block = True
                 block_precursors.append(t_ev)
-            elif ev.severity == "AAD_FIRE":
-                if is_observed:
+            elif rec.severity == "AAD_FIRE":
+                if rec.is_observed:
                     observed_aad_count += 1
                 else:
                     trigger = TerminalTrigger(
-                        seq=entry.seq,
-                        timestamp_utc=ev.timestamp_utc,
+                        seq=rec.seq,
+                        timestamp_utc=rec.timestamp_utc,
                         session_id=sid,
-                        zone=ev.zone,
-                        action=ev.action,
-                        rule_id=ev.rule_id,
+                        zone=rec.zone,
+                        action=rec.action,
+                        rule_id=rec.rule_id,
                         reason_code=reason_code,
-                        rpc_id=ev.request_id,
-                        tool_name=ev.tool_name,
-                        artifact_sha256=ev.artifact_sha256,
-                        redacted_summary=safe_reason,
-                        trigger_event_id=ev.event_id,
+                        rpc_id=rec.rpc_id,
+                        tool_name=rec.tool_name,
+                        artifact_sha256=rec.artifact_sha256,
+                        redacted_summary=rec.reason,
+                        trigger_event_id=rec.event_id,
                         containment_confirmed=False,
                         containment_seq=None,
                     )
-                    aad_index_by_id[ev.event_id] = len(aad_triggers)
+                    aad_index_by_id[rec.event_id] = len(aad_triggers)
                     aad_triggers.append(trigger)
-            elif ev.rule_id == AAD_CONTAINMENT_CONFIRMED_RULE_ID:
-                ref_id = ev.metadata.get("trigger_event_id")
+            elif rec.rule_id == AAD_CONTAINMENT_CONFIRMED_RULE_ID:
+                ref_id = rec.trigger_event_id
                 if isinstance(ref_id, str) and ref_id in aad_index_by_id:
                     idx = aad_index_by_id[ref_id]
                     existing = aad_triggers[idx]
-                    if entry.seq > existing.seq and not existing.containment_confirmed:
+                    if rec.seq > existing.seq and not existing.containment_confirmed:
                         aad_triggers[idx] = existing.model_copy(
-                            update={"containment_confirmed": True, "containment_seq": entry.seq}
+                            update={"containment_confirmed": True, "containment_seq": rec.seq}
                         )
 
         session_terminal: TerminalTrigger | None = None
@@ -348,7 +500,7 @@ def reconstruct_incident(path: Path, *, anchor: LedgerAnchor | None = None) -> I
         chain_valid=True,
         verification=verification,
         session_count=len(sessions),
-        total_events=len(entries),
+        total_events=len(records),
         unconfirmed_aad_triggers=unconfirmed_count,
         observed_aad_count=observed_aad_count,
         observed_block_count=observed_block_count,

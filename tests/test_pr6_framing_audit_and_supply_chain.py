@@ -253,8 +253,10 @@ class TestBoundedTaintHistoryAndStandaloneAuditEvents(unittest.TestCase):
                 ["untrusted-b/issue-2", "untrusted-c/issue-3"],
             )
 
-            records = [json.loads(line) for line in sink.getvalue().splitlines()]
-            self.assertEqual(len(records), 3)
+            rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in rows))
+            records = [r["event"] for r in rows]
             self.assertTrue(all(r["event_type"] == "taint" and r["decision"] == "tainted" for r in records))
             self.assertEqual(records[-1]["taint_count"], 3)
             self.assertEqual(len(records[-1]["taint_sources"]), 2)
@@ -265,8 +267,9 @@ class TestBoundedTaintHistoryAndStandaloneAuditEvents(unittest.TestCase):
             authorizer.authorize(
                 ToolCallRequest(session_id=sid, tool_name="workspace_read", arguments={"path": "a.txt"})
             )
-            all_records = [json.loads(line) for line in sink.getvalue().splitlines()]
-            auth_event = all_records[-1]
+            all_rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+            self.assertEqual(all_rows[-1]["schema_version"], 2)
+            auth_event = all_rows[-1]["event"]
             self.assertEqual(auth_event["event_type"], "authorization")
             self.assertEqual(auth_event["taint_count"], 3)
             self.assertEqual(len(auth_event["taint_sources"]), 2)
@@ -339,7 +342,9 @@ class TestHashedUntrustedAuditIdentities(unittest.TestCase):
                 with self.subTest(canary=canary):
                     self.assertNotIn(canary, raw_audit)
 
-            events = [json.loads(line) for line in raw_audit.splitlines()]
+            raw_rows = [json.loads(line) for line in raw_audit.splitlines()]
+            self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in raw_rows))
+            events = [r["event"] for r in raw_rows]
             # Repeated calls with the same unknown identifiers correlate via identical digests
             self.assertTrue(events[0]["session_id"].startswith("unknown_ses:"))
             self.assertEqual(events[0]["session_id"], events[1]["session_id"])

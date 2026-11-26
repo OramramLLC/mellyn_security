@@ -434,7 +434,9 @@ class TestGatewayEndToEnd(unittest.TestCase):
             self.assertEqual(replies[4]["error"]["code"], MELLYN_POLICY_DENIED)  # its own config is protected
             self.assertEqual(replies[5]["result"], {})
             audit = (workspace / "audit.jsonl").read_text(encoding="utf-8")
-            events = [json.loads(line) for line in audit.splitlines()]
+            rows = [json.loads(line) for line in audit.splitlines()]
+            self.assertTrue(all(r["schema_version"] == 2 and r["source"] == "gateway" for r in rows))
+            events = [r["event"] for r in rows]
             self.assertEqual([e["event_type"] for e in events], ["taint", "authorization", "taint", "authorization"])
             self.assertNotIn("aud_forged", audit)  # the server's stderr cannot write into the audit log
             self.assertIn("aud_forged", proc.stderr)
@@ -550,7 +552,10 @@ class TestAuditSink(unittest.TestCase):
             authorizer.authorize(ToolCallRequest(session, "workspace_read", {"path": "a.txt"}))
         lines = sink.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertEqual(json.loads(lines[0])["tool_name"], "workspace_read")
+        row = json.loads(lines[0])
+        self.assertEqual(row["schema_version"], 2)
+        self.assertEqual(row["source"], "gateway")
+        self.assertEqual(row["event"]["tool_name"], "workspace_read")
 
 
 if __name__ == "__main__":

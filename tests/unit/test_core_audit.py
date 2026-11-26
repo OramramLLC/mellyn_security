@@ -50,6 +50,8 @@ class TestAuditLedgerChainAndVerification(unittest.TestCase):
             e1 = ledger.record(_make_event(1), raw_artifact={"step": 1})
             e2 = ledger.record(_make_event(2), raw_artifact={"step": 2})
 
+            self.assertEqual(e0.schema_version, 2)
+            self.assertEqual(e0.source, "airlock")
             self.assertEqual(e0.seq, 0)
             self.assertEqual(e0.prev_hash, GENESIS_PREV_HASH)
             self.assertEqual(e1.seq, 1)

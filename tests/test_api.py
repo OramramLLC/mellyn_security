@@ -6,6 +6,7 @@ unless MELLYN_REQUIRE_API_TESTS=1 is set (as in CI), in which case missing depen
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import secrets
 import sys
@@ -193,7 +194,10 @@ class TestCreateAppFromEnv(unittest.TestCase):
 
             lines = audit_file.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
-            self.assertIn("git_status", lines[0])
+            row = json.loads(lines[0])
+            self.assertEqual(row["schema_version"], 2)
+            self.assertEqual(row["source"], "authorizer")
+            self.assertEqual(row["event"]["tool_name"], "git_status")
 
     def test_persists_sessions_taint_and_grants_across_app_restart_when_state_db_configured(self) -> None:
         from fastapi.testclient import TestClient
