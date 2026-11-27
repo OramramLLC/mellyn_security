@@ -1,0 +1,10 @@
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:08.586Z", "t_plus_s": 0.0, "event": "tree_loaded", "mellyn_module": "src\\mellyn\\__init__.py"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:08.595Z", "t_plus_s": 0.01, "event": "approval_server_started", "max_connections": 2}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:08.596Z", "t_plus_s": 0.01, "event": "baseline_approver_request", "status": "HTTP/1.0 200 OK"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:09.598Z", "t_plus_s": 1.01, "event": "attacker_connected", "client": 1}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:09.598Z", "t_plus_s": 1.01, "event": "attacker_connected", "client": 0}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:22.586Z", "t_plus_s": 14.0, "event": "approver_request", "status": "<closed without reply>"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:42.116Z", "t_plus_s": 33.53, "event": "attacker_connection_closed_by_server", "client": 1, "error": "ConnectionResetError"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:42.118Z", "t_plus_s": 33.53, "event": "attacker_connection_closed_by_server", "client": 0, "error": "ConnectionResetError"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:42.597Z", "t_plus_s": 34.01, "event": "approver_request", "status": "HTTP/1.0 200 OK"}
+{"drill": "IR-DRILL-2026-001", "tree": "post-patch-2ef9ccd", "utc": "2026-11-27T21:34:43.597Z", "t_plus_s": 35.01, "event": "drill_finished"}
