@@ -20,6 +20,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from mellyn.core.strict_input import strict_json_loads as _strict_json_loads
 from mellyn.models import (
     DOWNSTREAM_TIMEOUT_SECONDS,
     MAX_LINE_BYTES,
@@ -41,22 +42,13 @@ _MAX_SESSION_ID_CHARS = 256
 _AAD_DELETE_TIMEOUT_SECONDS = 1.0
 
 
-def _strict_json_loads(raw_text: str) -> Any:
-    def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in out:
-                raise ValueError(f"Duplicate JSON key '{key}' in downstream HTTP response.")
-            out[key] = value
-        return out
-
-    return json.loads(raw_text, object_pairs_hook=_reject_dup_keys)
-
-
 def _valid_reply_shape(response: Any, expected_id: Any) -> bool:
     if not isinstance(response, dict):
         return False
-    if response.get("jsonrpc") != "2.0" or response.get("id") != expected_id:
+    resp_id = response.get("id")
+    if isinstance(resp_id, bool) or type(resp_id) is not type(expected_id) or resp_id != expected_id:
+        return False
+    if response.get("jsonrpc") != "2.0":
         return False
     has_result = "result" in response
     has_error = "error" in response

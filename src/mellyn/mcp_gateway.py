@@ -47,6 +47,7 @@ from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import WorkspaceConfigError, check_workspace_root
 from mellyn.egress.guards import OwnedFile
+from mellyn.gateway_config import CODE_INJECTION_ENV_NAMES
 from mellyn.http_downstream import StreamableHttpDownstream
 from mellyn.legacy_env import LEGACY_ENV_PREFIX, LegacyConfigError, check_no_legacy_env
 from mellyn.models import (
@@ -139,22 +140,73 @@ _EOF = object()
 # but library callers of downstream_environment() get the same protection.
 SECRET_ENV_PREFIXES = ("MELLYN_", LEGACY_ENV_PREFIX)
 
+# Explicit minimal allowlist for downstream MCP child processes (never copy ambient secrets or injectors).
+DEFAULT_DOWNSTREAM_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        # Windows: Python, Node.js and npm/npx look these up to find system, program and per-user data
+        # directories. They hold paths, not secrets, and Windows children run as the gateway's own user anyway.
+        "SYSTEMDRIVE",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "OS",
+    }
+)
+
 
 def downstream_environment(
-    environ: Mapping[str, str] | None = None, *, secret_names: Iterable[str] = ()
+    environ: Mapping[str, str] | None = None,
+    *,
+    secret_names: Iterable[str] = (),
+    pass_env: Iterable[str] = (),
 ) -> dict[str, str]:
     """
-    The environment for downstream MCP servers: the gateway's own, minus every MELLYN_* variable, every variable
-    with the pre-rename prefix, and every variable the config names as a secret (`secret_names`: OAuth client
-    secrets and bearer tokens). The servers the gateway launches are untrusted and must not see the gateway's
-    credentials, whichever name a deployment set them under.
+    Build an isolated environment for downstream MCP servers from an explicit minimal allowlist.
+
+    Only variables in `DEFAULT_DOWNSTREAM_ENV_ALLOWLIST` or explicit `pass_env` opt-ins are forwarded. Every
+    `MELLYN_*` variable, legacy-prefixed variable, configured OAuth secret (`secret_names`), and code-injection
+    variable (`CODE_INJECTION_ENV_NAMES`, such as LD_PRELOAD or NODE_OPTIONS) is always withheld, even if listed in
+    `pass_env`. The config loader rejects those names too; this is the same rule for library callers.
     """
     source = os.environ if environ is None else environ
-    withheld = {name.upper() for name in secret_names}
+    allowed = DEFAULT_DOWNSTREAM_ENV_ALLOWLIST | {name.upper() for name in pass_env if name}
+    withheld = {name.upper() for name in secret_names} | CODE_INJECTION_ENV_NAMES
     return {
         key: value
         for key, value in source.items()
-        if not key.upper().startswith(SECRET_ENV_PREFIXES) and key.upper() not in withheld
+        if key.upper() in allowed and not key.upper().startswith(SECRET_ENV_PREFIXES) and key.upper() not in withheld
     }
 
 
@@ -408,6 +460,7 @@ class StdioDownstream:
         writer: Callable[[bytes], None] | None = None,
         env: Mapping[str, str] | None = None,
         secret_env_names: Iterable[str] = (),
+        pass_env: Iterable[str] = (),
     ) -> None:
         if not argv:
             raise ValueError(f"Server '{name}' requires a non-empty command argv.")
@@ -421,7 +474,7 @@ class StdioDownstream:
         self._writer_thread: threading.Thread | None = None
         self._closed = False
 
-        child_env = downstream_environment(env, secret_names=secret_env_names)
+        child_env = downstream_environment(env, secret_names=secret_env_names, pass_env=pass_env)
         if child_home is not None:
             child_env["HOME"] = child_home
         if child_username is not None:
@@ -1419,6 +1472,7 @@ def main(argv: list[str] | None = None) -> int:
                     child_username=ds_name,
                     on_notification=on_notification,
                     secret_env_names=unified.secret_env_names,
+                    pass_env=spec.pass_env,
                 )
         if args.gateway_user is not None:
             _drop_gateway_privileges(args.gateway_user)

@@ -23,17 +23,25 @@ import re
 import urllib.error
 import urllib.request
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mellyn.approvals import (
     API_KEY_HEADER,
+    APPROVAL_REQUEST_DEADLINE_SECONDS,
     MAX_BODY_BYTES,
+    MAX_CONCURRENT_APPROVAL_CONNECTIONS,
     MAX_PENDING,
     ApprovalRedirectError,
+    BoundedApprovalServer,
+    DeadlineRequestHandler,
     build_approval_opener,
     parse_approval_route,
+    read_bounded_http_body,
 )
+
+# Upstream call timeout; APPROVAL_REQUEST_DEADLINE_SECONDS must stay above it so a slow-but-legitimate forward is
+# not cut off by the relay's own deadline.
+_UPSTREAM_TIMEOUT_SECONDS = 10
 
 # Largest reply the relay will pass back. GET /v1/pending can hold MAX_PENDING calls, each with up to 64 KiB of
 # arguments plus their reasons, so this must comfortably exceed MAX_PENDING * 64 KiB. A larger reply is
@@ -85,7 +93,7 @@ def forward_approval_request(
     )
     active_opener = opener or build_approval_opener()
     try:
-        with active_opener.open(req, timeout=10) as resp:
+        with active_opener.open(req, timeout=_UPSTREAM_TIMEOUT_SECONDS) as resp:
             status, payload = resp.status, resp.read(MAX_RELAY_RESPONSE_BYTES + 1)
     except ApprovalRedirectError as exc:
         return int(HTTPStatus.BAD_GATEWAY), _json_error_bytes(
@@ -112,7 +120,7 @@ def forward_approval_request(
     return status, payload
 
 
-class _RelayHandler(BaseHTTPRequestHandler):
+class _RelayHandler(DeadlineRequestHandler):
     server: ApprovalRelayServer
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -136,14 +144,16 @@ class _RelayHandler(BaseHTTPRequestHandler):
 
         body: bytes | None = None
         if method == "POST":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = -1
-            if not 0 <= length <= MAX_BODY_BYTES:
-                self._send_error_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Body missing or too large.")
+            raw_body, err_status, err_msg = read_bounded_http_body(self.headers, self.rfile, max_bytes=MAX_BODY_BYTES)
+            if err_status is not None or raw_body is None:
+                self._send_error_json(err_status or HTTPStatus.BAD_REQUEST, err_msg or "Invalid request body.")
                 return
-            body = self.rfile.read(length)
+            body = raw_body
+        else:
+            raw_body, err_status, err_msg = read_bounded_http_body(self.headers, self.rfile, max_bytes=0)
+            if err_status is not None or raw_body:
+                self._send_error_json(err_status or HTTPStatus.BAD_REQUEST, err_msg or "GET body is not allowed.")
+                return
 
         status, payload = forward_approval_request(
             self.server.upstream_base,
@@ -162,9 +172,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
         self._forward("POST")
 
 
-class ApprovalRelayServer(ThreadingHTTPServer):
-    daemon_threads = True
-
+class ApprovalRelayServer(BoundedApprovalServer):
     def __init__(
         self,
         *,
@@ -173,10 +181,17 @@ class ApprovalRelayServer(ThreadingHTTPServer):
         upstream_host: str,
         upstream_port: int,
         opener: urllib.request.OpenerDirector | None = None,
+        max_connections: int = MAX_CONCURRENT_APPROVAL_CONNECTIONS,
+        request_deadline_seconds: float = APPROVAL_REQUEST_DEADLINE_SECONDS,
     ) -> None:
         self.upstream_base = validate_upstream(upstream_host, upstream_port)
         self.opener = opener or build_approval_opener()
-        super().__init__((listen_host, listen_port), _RelayHandler)
+        super().__init__(
+            (listen_host, listen_port),
+            _RelayHandler,
+            max_connections=max_connections,
+            request_deadline_seconds=request_deadline_seconds,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

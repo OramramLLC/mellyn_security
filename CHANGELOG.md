@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Changed
+- **Breaking: downstream stdio servers get an allowlisted environment.** The gateway no longer copies its own
+  environment (minus secrets) to the MCP servers it launches. A child gets only `DEFAULT_DOWNSTREAM_ENV_ALLOWLIST`:
+  `PATH`, `HOME`, user and locale names, temp directories, CA bundle and proxy variables, and the Windows system and
+  app-data variables (`SYSTEMROOT`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`, `PROGRAMFILES`, ...). A server that
+  reads anything else, such as an API token, must name it in the new `[[servers]] pass_env = [...]` list (stdio
+  servers only; a `streamable-http` server with `pass_env` is rejected). `MELLYN_*` and legacy-prefixed variables,
+  configured OAuth secrets, and code-injection variables (`CODE_INJECTION_ENV_NAMES`: `LD_PRELOAD`, `PYTHONPATH`,
+  `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `BASH_ENV`, ...) are rejected in `pass_env` at load time and withheld by
+  `downstream_environment()` even for library callers. See `config/mellyn.example.toml`.
 - **Breaking: unified audit ledger (`schema_version = 2`, Phase 2, Pass 2C).** Consolidated the Airlock
   (`mellyn.core.audit`) and gateway/authorizer (`mellyn.audit`) flight recorders into one writer
   (`CoreAuditLedger`) and one universal verifier (`verify_ledger_file_core` / `verify_ledger_bytes_core`) inside
@@ -88,6 +97,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `gitleaks` binary and fails the commit if none is found.
 
 ### Security
+- **Strict request parsing on every HTTP entry point.** One stdlib-only parser, `mellyn.core.strict_input`, now
+  serves the authorizer API, the approval server and relay, and the Streamable HTTP downstream client. It rejects
+  duplicate JSON keys (including `\u`-escaped duplicates), `NaN`/`Infinity`, and nesting deeper than
+  `MAX_JSON_DEPTH` (128). `Content-Length` must be plain ASCII digits (`int()` also accepted `+16`, `1_6`, and
+  non-ASCII digits). The authorizer API reads at most 128 KiB per body and answers these cases with 400 or 413
+  before authentication runs, never 500.
+- **Approval server and relay limits.** Both reject `Transfer-Encoding`, duplicate or malformed
+  `Content-Length`, and bodies on `GET`. They cap concurrent connections at 32, use a 10 s idle timeout per read,
+  and give each connection a 30 s total deadline (`APPROVAL_REQUEST_DEADLINE_SECONDS`). Without the deadline, 32
+  clients each trickling one header line every few seconds held every slot and locked the approver out. A local
+  process can still compete for slots, but no longer hold them.
+- **Downstream HTTP replies are matched strictly.** A reply's JSON-RPC `id` must have the request id's exact
+  type, so `true` no longer matches `1`.
+- **More special-use destinations blocked by the egress proxy and Squid**: `192.0.0.0/24`, `198.18.0.0/15`,
+  `::/128`, IPv4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, discard-only `100::/64`,
+  Teredo `2001::/32`, documentation `2001:db8::/32`, and 6to4 `2002::/16`.
 - **Unified ledger hardening (`schema_version = 2`, Pass 2C).** Both Airlock (`AuditLedger`) and
   gateway/authorizer (`AuditLogger`) now enforce the union of ledger controls: symlink refusal (`is_symlink` and
   `O_NOFOLLOW`), `0o600` file creation, cross-process OS locks (`.lock` sidecar), per-append `fsync`, constant-time
