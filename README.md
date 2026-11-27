@@ -17,7 +17,7 @@
 - **Redact Before Disk:** Secrets and canaries are hashed first (`artifact_sha256`), then redacted before appending to the hash-chained audit ledger.
 - **Stdio Wire Purity & Env Isolation:** Airlock diagnostics never touch `stdout`, and downstream MCP servers receive an explicit minimal environment rather than inheriting ambient `os.environ`.
 
-See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for architectural invariants and threat-model traceability.
+See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for architectural invariants and threat-model traceability, and [GOVERNANCE.md](GOVERNANCE.md), [RISK_REGISTER.md](RISK_REGISTER.md), [INCIDENT_DRILL_001.md](INCIDENT_DRILL_001.md), and [docs/grc/](docs/grc/) for NIST AI RMF / ISO 42001 / SOC 2 / ISO 27001 governance, AI impact assessment, MCP third-party risk, acceptable-use policy, and verifiable control evidence.
 
 ---
 

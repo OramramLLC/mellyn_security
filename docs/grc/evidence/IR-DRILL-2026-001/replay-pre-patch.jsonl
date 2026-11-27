@@ -1,0 +1,10 @@
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:33.791Z", "t_plus_s": 0.0, "event": "tree_loaded", "mellyn_module": "src\\mellyn\\__init__.py"}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:33.800Z", "t_plus_s": 0.01, "event": "approval_server_started", "max_connections": 2}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:33.801Z", "t_plus_s": 0.01, "event": "baseline_approver_request", "status": "HTTP/1.0 200 OK"}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:34.802Z", "t_plus_s": 1.01, "event": "attacker_connected", "client": 0}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:34.802Z", "t_plus_s": 1.01, "event": "attacker_connected", "client": 1}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:33:47.806Z", "t_plus_s": 14.01, "event": "approver_request", "status": "<ConnectionAbortedError>"}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:34:07.792Z", "t_plus_s": 34.0, "event": "approver_request", "status": "<closed without reply>"}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:34:07.855Z", "t_plus_s": 34.06, "event": "attacker_still_holding_slot_at_end", "client": 0}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:34:07.855Z", "t_plus_s": 34.06, "event": "attacker_still_holding_slot_at_end", "client": 1}
+{"drill": "IR-DRILL-2026-001", "tree": "pre-patch", "utc": "2026-11-27T21:34:08.303Z", "t_plus_s": 34.51, "event": "drill_finished"}
