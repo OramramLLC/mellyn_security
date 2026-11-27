@@ -12,19 +12,23 @@ port (for instance through a shell tool) still cannot approve anything.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import secrets
+import socket
 import threading
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from email.message import Message
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Protocol
 
 from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer
+from mellyn.core.strict_input import parse_content_length, strict_json_loads
 from mellyn.credentials import CredentialConfig, Role
 from mellyn.models import (
     ApprovalGrant,
@@ -38,9 +42,51 @@ from mellyn.models import (
 MAX_PENDING = 100
 PENDING_TTL_SECONDS = 3600
 MAX_BODY_BYTES = 16 * 1024
+# Idle timeout for one socket read or write.
+APPROVAL_SOCKET_TIMEOUT_SECONDS = 10.0
+# Total time one connection may hold a slot, however steadily it trickles bytes. Without it, a client sending one
+# header line every few seconds never hits the idle timeout and keeps its slot forever, so MAX_CONCURRENT clients
+# could lock the approver out. It must exceed the relay's 10 s upstream call.
+APPROVAL_REQUEST_DEADLINE_SECONDS = 30.0
+MAX_CONCURRENT_APPROVAL_CONNECTIONS = 32
 API_KEY_HEADER = "X-Mellyn-API-Key"
 PENDING_LIST_PATH = "/v1/pending"
 _APPROVE_PATH = re.compile(r"^/v1/pending/(apr_[A-Za-z0-9_-]{8,64})/(approve|reject)$")
+
+
+class _ReadableBinaryStream(Protocol):
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+def read_bounded_http_body(
+    headers: Message,
+    rfile: _ReadableBinaryStream,
+    *,
+    max_bytes: int = MAX_BODY_BYTES,
+) -> tuple[bytes | None, HTTPStatus | None, str | None]:
+    """
+    Validate Transfer-Encoding / Content-Length headers and read an exact bounded request body.
+
+    Returns `(body, None, None)` on success or `(None, status, error_message)` on rejection.
+    """
+    if headers.get("Transfer-Encoding") is not None:
+        return None, HTTPStatus.BAD_REQUEST, "Transfer-Encoding is not supported."
+    cl_values = headers.get_all("Content-Length") or []
+    if len(cl_values) > 1:
+        return None, HTTPStatus.BAD_REQUEST, "Duplicate Content-Length header is forbidden."
+    if not cl_values:
+        return b"", None, None
+    length = parse_content_length(cl_values[0])
+    if length is None:
+        return None, HTTPStatus.BAD_REQUEST, "Invalid Content-Length header."
+    if length > max_bytes:
+        return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Body missing or too large."
+    if length == 0:
+        return b"", None, None
+    body = rfile.read(length)
+    if len(body) != length:
+        return None, HTTPStatus.BAD_REQUEST, "Incomplete request body."
+    return body, None, None
 
 
 def parse_approval_route(method: str, path: str) -> tuple[str | None, str] | None:
@@ -196,7 +242,75 @@ class PendingApprovals:
             del self._pending[approval_id]
 
 
-class _ApprovalHandler(BaseHTTPRequestHandler):
+class DeadlineRequestHandler(BaseHTTPRequestHandler):
+    """Request handler with a per-read idle timeout plus a total deadline for the whole connection.
+
+    At the deadline the socket is shut down, which wakes any read or write blocked on it, so the handler finishes
+    and its `BoundedApprovalServer` slot is released.
+    """
+
+    server: BoundedApprovalServer
+    timeout = APPROVAL_SOCKET_TIMEOUT_SECONDS
+
+    def setup(self) -> None:
+        super().setup()
+        self._deadline_timer = threading.Timer(self.server.request_deadline_seconds, self._expire_connection)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _expire_connection(self) -> None:
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_RDWR)
+
+    def finish(self) -> None:
+        self._deadline_timer.cancel()
+        with contextlib.suppress(OSError):
+            super().finish()
+
+
+class BoundedApprovalServer(ThreadingHTTPServer):
+    """A threading HTTP server that caps concurrent connections and gives each one a total deadline.
+
+    Over the cap, a new connection is closed at once instead of queueing a thread. Together with the deadline in
+    `DeadlineRequestHandler`, a local process can still compete for slots but can no longer hold them forever.
+    """
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[DeadlineRequestHandler],
+        *,
+        max_connections: int = MAX_CONCURRENT_APPROVAL_CONNECTIONS,
+        request_deadline_seconds: float = APPROVAL_REQUEST_DEADLINE_SECONDS,
+    ) -> None:
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive.")
+        if not request_deadline_seconds > 0:
+            raise ValueError("request_deadline_seconds must be positive.")
+        self._conn_semaphore = threading.BoundedSemaphore(max_connections)
+        self.request_deadline_seconds = float(request_deadline_seconds)
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_semaphore.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._conn_semaphore.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_semaphore.release()
+
+
+class _ApprovalHandler(DeadlineRequestHandler):
     server: ApprovalHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - signature fixed by the stdlib
@@ -218,16 +332,13 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
         return True
 
     def _read_json(self) -> dict[str, Any] | None:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = -1
-        if not 0 <= length <= MAX_BODY_BYTES:
-            self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Body missing or too large."})
+        raw_body, err_status, err_msg = read_bounded_http_body(self.headers, self.rfile, max_bytes=MAX_BODY_BYTES)
+        if err_status is not None or raw_body is None:
+            self._send(err_status or HTTPStatus.BAD_REQUEST, {"error": err_msg or "Invalid request body."})
             return None
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = strict_json_loads(raw_body or b"{}")
+        except ValueError:  # includes StrictJsonError (also for over-deep nesting) and UnicodeDecodeError
             body = None
         if not isinstance(body, dict):
             self._send(HTTPStatus.BAD_REQUEST, {"error": "Body must be a JSON object."})
@@ -236,6 +347,10 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by the stdlib
         if not self._authorized():
+            return
+        raw_body, err_status, err_msg = read_bounded_http_body(self.headers, self.rfile, max_bytes=0)
+        if err_status is not None or raw_body:
+            self._send(err_status or HTTPStatus.BAD_REQUEST, {"error": err_msg or "GET body is not allowed."})
             return
         if parse_approval_route("GET", self.path) is None:
             self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
@@ -293,9 +408,7 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
 ALLOWED_BIND_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "0.0.0.0"})  # noqa: S104 - see above
 
 
-class ApprovalHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-
+class ApprovalHTTPServer(BoundedApprovalServer):
     def __init__(
         self,
         approvals: PendingApprovals,
@@ -303,12 +416,19 @@ class ApprovalHTTPServer(ThreadingHTTPServer):
         port: int = 0,
         *,
         host: str = "127.0.0.1",
+        max_connections: int = MAX_CONCURRENT_APPROVAL_CONNECTIONS,
+        request_deadline_seconds: float = APPROVAL_REQUEST_DEADLINE_SECONDS,
     ) -> None:
         # Loopback by default on bare metal; 0.0.0.0 is used only inside an internal-only container behind
         # mellyn-approval-relay. Either way, Role.APPROVER HMAC verification is what authorizes an approval.
         if host not in ALLOWED_BIND_HOSTS:
             raise ValueError(f"ApprovalHTTPServer host must be one of {sorted(ALLOWED_BIND_HOSTS)}, got '{host}'.")
-        super().__init__((host, port), _ApprovalHandler)
+        super().__init__(
+            (host, port),
+            _ApprovalHandler,
+            max_connections=max_connections,
+            request_deadline_seconds=request_deadline_seconds,
+        )
         self.approvals = approvals
         self.credentials = credentials
 

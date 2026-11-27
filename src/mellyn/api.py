@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tomllib
@@ -13,9 +14,11 @@ from typing import IO, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mellyn.audit import AuditLogger
 from mellyn.authorizer import MAX_GRANT_TTL_SECONDS, MAX_GRANT_USES, Authorizer, SessionLimitError
+from mellyn.core.strict_input import StrictJsonError, parse_content_length, strict_json_loads
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import check_workspace_root
 from mellyn.egress.guards import OwnedFile
@@ -27,7 +30,97 @@ from mellyn.state_store import AuthorizerStateStore, SqliteStateStore, StateStor
 from mellyn.unified_config import load_policy_any, load_unified_config
 
 MAX_ARGUMENTS_BYTES = 64 * 1024
+MAX_REQUEST_BODY_BYTES = 128 * 1024
 _STRICT = ConfigDict(extra="forbid", strict=True)
+
+
+class _StrictJsonBodyLimitMiddleware:
+    """Enforce a pre-parse raw body size cap and reject duplicate keys, NaN/Infinity, and over-deep nesting.
+
+    It runs before authentication, so every rejection here must be a 4xx, never an unhandled exception.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int = MAX_REQUEST_BODY_BYTES) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method", "").upper() not in ("POST", "PUT", "PATCH"):
+            await self.app(scope, receive, send)
+            return
+
+        cl_values = [val for name, val in scope.get("headers", ()) if name.lower() == b"content-length"]
+        if len(cl_values) > 1:
+            resp = JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "Duplicate Content-Length header is forbidden."},
+            )
+            await resp(scope, receive, send)
+            return
+        if len(cl_values) == 1:
+            declared_len = parse_content_length(cl_values[0])
+            if declared_len is None:
+                resp = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+                await resp(scope, receive, send)
+                return
+            if declared_len > self.max_body_bytes:
+                resp = JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large."},
+                )
+                await resp(scope, receive, send)
+                return
+
+        chunks: list[bytes] = []
+        total_bytes = 0
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            total_bytes += len(chunk)
+            if total_bytes > self.max_body_bytes:
+                resp = JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large."},
+                )
+                await resp(scope, receive, send)
+                return
+            if chunk:
+                chunks.append(chunk)
+            more_body = bool(message.get("more_body", False))
+
+        raw_body = b"".join(chunks)
+        if raw_body:
+            try:
+                strict_json_loads(raw_body)
+            except StrictJsonError as exc:
+                resp = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": str(exc)},
+                )
+                await resp(scope, receive, send)
+                return
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Let FastAPI produce its standard 422 JSON validation error.
+                pass
+
+        body_sent = False
+
+        async def _replay_receive() -> Message:
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": raw_body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, _replay_receive, send)
 
 
 class RiskSignalsPayload(BaseModel):
@@ -106,6 +199,8 @@ def create_app(
                     _owned_sink.close()
 
     app = FastAPI(title="Mellyn Security MCP Tool-Call Authorizer", version="1.0.0", lifespan=_lifespan)
+    # Unconditional: a missing `add_middleware` must fail loudly rather than silently drop the body limits.
+    app.add_middleware(_StrictJsonBodyLimitMiddleware, max_body_bytes=MAX_REQUEST_BODY_BYTES)
     authorizer = Authorizer(
         workspace_root=workspace_root or Path.cwd(),
         policy_config=policy_config,

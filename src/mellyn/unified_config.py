@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mellyn.egress_proxy import validate_egress_domain
-from mellyn.gateway_config import SERVER_NAME, GatewayConfig, ServerSpec, load_gateway_config
+from mellyn.gateway_config import (
+    CODE_INJECTION_ENV_NAMES,
+    SERVER_NAME,
+    GatewayConfig,
+    ServerSpec,
+    load_gateway_config,
+)
+from mellyn.legacy_env import LEGACY_ENV_PREFIX
 from mellyn.models import RiskTier
 from mellyn.oauth_client import OAuthClientConfig, extract_url_host, validate_outbound_url
 from mellyn.policy import (
@@ -45,7 +52,11 @@ _SCANNER_KEYS = frozenset(
         "min_entropy_length",
     }
 )
-_SERVER_KEYS = frozenset({"name", "transport", "preset", "trusted", "command", "url", "oauth", "tools_sha256"})
+_SERVER_KEYS = frozenset(
+    {"name", "transport", "preset", "trusted", "command", "url", "oauth", "tools_sha256", "pass_env"}
+)
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FORBIDDEN_PASS_ENV_PREFIXES = ("MELLYN_", LEGACY_ENV_PREFIX)
 _OAUTH_KEYS = frozenset(
     {
         "flow",
@@ -353,6 +364,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
         cmd_tuple: tuple[str, ...] = ()
         server_url: str | None = None
         oauth_cfg: OAuthClientConfig | None = None
+        pass_env_tuple: tuple[str, ...] = ()
         if transport == "stdio":
             if "url" in entry or "oauth" in entry:
                 raise PolicyLoadError(
@@ -365,10 +377,30 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
             if not argv_ok:
                 raise PolicyLoadError(f"Server '{name}' command rejected: {argv_reason}")
             cmd_tuple = tuple(command)
+            if "pass_env" in entry:
+                raw_pass_env = _require_str_list(entry, "pass_env", f"servers[{idx}] ({name})")
+                validated_env: list[str] = []
+                for var_name in raw_pass_env:
+                    if not _ENV_VAR_NAME_RE.fullmatch(var_name):
+                        raise PolicyLoadError(
+                            f"servers[{idx}] ({name}).pass_env contains invalid env var name {var_name!r}."
+                        )
+                    upper_name = var_name.upper()
+                    if upper_name.startswith(_FORBIDDEN_PASS_ENV_PREFIXES) or upper_name in CODE_INJECTION_ENV_NAMES:
+                        raise PolicyLoadError(
+                            f"servers[{idx}] ({name}).pass_env cannot pass protected variable {var_name!r}."
+                        )
+                    if var_name not in validated_env:
+                        validated_env.append(var_name)
+                pass_env_tuple = tuple(validated_env)
         else:
             if "command" in entry:
                 raise PolicyLoadError(
                     f"servers[{idx}] ({name}) with transport='streamable-http' must not specify 'command'."
+                )
+            if "pass_env" in entry:
+                raise PolicyLoadError(
+                    f"servers[{idx}] ({name}) with transport='streamable-http' must not specify 'pass_env'."
                 )
             url_raw = entry.get("url")
             if not isinstance(url_raw, str) or not url_raw.strip():
@@ -433,6 +465,7 @@ def parse_unified_dict(data: Mapping[str, Any], *, base_dir: Path, config_path: 
                 transport=transport,
                 url=server_url,
                 oauth=oauth_cfg,
+                pass_env=pass_env_tuple,
             )
         )
         allowed_servers.append(name)

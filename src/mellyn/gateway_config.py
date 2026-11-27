@@ -17,6 +17,41 @@ SERVER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$")
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "policy", "servers"})
 _SERVER_KEYS = frozenset({"name", "command"})
 
+# Variables a downstream server never receives, even when a `[[servers]] pass_env` entry names them: each makes the
+# child's loader or language runtime load or run extra code (preloads, interpreter startup files, option strings).
+# Enforced both when the config is parsed (`mellyn.unified_config`) and in `mellyn.mcp_gateway.downstream_environment`.
+CODE_INJECTION_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        # Dynamic loaders (glibc, macOS dyld)
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        # Python
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        # Node.js
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        # Perl, Ruby, Java/JVM
+        "PERL5OPT",
+        "PERL5LIB",
+        "PERLLIB",
+        "RUBYOPT",
+        "RUBYLIB",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        # Shell startup files for non-interactive shells
+        "BASH_ENV",
+        "ENV",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ServerSpec:
@@ -25,6 +60,7 @@ class ServerSpec:
     transport: Literal["stdio", "streamable-http"] = "stdio"
     url: str | None = None
     oauth: OAuthClientConfig | None = None
+    pass_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

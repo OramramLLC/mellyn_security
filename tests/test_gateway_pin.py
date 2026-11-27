@@ -456,6 +456,9 @@ class TestExampleConfigAndApiChain(unittest.TestCase):
             def exception_handler(self, _exc: Any):
                 return lambda fn: fn
 
+            def add_middleware(self, *_a: Any, **_kw: Any) -> None:
+                pass
+
             def get(self, *_a: Any, **_kw: Any):
                 return lambda fn: fn
 
