@@ -31,6 +31,7 @@ from mellyn.oauth_client import (
     OAuthClientConfig,
     OAuthError,
     OAuthTokenProvider,
+    _apply_stream_deadline,
     build_safe_opener,
     read_bounded_bytes,
     validate_outbound_url,
@@ -181,14 +182,39 @@ class StreamableHttpDownstream:
         total_bytes = 0
         event_count = 0
         data_lines: list[str] = []
+        buf = bytearray()
+        eof = False
+        read_fn = getattr(resp, "read1", None)
+        if not callable(read_fn):
+            read_fn = resp.read
+
+        def _next_line() -> bytes:
+            nonlocal total_bytes, eof
+            while True:
+                nl = buf.find(b"\n")
+                if nl >= 0:
+                    line_bytes = bytes(buf[: nl + 1])
+                    del buf[: nl + 1]
+                    return line_bytes
+                if eof:
+                    line_bytes = bytes(buf)
+                    buf.clear()
+                    return line_bytes
+                _apply_stream_deadline(resp, deadline)
+                remaining_budget = self._max_response_bytes - total_bytes - len(buf) + 1
+                if remaining_budget <= 0:
+                    raise ValueError(f"SSE stream from '{self.name}' exceeded max_response_bytes.")
+                chunk = read_fn(min(4_096, remaining_budget))
+                if not chunk:
+                    eof = True
+                else:
+                    if total_bytes + len(buf) + len(chunk) > self._max_response_bytes:
+                        raise ValueError(f"SSE stream from '{self.name}' exceeded max_response_bytes.")
+                    buf.extend(chunk)
 
         while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for SSE reply from '{self.name}'.")
-            budget = self._max_response_bytes - total_bytes + 1
-            if budget <= 0:
-                raise ValueError(f"SSE stream from '{self.name}' exceeded max_response_bytes.")
-            raw_line = resp.readline(budget)
+            _apply_stream_deadline(resp, deadline)
+            raw_line = _next_line()
             if not raw_line:
                 if data_lines:
                     event_count += 1
@@ -299,7 +325,7 @@ class StreamableHttpDownstream:
                     resp_sid = resp.headers.get("Mcp-Session-Id")
 
                     if ctype == "application/json":
-                        raw_bytes = read_bounded_bytes(resp, max_bytes=self._max_response_bytes)
+                        raw_bytes = read_bounded_bytes(resp, max_bytes=self._max_response_bytes, deadline=deadline)
                         parsed = _strict_json_loads(raw_bytes.decode("utf-8"))
                         if not _valid_reply_shape(parsed, req_id):
                             return local_downstream_error(

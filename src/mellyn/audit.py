@@ -89,12 +89,18 @@ def hash_untrusted_identifier(prefix: str, raw_value: str) -> str:
     return f"{prefix}:{digest}"
 
 
-def format_taint_entry(source: TaintSource, *, max_chars: int = MAX_TAINT_ENTRY_CHARS) -> str:
-    """Redact and bound a single taint entry once so repeated decisions do not re-scan full text."""
-    s_type = redact_text(source.source_type)[:64]
-    s_origin = redact_text(source.origin)
+def format_taint_entry(
+    source: TaintSource,
+    *,
+    max_chars: int = MAX_TAINT_ENTRY_CHARS,
+    canary_tokens: tuple[str, ...] = (),
+) -> str:
+    """Redact secrets and any configured canaries before bounding a taint entry."""
+    s_type = redact_core_secrets(source.source_type, canary_tokens=canary_tokens)[:64]
+    s_origin = redact_core_secrets(source.origin, canary_tokens=canary_tokens)
     combined = f"{s_type}:{s_origin}"
-    return combined[:max_chars]
+    scrubbed = redact_core_secrets(combined, canary_tokens=canary_tokens) if canary_tokens else combined
+    return scrubbed[:max_chars]
 
 
 def compute_audit_entry_hash(event_dict: Mapping[str, Any]) -> str:
@@ -380,6 +386,10 @@ class AuditLogger:
         path = self._core.path
         return ((path, LEDGER_FILE_SUFFIXES),) if path is not None else ()
 
+    def scrub_text(self, text: str) -> str:
+        """Redact known secret patterns and configured canary tokens from `text`."""
+        return self._scrub(text)
+
     def _scrub(self, text: str) -> str:
         return redact_core_secrets(text, canary_tokens=self._canary_tokens)
 
@@ -444,20 +454,25 @@ class AuditLogger:
         tool_known: bool = True,
         server_known: bool = True,
     ) -> AuditEvent:
-        safe_session = (
-            redact_text(session_id)[:128] if session_known else hash_untrusted_identifier("unknown_ses", session_id)
-        )
-        safe_tool = (
-            redact_text(tool_name)[:128] if tool_known else hash_untrusted_identifier("untrusted_tool", tool_name)
-        )
+        safe_session = session_id if session_known else hash_untrusted_identifier("unknown_ses", session_id)
+        safe_tool = tool_name if tool_known else hash_untrusted_identifier("untrusted_tool", tool_name)
         if mcp_server is None:
             safe_server: str | None = None
         elif server_known:
-            safe_server = redact_text(mcp_server)[:128]
+            safe_server = mcp_server
         else:
             safe_server = hash_untrusted_identifier("untrusted_srv", mcp_server)
 
-        rendered_taints = [item if isinstance(item, str) else format_taint_entry(item) for item in taint_sources]
+        rendered_taints = [
+            item
+            if isinstance(item, str)
+            else format_taint_entry(
+                item,
+                max_chars=max(MAX_TAINT_ENTRY_CHARS, len(item.origin) + 128),
+                canary_tokens=self._canary_tokens,
+            )
+            for item in taint_sources
+        ]
         effective_count = len(rendered_taints) if taint_count is None else taint_count
 
         event = AuditEvent(
@@ -471,7 +486,7 @@ class AuditLogger:
             tainted=tainted,
             taint_sources=rendered_taints,
             args_sha256=hash_arguments(arguments),
-            reasons=[redact_text(reason)[:MAX_AUDIT_REASON_CHARS] for reason in reasons],
+            reasons=list(reasons),
             policy_id=policy_id,
             grant_id=grant_id,
             event_type="authorization",
@@ -492,7 +507,7 @@ class AuditLogger:
         event = AuditEvent(
             audit_id=f"aud_{secrets.token_hex(12)}",
             timestamp=utc_now().isoformat(),
-            session_id=redact_text(session_id)[:128],
+            session_id=session_id,
             tool_name="session/taint",
             mcp_server=None,
             decision="tainted",
@@ -500,7 +515,7 @@ class AuditLogger:
             tainted=True,
             taint_sources=list(taint_sources),
             args_sha256=EMPTY_ARGS_SHA256,
-            reasons=[redact_text(reason)[:MAX_AUDIT_REASON_CHARS]],
+            reasons=[reason],
             policy_id=None,
             grant_id=None,
             event_type="taint",
@@ -528,15 +543,15 @@ class AuditLogger:
         event = AuditEvent(
             audit_id=f"aud_{secrets.token_hex(12)}",
             timestamp=utc_now().isoformat(),
-            session_id=redact_text(session_id)[:128],
-            tool_name=redact_text(tool_name)[:128],
-            mcp_server=redact_text(mcp_server)[:128] if mcp_server is not None else None,
+            session_id=session_id,
+            tool_name=tool_name,
+            mcp_server=mcp_server,
             decision=decision,
             risk_tier=RiskTier.HIGH.value,
             tainted=tainted,
             taint_sources=list(taint_sources),
             args_sha256=EMPTY_ARGS_SHA256 if payload is None else hash_arguments(payload),
-            reasons=[redact_text(r)[:MAX_AUDIT_REASON_CHARS] for r in reasons],
+            reasons=list(reasons),
             policy_id=policy_id,
             grant_id=None,
             event_type="containment",

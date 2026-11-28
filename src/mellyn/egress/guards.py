@@ -89,6 +89,7 @@ def owned_file_entries(workspace_root: Path, owned: Iterable[OwnedFile]) -> tupl
 # validators and the programs that later open the path or URL disagree (NUL truncates C strings; CR/LF
 # split HTTP headers and log lines).
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_STRICT_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 
 
 class EgressValidator:
@@ -111,14 +112,21 @@ class EgressValidator:
         if _CONTROL_CHARACTERS.search(raw_url):
             return False, "URL contains control characters."
 
+        stripped = raw_url.strip()
         try:
-            parsed = urlparse(raw_url.strip())
+            parsed = urlparse(stripped)
             port = parsed.port
         except ValueError:
             return False, "Malformed URL authority or port."
 
         if parsed.scheme.lower() != "https":
             return False, "Disallowed URL scheme; only https is permitted."
+
+        # Reject backslashes anywhere in the authority so WHATWG clients (`fetch`, `undici`, modern `curl`)
+        # cannot split `evil.com\.allowed.example` into host `evil.com` and path `/.allowed.example`.
+        raw_authority = stripped.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "\\" in parsed.netloc or "\\" in raw_authority:
+            return False, "Backslashes are forbidden in URL authorities."
 
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             return False, "URLs with embedded credentials/userinfo are forbidden."
@@ -141,6 +149,9 @@ class EgressValidator:
 
         if self._is_ip_literal(hostname):
             return False, "Direct IP literals are forbidden; use an allowlisted domain."
+
+        if not _STRICT_HOSTNAME_RE.fullmatch(hostname):
+            return False, "Destination host is not a valid ASCII domain name."
 
         if not self.is_domain_allowlisted(hostname):
             return False, "Destination host is not in the egress domain allowlist."
