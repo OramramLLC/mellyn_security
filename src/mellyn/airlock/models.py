@@ -17,13 +17,14 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator, model_validator
 
 from mellyn.core.normalize import JsonObject, JsonValue
 from mellyn.core.strict_input import strict_json_loads
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_PROTOCOL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _check_finite_json(value: JsonValue) -> JsonValue:
@@ -233,6 +234,229 @@ class ToolCallParams(_StrictAirlockModel):
     def _validate_arguments(cls, v: JsonObject) -> JsonObject:
         _check_finite_json(v)
         return v
+
+
+def _reject_optional_control_chars(value: str | None, what: str) -> str | None:
+    if value is not None:
+        return _reject_control_chars(value, what)
+    return None
+
+
+# MCP 2025-11-25 `Icon.src`: "May be an HTTP/HTTPS URL or a `data:` URI with Base64-encoded image data." No size limit
+# is set here; a large `data:` URI is still bounded by the policy's `max_payload_bytes` frame cap.
+_ICON_SRC_SCHEMES: tuple[str, ...] = ("https:", "http:", "data:")
+
+
+class ClientIcon(_StrictAirlockModel):
+    """Strict MCP 2025-11-25 `Icon` inside `clientInfo.icons`."""
+
+    src: str = Field(min_length=1)
+    mimeType: str | None = Field(default=None, min_length=1, max_length=128)
+    sizes: list[str] | None = Field(default=None, max_length=32)
+    theme: Literal["light", "dark"] | None = None
+
+    @field_validator("src")
+    @classmethod
+    def _validate_src(cls, v: str) -> str:
+        _reject_control_chars(v, "clientInfo.icons[].src")
+        if not v.lower().startswith(_ICON_SRC_SCHEMES):
+            raise ValueError("clientInfo.icons[].src must be an http(s) URL or a data: URI.")
+        return v
+
+    @field_validator("mimeType")
+    @classmethod
+    def _validate_mime_type(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.icons[].mimeType")
+
+    @field_validator("sizes")
+    @classmethod
+    def _validate_sizes(cls, v: list[str] | None) -> list[str] | None:
+        for size in v or ():
+            if not 1 <= len(size) <= 32:
+                raise ValueError("clientInfo.icons[].sizes entries must be 1-32 characters.")
+            _reject_control_chars(size, "clientInfo.icons[].sizes")
+        return v
+
+
+class ClientImplementationInfo(_StrictAirlockModel):
+    """Strict MCP client implementation metadata inside `initialize.params.clientInfo`.
+
+    Covers the `Implementation` fields of MCP 2025-06-18 (`name`, `version`, `title`) and those added in 2025-11-25
+    (`icons`, `websiteUrl`, `description`). Anything else is still rejected.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=128)
+    title: str | None = Field(default=None, max_length=256)
+    icons: list[ClientIcon] | None = Field(default=None, max_length=32)
+    websiteUrl: str | None = Field(default=None, min_length=1, max_length=2048)
+    description: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        return _reject_control_chars(v, "clientInfo.name")
+
+    @field_validator("version")
+    @classmethod
+    def _validate_version(cls, v: str) -> str:
+        return _reject_control_chars(v, "clientInfo.version")
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.title")
+
+    @field_validator("websiteUrl")
+    @classmethod
+    def _validate_website_url(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.websiteUrl")
+
+    @field_validator("description")
+    @classmethod
+    def _validate_description(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.description")
+
+
+class InitializeParams(_StrictAirlockModel):
+    """Strict MCP 2025-06-18 `initialize` request parameters (minimal `{}` supported, supplied fields validated)."""
+
+    protocolVersion: str | None = Field(default=None, min_length=1, max_length=64)
+    capabilities: JsonObject | None = None
+    clientInfo: ClientImplementationInfo | None = None
+    meta: JsonObject | None = Field(default=None, alias="_meta")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_nulls(cls, data: object) -> object:
+        if isinstance(data, dict):
+            for key in ("protocolVersion", "capabilities", "clientInfo"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"initialize.{key} cannot be null when provided.")
+        return data
+
+    @field_validator("protocolVersion")
+    @classmethod
+    def _validate_protocol_version(cls, v: str | None) -> str | None:
+        if v is not None and _PROTOCOL_VERSION_RE.fullmatch(v) is None:
+            raise ValueError("protocolVersion must contain only ASCII alphanumerics, '.', '_', or '-'.")
+        return v
+
+    @field_validator("capabilities", "meta")
+    @classmethod
+    def _validate_json_fields(cls, v: JsonObject | None) -> JsonObject | None:
+        if v is not None:
+            _check_finite_json(v)
+        return v
+
+
+class PingParams(_StrictAirlockModel):
+    """Strict MCP `ping` request parameters (`{}` or optional `_meta`)."""
+
+    meta: JsonObject | None = Field(default=None, alias="_meta")
+
+    @field_validator("meta")
+    @classmethod
+    def _validate_meta(cls, v: JsonObject | None) -> JsonObject | None:
+        if v is not None:
+            _check_finite_json(v)
+        return v
+
+
+class ListCursorParams(_StrictAirlockModel):
+    """Strict MCP paginated list parameters for `tools/list` and `resources/list`."""
+
+    cursor: str | None = Field(default=None, min_length=1, max_length=1024)
+    meta: JsonObject | None = Field(default=None, alias="_meta")
+
+    @field_validator("cursor")
+    @classmethod
+    def _validate_cursor(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "cursor")
+
+    @field_validator("meta")
+    @classmethod
+    def _validate_meta(cls, v: JsonObject | None) -> JsonObject | None:
+        if v is not None:
+            _check_finite_json(v)
+        return v
+
+
+class InitializedNotificationParams(_StrictAirlockModel):
+    """Strict MCP `notifications/initialized` parameters (`{}` or optional `_meta`)."""
+
+    meta: JsonObject | None = Field(default=None, alias="_meta")
+
+    @field_validator("meta")
+    @classmethod
+    def _validate_meta(cls, v: JsonObject | None) -> JsonObject | None:
+        if v is not None:
+            _check_finite_json(v)
+        return v
+
+
+class CancelledNotificationParams(_StrictAirlockModel):
+    """Strict MCP `notifications/cancelled` parameters.
+
+    `requestId` is required in MCP 2025-06-18 but optional in 2025-11-25 (omitted when a task is cancelled), so it may
+    be left out; an explicit `null` is still rejected because it is not a valid request id.
+    """
+
+    requestId: int | str | None = None
+    reason: str | None = Field(default=None, max_length=1024)
+    meta: JsonObject | None = Field(default=None, alias="_meta")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_request_id(cls, data: object) -> object:
+        if isinstance(data, dict) and "requestId" in data and data["requestId"] is None:
+            raise ValueError("notifications/cancelled requestId cannot be null when provided.")
+        return data
+
+    @field_validator("requestId")
+    @classmethod
+    def _validate_request_id(cls, v: int | str | None) -> int | str | None:
+        if isinstance(v, bool):
+            raise ValueError("notifications/cancelled requestId cannot be a boolean.")
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("notifications/cancelled requestId cannot be empty.")
+            _reject_control_chars(v, "notifications/cancelled requestId")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _validate_reason(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "notifications/cancelled reason")
+
+    @field_validator("meta")
+    @classmethod
+    def _validate_meta(cls, v: JsonObject | None) -> JsonObject | None:
+        if v is not None:
+            _check_finite_json(v)
+        return v
+
+
+_CONTROL_PARAM_MODELS: dict[str, type[_StrictAirlockModel]] = {
+    "initialize": InitializeParams,
+    "ping": PingParams,
+    "tools/list": ListCursorParams,
+    "resources/list": ListCursorParams,
+    "notifications/initialized": InitializedNotificationParams,
+    "notifications/cancelled": CancelledNotificationParams,
+}
+
+
+def validate_control_params(method: str, params: JsonObject) -> str | None:
+    """Validate allowlisted MCP control-method params against strict schema; return error string or None."""
+    model_cls = _CONTROL_PARAM_MODELS.get(method)
+    if model_cls is None:
+        return None
+    try:
+        model_cls.model_validate(params)
+    except ValidationError as exc:
+        return f"Invalid params for '{method}' ({exc.error_count()} validation error(s))."
+    return None
 
 
 class ToolPolicyRule(_StrictAirlockModel):

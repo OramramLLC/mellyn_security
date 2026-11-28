@@ -67,6 +67,7 @@ from mellyn.airlock.models import (
     ToolDefinition,
     parse_airlock_policy_toml,
     parse_jsonrpc_bytes,
+    validate_control_params,
 )
 from mellyn.core.audit import AuditLedger, redact_core_secrets
 from mellyn.core.normalize import JsonObject, JsonValue, exact_json_bytes, has_invisible_unicode, strip_invisible
@@ -86,6 +87,7 @@ INTERNAL_FAULT_EXIT_CODE = 70  # EX_SOFTWARE: a proxy task raised; the session w
 
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
 JSONRPC_POLICY_VIOLATION = -32000
 JSONRPC_REQUEST_TIMEOUT = -32001
@@ -1321,6 +1323,29 @@ class AirlockProxy:
                 artifact_sha256=wire_sha,
             )
             return
+        param_err = validate_control_params(msg.method, msg.params)
+        if param_err is not None:
+            if self._mode == "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.invalid_control_params",
+                    reason=param_err,
+                    artifact_sha256=wire_sha,
+                    metadata=self._observe_metadata(),
+                )
+                await self._write_downstream_bytes(wire_bytes)
+                return
+            self._record_event(
+                action=msg.method,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.invalid_control_params",
+                reason=param_err,
+                artifact_sha256=wire_sha,
+            )
+            return
         if not ok:
             if self._mode == "observe":
                 self._record_event(
@@ -1558,6 +1583,38 @@ class AirlockProxy:
                     severity="BLOCK",
                     rule_id="airlock.method_not_allowed",
                     reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                    metadata=self._observe_metadata(),
+                )
+                observed_violation = True
+
+        param_err = validate_control_params(msg.method, msg.params)
+        if param_err is not None:
+            if self._mode != "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.invalid_control_params",
+                    reason=param_err,
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                )
+                await self._emit_client_error(
+                    rpc_id=msg.id,
+                    code=JSONRPC_INVALID_PARAMS,
+                    message=f"Invalid params (airlock.invalid_control_params): {param_err}",
+                    data={"rule_id": "airlock.invalid_control_params"},
+                )
+                return
+            if not observed_violation:
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.invalid_control_params",
+                    reason=param_err,
                     artifact_sha256=wire_sha,
                     request_id=msg.id,
                     metadata=self._observe_metadata(),
