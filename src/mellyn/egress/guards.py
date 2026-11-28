@@ -89,6 +89,7 @@ def owned_file_entries(workspace_root: Path, owned: Iterable[OwnedFile]) -> tupl
 # validators and the programs that later open the path or URL disagree (NUL truncates C strings; CR/LF
 # split HTTP headers and log lines).
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![\\/])")
 _STRICT_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 
 
@@ -235,9 +236,11 @@ class WorkspacePathGuard:
                 return True
             if norm_prot.endswith(".*"):
                 stem = norm_prot[:-1]  # "<name>."
-                if norm_path.startswith(stem) and len(norm_path) > len(stem) and "/" not in norm_path[len(stem) :]:
-                    return True
-            if protected.endswith("/") and norm_path.startswith(f"{norm_prot}/"):
+                if norm_path.startswith(stem) and len(norm_path) > len(stem):
+                    suffix_part = norm_path[len(stem) :].split("/", 1)[0]
+                    if suffix_part:
+                        return True
+            if norm_path.startswith(f"{norm_prot}/"):
                 return True
             if norm_prot.startswith(f"{norm_path}/"):
                 return True
@@ -249,6 +252,8 @@ class WorkspacePathGuard:
             return False, "Path is empty or not a string."
         if _CONTROL_CHARACTERS.search(raw_path):
             return False, "Path contains control characters (for example a NUL byte)."
+        if _WINDOWS_DRIVE_RELATIVE_RE.match(raw_path.strip()):
+            return False, "Drive-relative Windows path is forbidden."
 
         candidate = Path(raw_path)
         try:

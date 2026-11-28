@@ -129,15 +129,20 @@ def has_invisible_unicode(value: object) -> bool:
     return False
 
 
-def normalize_value(value: JsonValue) -> JsonValue:
+MAX_NORMALIZE_DEPTH = 128
+
+
+def normalize_value(value: JsonValue, _depth: int = 0) -> JsonValue:
     """
-    Recursively validate and normalize strict JSON data for canonical serialization.
+    Validate and normalize strict JSON data for canonical serialization within `MAX_NORMALIZE_DEPTH`.
 
     - Strings are stripped of invisible characters and NFKC-normalized.
     - Booleans remain distinct from integers.
     - Finite floats canonicalize `-0.0` to `0.0`; NaN/Inf fail closed with `ValueError`.
     - Dict keys are normalized; collisions after NFKC/stripping fail closed with `ValueError`.
     """
+    if _depth > MAX_NORMALIZE_DEPTH:
+        raise ValueError(f"JSON nesting depth exceeds maximum allowed depth of {MAX_NORMALIZE_DEPTH}.")
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -149,7 +154,7 @@ def normalize_value(value: JsonValue) -> JsonValue:
     if isinstance(value, str):
         return normalize_str(value)
     if isinstance(value, list):
-        return [normalize_value(item) for item in value]
+        return [normalize_value(item, _depth + 1) for item in value]
     if isinstance(value, dict):
         out: dict[str, JsonValue] = {}
         for raw_key, raw_val in value.items():
@@ -158,7 +163,7 @@ def normalize_value(value: JsonValue) -> JsonValue:
             norm_key = normalize_str(raw_key)
             if norm_key in out:
                 raise ValueError(f"Canonical key collision after Unicode normalization: {norm_key!r}")
-            out[norm_key] = normalize_value(raw_val)
+            out[norm_key] = normalize_value(raw_val, _depth + 1)
         return out
     raise TypeError(f"Unsupported non-JSON value type: {type(value).__name__}")
 

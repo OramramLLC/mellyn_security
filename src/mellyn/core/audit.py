@@ -27,6 +27,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import threading
 import time
@@ -177,9 +178,31 @@ def _strict_json_loads(raw_line: str) -> Any:
     return json.loads(raw_line, object_pairs_hook=_reject_dup_keys, parse_constant=_reject_constant)
 
 
+def is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
 def _reject_symlink_path(path: Path) -> None:
-    if path.is_symlink() or path.parent.is_symlink():
-        raise LedgerIntegrityError(f"Refusing symlink audit ledger path '{path}'.")
+    if is_link_or_junction(path) or is_link_or_junction(path.parent):
+        raise LedgerIntegrityError(f"Refusing symlink or junction audit ledger path '{path}'.")
+
+
+def read_regular_file_nofollow(path: Path) -> bytes:
+    """Read `path` using `O_NOFOLLOW` + `fstat(S_ISREG)`, refusing symlinks, junctions, and special files."""
+    if is_link_or_junction(path) or is_link_or_junction(path.parent):
+        raise OSError(f"Refusing symlink or junction path '{path}'.")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Refusing non-regular file '{path}'.")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _open_private_fd(path: Path, flags: int) -> int:
@@ -462,7 +485,7 @@ def verify_ledger_bytes_core(raw_bytes: bytes, *, anchor: LedgerAnchor | None = 
         try:
             decoded_text = parse_bytes.decode("utf-8")
             parsed_obj = _strict_json_loads(decoded_text)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             return _fail_verification(
                 entry_count=count,
                 last_seq=last_seq_so_far,
@@ -563,57 +586,68 @@ def verify_ledger_bytes_core(raw_bytes: bytes, *, anchor: LedgerAnchor | None = 
                 ledger_format=detected_format,
             )
 
-        if line_format == "v2":
-            entry_source, verify_err = _verify_v2_entry(
-                parsed_obj,
-                parse_bytes,
-                seq=seq,
-                prev_hash=prev_hash,
-                entry_hash=entry_hash,
+        try:
+            if line_format == "v2":
+                entry_source, verify_err = _verify_v2_entry(
+                    parsed_obj,
+                    parse_bytes,
+                    seq=seq,
+                    prev_hash=prev_hash,
+                    entry_hash=entry_hash,
+                )
+                if verify_err is not None or entry_source is None:
+                    return _fail_verification(
+                        entry_count=count,
+                        last_seq=last_seq_so_far,
+                        last_hash=last_hash,
+                        first_invalid_seq=expected_seq,
+                        first_invalid_line=line_no,
+                        reason=verify_err or f"Invalid v2 entry at seq {expected_seq}.",
+                        ledger_format=detected_format,
+                    )
+                seen_sources.add(entry_source)
+            elif line_format == "v1_airlock":
+                verify_err = _verify_v1_airlock_entry(
+                    parsed_obj,
+                    parse_bytes,
+                    seq=seq,
+                    prev_hash=prev_hash,
+                    entry_hash=entry_hash,
+                )
+                if verify_err is not None:
+                    return _fail_verification(
+                        entry_count=count,
+                        last_seq=last_seq_so_far,
+                        last_hash=last_hash,
+                        first_invalid_seq=expected_seq,
+                        first_invalid_line=line_no,
+                        reason=verify_err,
+                        ledger_format=detected_format,
+                    )
+                seen_sources.add("airlock")
+            else:
+                verify_err = _verify_v1_gateway_entry(parsed_obj, line_no=line_no, entry_hash=entry_hash)
+                if verify_err is not None:
+                    return _fail_verification(
+                        entry_count=count,
+                        last_seq=last_seq_so_far,
+                        last_hash=last_hash,
+                        first_invalid_seq=expected_seq,
+                        first_invalid_line=line_no,
+                        reason=verify_err,
+                        ledger_format=detected_format,
+                    )
+                seen_sources.add("gateway")
+        except (RecursionError, ValueError, TypeError) as exc:
+            return _fail_verification(
+                entry_count=count,
+                last_seq=last_seq_so_far,
+                last_hash=last_hash,
+                first_invalid_seq=expected_seq,
+                first_invalid_line=line_no,
+                reason=f"Audit entry at line {line_no} (seq {expected_seq}) failed canonical check: {exc}",
+                ledger_format=detected_format,
             )
-            if verify_err is not None or entry_source is None:
-                return _fail_verification(
-                    entry_count=count,
-                    last_seq=last_seq_so_far,
-                    last_hash=last_hash,
-                    first_invalid_seq=expected_seq,
-                    first_invalid_line=line_no,
-                    reason=verify_err or f"Invalid v2 entry at seq {expected_seq}.",
-                    ledger_format=detected_format,
-                )
-            seen_sources.add(entry_source)
-        elif line_format == "v1_airlock":
-            verify_err = _verify_v1_airlock_entry(
-                parsed_obj,
-                parse_bytes,
-                seq=seq,
-                prev_hash=prev_hash,
-                entry_hash=entry_hash,
-            )
-            if verify_err is not None:
-                return _fail_verification(
-                    entry_count=count,
-                    last_seq=last_seq_so_far,
-                    last_hash=last_hash,
-                    first_invalid_seq=expected_seq,
-                    first_invalid_line=line_no,
-                    reason=verify_err,
-                    ledger_format=detected_format,
-                )
-            seen_sources.add("airlock")
-        else:
-            verify_err = _verify_v1_gateway_entry(parsed_obj, line_no=line_no, entry_hash=entry_hash)
-            if verify_err is not None:
-                return _fail_verification(
-                    entry_count=count,
-                    last_seq=last_seq_so_far,
-                    last_hash=last_hash,
-                    first_invalid_seq=expected_seq,
-                    first_invalid_line=line_no,
-                    reason=verify_err,
-                    ledger_format=detected_format,
-                )
-            seen_sources.add("gateway")
 
         if anchor is not None and seq == anchor[0] and not hmac.compare_digest(entry_hash, anchor[1]):
             return _fail_verification(
@@ -677,7 +711,7 @@ def verify_ledger_file_core(path: Path, *, anchor: LedgerAnchor | None = None) -
             reason="Ledger anchor is malformed.",
         )
 
-    if path.is_symlink() or path.parent.is_symlink():
+    if is_link_or_junction(path) or is_link_or_junction(path.parent):
         return _fail_verification(
             entry_count=0,
             last_seq=None,
@@ -698,7 +732,7 @@ def verify_ledger_file_core(path: Path, *, anchor: LedgerAnchor | None = None) -
         )
 
     try:
-        raw_bytes = path.read_bytes()
+        raw_bytes = read_regular_file_nofollow(path)
     except OSError as exc:
         return _fail_verification(
             entry_count=0,
@@ -1091,18 +1125,38 @@ class _HeldFile:
 
 
 def _rotate_aside(path: Path, *, tag: str, now_fn: Callable[[], datetime]) -> Path:
-    """Rename a legacy ledger to `<name>.<tag>-<UTC>[-N]` in the same folder, never overwriting anything."""
+    """Move a legacy ledger to `<name>.<tag>-<UTC>[-N]` in the same folder without overwriting anything."""
     stamp = now_fn().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    target = path.with_name(f"{path.name}.{tag}-{stamp}")
-    counter = 1
-    while target.exists() or target.is_symlink():
-        target = path.with_name(f"{path.name}.{tag}-{stamp}-{counter}")
-        counter += 1
-    try:
-        path.rename(target)
-    except OSError as exc:
-        raise LedgerIntegrityError(f"Could not move legacy audit ledger '{path}' aside: {exc}") from exc
-    return target
+    for attempt in range(64):
+        target = (
+            path.with_name(f"{path.name}.{tag}-{stamp}")
+            if attempt == 0
+            else path.with_name(f"{path.name}.{tag}-{stamp}-{attempt}")
+        )
+        if target.exists() or is_link_or_junction(target):
+            continue
+        if os.name == "posix" and hasattr(os, "link"):
+            try:
+                os.link(path, target)
+            except FileExistsError:
+                continue
+            except OSError:
+                pass
+            else:
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    target.unlink(missing_ok=True)
+                    raise LedgerIntegrityError(f"Could not move legacy audit ledger '{path}' aside: {exc}") from exc
+                return target
+        try:
+            path.rename(target)
+            return target
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise LedgerIntegrityError(f"Could not move legacy audit ledger '{path}' aside: {exc}") from exc
+    raise LedgerIntegrityError(f"Could not move legacy audit ledger '{path}' aside: target names exhausted.")
 
 
 def _default_rotation_event(rotated_path: Path, rotated_format: str, rotated_sha256: str) -> JsonObject:
@@ -1195,7 +1249,7 @@ class CoreAuditLedger:
         _reject_symlink_path(self._lock_path)
 
         with _exclusive_lock(self._lock_path):
-            raw = self.path.read_bytes() if self.path.exists() else b""
+            raw = read_regular_file_nofollow(self.path) if self.path.exists() else b""
             if raw:
                 check = verify_ledger_bytes_core(raw, anchor=anchor)
                 if check.valid and check.ledger_format == "v2":

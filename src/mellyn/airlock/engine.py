@@ -42,6 +42,7 @@ from mellyn.core.normalize import (
     normalize_str,
     sha256_exact,
 )
+from mellyn.core.scan import canary_present_in_json
 from mellyn.core.schemas import RedactionRecord, Verdict
 from mellyn.egress.guards import WorkspacePathGuard, owned_file_entries
 from mellyn.egress.scanner import EgressScanResult, scan_payload
@@ -49,6 +50,7 @@ from mellyn.egress.scanner import EgressScanResult, scan_payload
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _URI_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 _WINDOWS_DRIVE_URI_PATH_RE = re.compile(r"^/[A-Za-z]:/")
+_WINDOWS_DRIVE_RELATIVE_RE = re.compile(r"^/?[A-Za-z]:(?![\\/])")
 
 # Argument keys treated as filesystem paths at ANY nesting depth (compared case-insensitively with `_`/`-` removed),
 # in addition to a rule's explicit `path_arg_names`. Any string value anywhere that is a `file:` URI is also checked.
@@ -214,6 +216,8 @@ def _check_lexical_path_containment(
         return False, "Path component must not end with a space or trailing dot."
     if normalized_raw.startswith("~"):
         return False, "Home-directory tilde paths are forbidden."
+    if _WINDOWS_DRIVE_RELATIVE_RE.match(normalized_raw):
+        return False, "Drive-relative Windows path is forbidden."
 
     scheme = _uri_scheme(normalized_raw)
     if scheme is not None:
@@ -222,6 +226,8 @@ def _check_lexical_path_containment(
         parsed = urlparse(normalized_raw)
         if parsed.netloc.casefold() not in ("", "localhost"):
             return False, "Remote file:// authority is forbidden."
+        if parsed.query or parsed.fragment or "?" in normalized_raw or "#" in normalized_raw:
+            return False, "file: URI must not contain query or fragment components."
         normalized_raw = unquote(parsed.path)
         if normalized_raw != normalized_raw.strip():
             return False, "Decoded file: URI path must not have leading or trailing whitespace."
@@ -239,6 +245,8 @@ def _check_lexical_path_containment(
             return False, "Decoded file: URI path component must not end with a space or trailing dot."
         if normalized_raw.startswith("~"):
             return False, "Home-directory tilde paths are forbidden."
+        if _WINDOWS_DRIVE_RELATIVE_RE.match(normalized_raw):
+            return False, "Decoded file: URI drive-relative Windows path is forbidden."
 
     candidate = Path(normalized_raw)
     matched_any_root = False
@@ -609,10 +617,31 @@ def evaluate_tool_call(request: JsonRpcRequest, policy: AirlockPolicy) -> Verdic
         entropy_threshold=policy.entropy_threshold,
         min_entropy_length=policy.min_entropy_length,
     )
+    name_scan = scan_payload(
+        call_params.name,
+        canary_tokens=policy.canary_tokens,
+        blocked_patterns=policy.blocked_patterns,
+        entropy_threshold=policy.entropy_threshold,
+        min_entropy_length=policy.min_entropy_length,
+    )
+    split_name_canary = bool(policy.canary_tokens) and any(
+        canary_present_in_json({"name": call_params.name, "arguments": call_params.arguments}, c)
+        for c in policy.canary_tokens
+        if c
+    )
     id_scan = scan_rpc_id(request.id, policy)
-    all_findings = [*(id_scan.findings if id_scan is not None else ()), *scan.findings]
+    all_findings = [
+        *(id_scan.findings if id_scan is not None else ()),
+        *name_scan.findings,
+        *scan.findings,
+    ]
 
-    if scan.canary_matched or (id_scan is not None and id_scan.canary_matched):
+    if (
+        scan.canary_matched
+        or name_scan.canary_matched
+        or split_name_canary
+        or (id_scan is not None and id_scan.canary_matched)
+    ):
         return Verdict(
             verdict_allow=False,
             severity="AAD_FIRE",

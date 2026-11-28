@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mellyn.core.audit import LedgerAnchor, verify_ledger_bytes_core
+from mellyn.core.audit import LedgerAnchor, is_link_or_junction, read_regular_file_nofollow, verify_ledger_bytes_core
 from mellyn.core.schemas import LedgerFormat
 
 
@@ -73,10 +73,10 @@ def read_and_verify_chain(
     path: Path, *, anchor: LedgerAnchor | None = None
 ) -> tuple[ChainVerificationReport, bytes | None]:
     """
-    Read `path` ONCE and verify those bytes. Refuses symlink ledger paths fail-closed and returns
-    the report plus the exact verified bytes so callers never reconstruct from unverified content.
+    Read `path` ONCE via `O_NOFOLLOW` and verify those bytes. Refuses symlink/junction ledger paths
+    fail-closed and returns the report plus exact verified bytes.
     """
-    if path.is_symlink() or path.parent.is_symlink():
+    if is_link_or_junction(path) or is_link_or_junction(path.parent):
         return (
             ChainVerificationReport(
                 valid=False,
@@ -103,7 +103,7 @@ def read_and_verify_chain(
             None,
         )
     try:
-        raw_bytes = path.read_bytes()
+        raw_bytes = read_regular_file_nofollow(path)
     except OSError as exc:
         return (
             ChainVerificationReport(

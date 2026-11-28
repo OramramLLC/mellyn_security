@@ -428,7 +428,7 @@ def discover_protected_resource(
             validated_meta = validate_outbound_url(
                 meta_uri, allowed_domains=allowed_domains, allow_loopback_http=allow_loopback_http
             )
-            if allowed_domains is None and _origin_tuple(validated_meta) != _origin_tuple(canonical_res):
+            if _origin_tuple(validated_meta) != _origin_tuple(canonical_res):
                 raise OAuthError("WWW-Authenticate resource_metadata URL origin does not match MCP server.")
             candidates.append(validated_meta)
     for well_known in _well_known_urls(canonical_res, "oauth-protected-resource"):
@@ -506,6 +506,7 @@ def discover_authorization_server(
     timeout: float = DEFAULT_OAUTH_TIMEOUT_SECONDS,
     opener: urllib.request.OpenerDirector | None = None,
     allow_loopback_http: bool = False,
+    require_same_origin_endpoints: bool = True,
 ) -> dict[str, Any]:
     """
     Fetch and validate RFC 8414 / OIDC authorization server metadata fail-closed.
@@ -542,6 +543,9 @@ def discover_authorization_server(
     validated_token_ep = validate_outbound_url(
         token_ep, allowed_domains=allowed_domains, allow_loopback_http=allow_loopback_http
     )
+    issuer_origin = _origin_tuple(norm_issuer)
+    if require_same_origin_endpoints and _origin_tuple(validated_token_ep) != issuer_origin:
+        raise OAuthError("Authorization server 'token_endpoint' origin does not match issuer.")
 
     out = dict(metadata)
     out["token_endpoint"] = validated_token_ep
@@ -549,9 +553,12 @@ def discover_authorization_server(
     if auth_ep is not None:
         if not isinstance(auth_ep, str):
             raise OAuthError("Authorization server 'authorization_endpoint' must be a string.")
-        out["authorization_endpoint"] = validate_outbound_url(
+        validated_auth_ep = validate_outbound_url(
             auth_ep, allowed_domains=allowed_domains, allow_loopback_http=allow_loopback_http
         )
+        if require_same_origin_endpoints and _origin_tuple(validated_auth_ep) != issuer_origin:
+            raise OAuthError("Authorization server 'authorization_endpoint' origin does not match issuer.")
+        out["authorization_endpoint"] = validated_auth_ep
     return out
 
 

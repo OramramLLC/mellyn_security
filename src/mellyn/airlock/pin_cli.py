@@ -13,7 +13,9 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import re
+import secrets
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -345,6 +347,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _write_atomic_text(path: Path, text: str) -> None:
+    if _is_link_or_junction(path) or _is_link_or_junction(path.parent):
+        raise OSError(f"Refusing symlink or junction target '{path}'.")
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(tmp, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _is_link_or_junction(path):
+            raise OSError(f"Refusing symlink or junction target '{path}'.")
+        os.replace(tmp, path)
+    except OSError:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `mellyn-pin`."""
     parser = _build_parser()
@@ -383,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
             max_payload_bytes=args.max_payload_bytes,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(toml_text, encoding="utf-8", newline="\n")
+        _write_atomic_text(args.output, toml_text)
     except (OSError, ValueError, ValidationError) as exc:
         sys.stderr.write(f"mellyn-pin: failed to write policy '{args.output}': {exc}\n")
         return 2
