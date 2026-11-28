@@ -10,7 +10,6 @@ Invariants enforced (per AGENTS.md):
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import tomllib
@@ -21,6 +20,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from mellyn.core.normalize import JsonObject, JsonValue
+from mellyn.core.strict_input import strict_json_loads
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -36,10 +36,6 @@ def _check_finite_json(value: JsonValue) -> JsonValue:
         for val in value.values():
             _check_finite_json(val)
     return value
-
-
-def _reject_json_constant(constant: str) -> JsonValue:
-    raise ValueError(f"Non-standard JSON constant is forbidden: {constant!r}")
 
 
 class _StrictAirlockModel(BaseModel):
@@ -178,21 +174,9 @@ def parse_jsonrpc_message(raw: JsonObject) -> JsonRpcMessage:
     raise ValueError("Unrecognized JSON-RPC 2.0 frame: missing 'method', 'result', or 'error'.")
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
-    # Python keeps the last duplicate; another parser may keep the first. Either way the airlock could check one
-    # value while the downstream server acts on the other, so duplicate keys are rejected outright.
-    obj: JsonObject = {}
-    for key, value in pairs:
-        if key in obj:
-            raise ValueError(f"Duplicate JSON object key is forbidden: {key!r}")
-        obj[key] = value
-    return obj
-
-
 def parse_jsonrpc_bytes(data: bytes | str) -> JsonRpcMessage:
-    """Strictly decode raw UTF-8 JSON bytes/text (no duplicate keys) and validate as a `JsonRpcMessage`."""
-    text = data.decode("utf-8") if isinstance(data, bytes) else data
-    parsed = json.loads(text, parse_constant=_reject_json_constant, object_pairs_hook=_reject_duplicate_keys)
+    """Strictly decode raw UTF-8 JSON bytes/text (no duplicate keys, constants, or deep nesting) and validate."""
+    parsed = strict_json_loads(data)
     if not isinstance(parsed, dict):
         raise ValueError("JSON-RPC frame must be a JSON object.")
     return parse_jsonrpc_message(parsed)

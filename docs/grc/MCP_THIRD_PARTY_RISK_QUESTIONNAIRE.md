@@ -79,6 +79,9 @@ trusted = false
 tools_sha256 = "<64-char lowercase hex SHA-256 from mellyn pin>"
 ```
 
+### Completed Assessment in Repository (`TPRM-MCP-2026-001`)
+*   **Real-World Completed Assessment:** [`TPRM-MCP-2026-001-filesystem.md`](evidence/TPRM-MCP-2026-001/TPRM-MCP-2026-001-filesystem.md) — Live third-party assessment of `@modelcontextprotocol/server-filesystem@2.4.1` (`16` live tools inspected, `4` preset gaps surfaced and held fail-closed at `high`, `0` Unicode warnings, backed by [`pin-gateway-output.json`](evidence/TPRM-MCP-2026-001/pin-gateway-output.json) and [`pin-airlock-starter.toml`](evidence/TPRM-MCP-2026-001/pin-airlock-starter.toml)).
+
 ### Worked Example from Repository (`examples/airlock_demo/reviewed_policy.toml`)
 The repository's reference Airlock demo policy demonstrates pinning-as-evidence against `examples/airlock_demo/sample_mcp_server.py`:
 *   **Verification Tool:** `mellyn-pin` (`src/mellyn/airlock/pin_cli.py`)

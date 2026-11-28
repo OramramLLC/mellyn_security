@@ -9,7 +9,7 @@ import tomllib
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -98,18 +98,23 @@ class _StrictJsonBodyLimitMiddleware:
 
         raw_body = b"".join(chunks)
         if raw_body:
-            try:
-                strict_json_loads(raw_body)
-            except StrictJsonError as exc:
+            if raw_body.startswith(b"\xef\xbb\xbf") or b"\x00" in raw_body:
                 resp = JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": str(exc)},
+                    content={"detail": "Request body must be plain UTF-8 JSON without BOM or NUL bytes."},
                 )
                 await resp(scope, receive, send)
                 return
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                # Let FastAPI produce its standard 422 JSON validation error.
-                pass
+            try:
+                strict_json_loads(raw_body)
+            except (StrictJsonError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                detail = str(exc) if isinstance(exc, StrictJsonError) else "Malformed UTF-8 JSON request body."
+                resp = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": detail},
+                )
+                await resp(scope, receive, send)
+                return
 
         body_sent = False
 
@@ -138,6 +143,7 @@ class AuthorizePayload(BaseModel):
     tool_name: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
     mcp_server: str | None = Field(default=None, max_length=128)
+    mcp_method: Literal["tools/call", "resources/read"] | None = None
     signals: RiskSignalsPayload = Field(default_factory=RiskSignalsPayload)
 
 
@@ -153,6 +159,7 @@ class GrantPayload(BaseModel):
 
     tool_name: str = Field(min_length=1, max_length=128)
     mcp_server: str | None = Field(default=None, max_length=128)
+    mcp_method: Literal["tools/call", "resources/read"] | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     approved_by: str = Field(min_length=1, max_length=128)
     ttl_seconds: int = Field(default=900, ge=1, le=MAX_GRANT_TTL_SECONDS)
@@ -160,7 +167,11 @@ class GrantPayload(BaseModel):
 
 
 def _check_arguments_size(arguments: dict[str, Any]) -> None:
-    if len(canonical_json(arguments).encode("utf-8")) > MAX_ARGUMENTS_BYTES:
+    try:
+        encoded = canonical_json(arguments).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if len(encoded) > MAX_ARGUMENTS_BYTES:
         # Literal 413: the named constant differs across Starlette versions.
         raise HTTPException(status_code=413, detail="Tool arguments too large.")
 
@@ -265,6 +276,7 @@ def create_app(
             tool_name=payload.tool_name,
             arguments=payload.arguments,
             mcp_server=payload.mcp_server,
+            mcp_method=payload.mcp_method,
             signals=RiskSignals(
                 injection_score=payload.signals.injection_score,
                 dlp_secret_detected=payload.signals.dlp_secret_detected,
@@ -296,6 +308,7 @@ def create_app(
             session_id=session_id,
             tool_name=payload.tool_name,
             mcp_server=payload.mcp_server,
+            mcp_method=payload.mcp_method,
             arguments=payload.arguments,
             approved_by=payload.approved_by,
             ttl_seconds=payload.ttl_seconds,

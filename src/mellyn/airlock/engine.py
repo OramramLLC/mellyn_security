@@ -266,27 +266,45 @@ def _check_lexical_path_containment(
     return False, last_guard_reason
 
 
+_URI_KEY_EXACT: frozenset[str] = frozenset({"uri", "uris"})
+_HTTP_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _is_uri_key(key: str) -> bool:
+    folded = "".join(ch for ch in key.casefold() if ch.isalnum())
+    return folded in _URI_KEY_EXACT or folded.endswith(("uri", "uris"))
+
+
+def _is_network_uri_candidate(value: str) -> bool:
+    """True only for plain `http://` or `https://` URLs with no parent-traversal segments."""
+    norm = normalize_str(value).replace("\\", "/")
+    if not _HTTP_SCHEME_RE.match(norm):
+        return False
+    parsed = urlparse(norm)
+    return bool(parsed.netloc) and ".." not in parsed.path.split("/")
+
+
 def _gather_path_candidates(
     arguments: JsonObject,
     explicit_keys: frozenset[str],
     exempt_keys: frozenset[str] = frozenset(),
-) -> tuple[list[tuple[str, str, bool]], str | None]:
+) -> tuple[list[tuple[str, str, str, bool]], str | None]:
     """
-    Walk every argument at every depth and return `(location, value, explicit)` for each string to path-check,
+    Walk every argument at every depth and return `(location, key, value, explicit)` for each string to path-check,
     plus an error message if an explicitly declared path argument has the wrong type.
 
     `exempt_keys` (a rule's `non_path_arg_names`) opt a key out of the name-based path heuristic only; a `file:`
     URI under an exempt key is still checked.
     """
-    found: list[tuple[str, str, bool]] = []
+    found: list[tuple[str, str, str, bool]] = []
 
     def visit(value: JsonValue, location: str, key: str) -> str | None:
         explicit = key in explicit_keys
         if isinstance(value, str):
             if explicit or (key not in exempt_keys and _is_path_like_key(key)):
-                found.append((location, value, explicit))
+                found.append((location, key, value, explicit))
             elif _uri_scheme(normalize_str(value).strip()) == "file":
-                found.append((location, value, True))
+                found.append((location, key, value, True))
             return None
         if isinstance(value, list):
             if explicit and (not value or not all(isinstance(item, str) for item in value)):
@@ -333,12 +351,15 @@ def _evaluate_path_rules(
         return False, "Path argument supplied without configured workspace_roots (fail-closed)."
 
     block_guardrails = tool_rule.block_guardrail_paths if tool_rule is not None else True
-    for location, raw_value, explicit in candidates:
-        if not explicit and raw_value == raw_value.strip():
-            # A path-like key holding a non-file URI (`uri: https://...`) is not a filesystem path.
-            scheme = _uri_scheme(normalize_str(raw_value).replace("\\", "/"))
-            if scheme is not None and scheme != "file":
-                continue
+    for location, key, raw_value, explicit in candidates:
+        if (
+            not explicit
+            and raw_value == raw_value.strip()
+            and _is_uri_key(key)
+            and _is_network_uri_candidate(raw_value)
+        ):
+            # Only heuristic `uri`/`uris` keys holding clean http(s):// URLs skip filesystem path containment.
+            continue
         ok, reason = _check_lexical_path_containment(
             raw_value,
             roots=roots,

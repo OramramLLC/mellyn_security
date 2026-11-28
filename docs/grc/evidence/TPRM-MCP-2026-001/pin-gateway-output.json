@@ -1,0 +1,16 @@
+{
+  "command": [
+    "node",
+    "./node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
+    "./sandbox_root"
+  ],
+  "config_path": null,
+  "preset": "mcp-filesystem",
+  "server_name": "local-workspace",
+  "tools_count": 16,
+  "tools_sha256": "789b5d1ed5f1bcd6cd91a8bd0dab3693062d5ffed2c26544e7720b0a9cb9c4d1",
+  "transport": "stdio",
+  "trusted": true,
+  "url": null,
+  "warnings": []
+}

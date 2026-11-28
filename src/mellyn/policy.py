@@ -509,7 +509,8 @@ def resolve_capability(
     Resolve the hard-boundary capability profile for `(mcp_server, tool_name)`:
       1. Explicit `tool_capabilities` entry (`"<server>/<tool>"` for MCP, `"<tool>"` for local).
       2. Server preset (`MCP_CAPABILITY_PRESETS[preset][tool_name]`) when `mcp_server` uses a preset.
-      3. Built-in `DEFAULT_TOOL_CAPABILITIES` for canonical tool names (`workspace_read`, `shell_exec`, ...).
+      3. Built-in `DEFAULT_TOOL_CAPABILITIES` for canonical tool names (`workspace_read`, `shell_exec`, ...);
+         unbound MCP servers never inherit `pure=True` by bare name alone.
     """
     key = tool_key(tool_name, mcp_server)
     if key in tool_capabilities:
@@ -518,7 +519,10 @@ def resolve_capability(
         preset_map = MCP_CAPABILITY_PRESETS.get(server_presets[mcp_server], {})
         if tool_name in preset_map:
             return preset_map[tool_name]
-    return DEFAULT_TOOL_CAPABILITIES.get(tool_name)
+    default_cap = DEFAULT_TOOL_CAPABILITIES.get(tool_name)
+    if mcp_server is not None and default_cap is not None and default_cap.pure:
+        return None
+    return default_cap
 
 
 @dataclass(frozen=True)
@@ -651,6 +655,16 @@ class PolicyEngine:
             tool_capabilities=self.config.tool_capabilities,
             server_presets=self.config.server_presets,
         )
+
+    def has_explicit_capability(self, tool_name: str, mcp_server: str | None = None) -> bool:
+        """True when `(mcp_server, tool_name)` is bound via `tool_capabilities` or `server_presets`."""
+        key = tool_key(tool_name, mcp_server)
+        if key in self.config.tool_capabilities:
+            return True
+        if mcp_server is not None and mcp_server in self.config.server_presets:
+            preset_map = MCP_CAPABILITY_PRESETS.get(self.config.server_presets[mcp_server], {})
+            return tool_name in preset_map
+        return False
 
     def check_mcp_server(self, mcp_server: str | None) -> tuple[bool, str]:
         """Verify MCP server against the allowlist (defaults to an empty allowlist when omitted)."""

@@ -16,14 +16,19 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _normalize_json_tree(value: Any) -> Any:
+_MAX_NORMALIZE_JSON_DEPTH = 128
+
+
+def _normalize_json_tree(value: Any, *, _depth: int = 0) -> Any:
     """
     Validate that `value` consists exclusively of strict RFC 8259 JSON types and return canonical
     plain-JSON containers (`tuple` -> `list`, mapping -> `dict`, `-0.0` -> `0.0`).
 
-    Rejects NaN/Infinity floats, non-string mapping keys, and arbitrary Python objects so
-    serialization never falls back to lossy stringification (`default=str`).
+    Rejects NaN/Infinity floats, non-string mapping keys, nesting beyond `_MAX_NORMALIZE_JSON_DEPTH`,
+    and arbitrary Python objects so serialization never falls back to lossy stringification (`default=str`).
     """
+    if _depth > _MAX_NORMALIZE_JSON_DEPTH:
+        raise ValueError(f"JSON nesting is deeper than {_MAX_NORMALIZE_JSON_DEPTH} levels.")
     if value is None or isinstance(value, bool | int | str):
         return value
     if isinstance(value, float):
@@ -31,13 +36,13 @@ def _normalize_json_tree(value: Any) -> Any:
             raise ValueError("Non-finite float (NaN or Infinity) is not permitted in JSON values.")
         return 0.0 if value == 0.0 else value
     if isinstance(value, list | tuple):
-        return [_normalize_json_tree(item) for item in value]
+        return [_normalize_json_tree(item, _depth=_depth + 1) for item in value]
     if isinstance(value, Mapping):
         out: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("Tool argument mapping keys must be strings.")
-            out[key] = _normalize_json_tree(item)
+            out[key] = _normalize_json_tree(item, _depth=_depth + 1)
         return out
     raise TypeError(f"Unsupported non-JSON value of type '{type(value).__name__}'.")
 

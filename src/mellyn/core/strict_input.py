@@ -19,8 +19,6 @@ _CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,18}")
 # deeper documents than 3.12), so an explicit cap keeps the result the same everywhere and keeps pathological
 # documents away from json and pydantic. It is above the gateway scanner's 64-level nesting rule.
 MAX_JSON_DEPTH = 128
-_JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
-_NOT_A_BRACKET_RE = re.compile(r"[^\[\]{}]+")
 
 
 class StrictJsonError(ValueError):
@@ -41,17 +39,26 @@ def _reject_constant(token: str) -> Any:
 
 
 def _check_depth(text: str, max_depth: int) -> None:
-    # Brackets inside strings don't count, so drop the strings, then everything that is not a bracket.
-    brackets = _NOT_A_BRACKET_RE.sub("", _JSON_STRING_RE.sub('""', text))
-    if brackets.count("[") + brackets.count("{") <= max_depth:
-        return  # cannot nest deeper than the number of openers: the common case skips the loop
+    if text.count("[") + text.count("{") <= max_depth:
+        return  # cannot nest deeper than the total number of openers (O(N) fast path in C)
     depth = 0
-    for char in brackets:
-        if char in "[{":
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
             depth += 1
             if depth > max_depth:
                 raise StrictJsonError(f"JSON nesting is deeper than {max_depth} levels.")
-        else:
+        elif char in "]}" and depth > 0:
             depth -= 1
 
 

@@ -915,7 +915,7 @@ def _sanitize_event(
     canary_tokens: tuple[str, ...],
     extra_redactor: Callable[[str], str] | None,
 ) -> ZoneEvent:
-    from mellyn.core.schemas import ZoneEvent
+    from mellyn.core.schemas import RedactionRecord, ZoneEvent
 
     safe_meta = _redact_dict(event.metadata, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
     safe_req_id: int | str | None = (
@@ -930,6 +930,15 @@ def _sanitize_event(
     )
     safe_action = redact_core_secrets(event.action, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
     safe_reason = redact_core_secrets(event.reason, canary_tokens=canary_tokens, extra_redactor=extra_redactor)
+    safe_redactions = [
+        RedactionRecord(
+            kind=rec.kind,
+            rule_id=rec.rule_id,
+            field_path=redact_core_secrets(rec.field_path, canary_tokens=canary_tokens, extra_redactor=extra_redactor),
+            match_sha256=rec.match_sha256,
+        )
+        for rec in event.redactions
+    ]
 
     def _peer_view() -> JsonObject:
         view: JsonObject = {"action": safe_action, "reason": safe_reason, "metadata": safe_meta}
@@ -937,6 +946,8 @@ def _sanitize_event(
             view["tool_name"] = safe_tool
         if isinstance(safe_req_id, str):
             view["request_id"] = safe_req_id
+        if safe_redactions:
+            view["redactions"] = [rec.field_path for rec in safe_redactions]
         return view
 
     if canary_tokens and _split_canary_in(_peer_view(), canary_tokens):
@@ -950,10 +961,28 @@ def _sanitize_event(
         safe_action, safe_reason = _scrub(safe_action), _scrub(safe_reason)
         safe_tool = _scrub(safe_tool) if safe_tool is not None else None
         safe_req_id = _scrub(safe_req_id) if isinstance(safe_req_id, str) else safe_req_id
+        safe_redactions = [
+            RedactionRecord(
+                kind=rec.kind,
+                rule_id=rec.rule_id,
+                field_path="$[redacted]" if _carries_canary_piece(rec.field_path, canary_tokens) else rec.field_path,
+                match_sha256=rec.match_sha256,
+            )
+            for rec in safe_redactions
+        ]
         if _split_canary_in(_peer_view(), canary_tokens):
             safe_action = safe_reason = "[REDACTED_CANARY]"
             safe_tool = "[REDACTED_CANARY]" if safe_tool is not None else None
             safe_req_id = "[REDACTED_CANARY]" if isinstance(safe_req_id, str) else safe_req_id
+            safe_redactions = [
+                RedactionRecord(
+                    kind=rec.kind,
+                    rule_id=rec.rule_id,
+                    field_path="$[redacted]",
+                    match_sha256=rec.match_sha256,
+                )
+                for rec in safe_redactions
+            ]
             sid = safe_meta.get("session_id")
             keep_sid = isinstance(sid, str) and not any(canary_present(sid, c) for c in canary_tokens)
             safe_meta = (
@@ -972,7 +1001,7 @@ def _sanitize_event(
         artifact_sha256=artifact_sha256,
         tool_name=safe_tool,
         request_id=safe_req_id,
-        redactions=event.redactions,
+        redactions=safe_redactions,
         metadata=safe_meta,
     )
 

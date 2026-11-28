@@ -169,14 +169,15 @@ class Authorizer:
             tool_part = hash_untrusted_identifier("untrusted_tool", request.tool_name)
         return f"{srv_part}:{tool_part}"
 
-    @staticmethod
-    def _sanitize_taint_source(source: TaintSource) -> tuple[TaintSource, str]:
+    def _sanitize_taint_source(self, source: TaintSource) -> tuple[TaintSource, str]:
+        canary_tokens = tuple(getattr(self.audit, "_canary_tokens", ()))
         sanitized = TaintSource(
-            source_type=redact_text(source.source_type)[:64],
-            origin=redact_text(source.origin)[:MAX_TAINT_ENTRY_CHARS],
+            source_type=self.audit.scrub_text(source.source_type)[:64],
+            origin=self.audit.scrub_text(source.origin)[:MAX_TAINT_ENTRY_CHARS],
             recorded_at=source.recorded_at,
         )
-        return sanitized, format_taint_entry(sanitized)
+        formatted = self.audit.scrub_text(format_taint_entry(sanitized, canary_tokens=canary_tokens))
+        return sanitized, formatted
 
     def mark_tainted(self, session_id: str, source: TaintSource, *, now: datetime | None = None) -> None:
         """Record that untrusted external content has entered the session and emit a durable audit event."""
@@ -373,13 +374,15 @@ class Authorizer:
             return deny(f"Invalid tool arguments: {exc}")
 
         # 1. Hard boundary: MCP server allowlist
+        if request.mcp_server is not None and "/" in request.mcp_server:
+            return deny("Invalid MCP server identifier.")
         mcp_ok, mcp_reason = self.policy.check_mcp_server(request.mcp_server)
         if not mcp_ok:
             return deny(mcp_reason)
 
         # 1b. Hard boundary: MCP operation identity separation (tools/call vs resources/read)
         op_method = effective_mcp_method(request.tool_name, request.mcp_method)
-        if request.mcp_method == "tools/call" and (request.tool_name == RESOURCE_READ_TOOL or "/" in request.tool_name):
+        if op_method == "tools/call" and (request.tool_name == RESOURCE_READ_TOOL or "/" in request.tool_name):
             return deny("Reserved MCP operation name cannot be invoked via tools/call.")
         if op_method == "resources/read" and request.tool_name != RESOURCE_READ_TOOL:
             return deny("resources/read requests must use the reserved resource-read operation identity.")
@@ -405,6 +408,26 @@ class Authorizer:
             if not cap_ok:
                 return deny(cap_reasons[0])
             reasons.extend(cap_reasons)
+            if request.mcp_server is not None and not self.policy.has_explicit_capability(
+                request.tool_name, request.mcp_server
+            ):
+                bound_args: frozenset[str] = (
+                    frozenset()
+                    if risk_tier == RiskTier.HIGH
+                    else frozenset(
+                        name.lower()
+                        for name in (
+                            *capability.path_read_args,
+                            *capability.optional_path_read_args,
+                            *capability.path_read_list_args,
+                            *capability.path_write_args,
+                        )
+                    )
+                )
+                path_ok, path_reasons = self._guard_unbound_paths(request.arguments, skip_args=bound_args)
+                if not path_ok:
+                    return deny(path_reasons[0])
+                reasons.extend(path_reasons)
         else:
             # No binding: guess path arguments by name and hold them to the write rules (see UNBOUND_PATH_ARG_NAMES).
             path_ok, path_reasons = self._guard_unbound_paths(request.arguments)
@@ -553,12 +576,14 @@ class Authorizer:
 
         return True, notes
 
-    def _guard_unbound_paths(self, arguments: dict[str, Any]) -> tuple[bool, list[str]]:
+    def _guard_unbound_paths(
+        self, arguments: dict[str, Any], *, skip_args: frozenset[str] = frozenset()
+    ) -> tuple[bool, list[str]]:
         """Path-like arguments of a tool with no capability binding, checked as writes (strictest)."""
         notes: list[str] = []
         for name, value in arguments.items():
             canonical_arg = name.lower()
-            if canonical_arg not in UNBOUND_PATH_ARG_NAMES:
+            if canonical_arg in skip_args or canonical_arg not in UNBOUND_PATH_ARG_NAMES:
                 continue
             values = value if isinstance(value, list | tuple) else [value]
             for item in values:

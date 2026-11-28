@@ -33,7 +33,7 @@ KNOWN_SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         "url-userinfo-password",
         # The lookbehind makes a scheme start only at a token boundary; without it every letter of a long word
         # starts a new attempt and the scan becomes quadratic.
-        re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@"),
+        re.compile(r"(?<![A-Za-z0-9+-])[A-Za-z][A-Za-z0-9+-]*://[^/\s:@]+:([^@\s/]+)@"),
     ),
     (
         "openai-api-key",
@@ -98,7 +98,7 @@ _FAST_SECRET_PREFILTER_RE = re.compile(
         if rule_id not in ("url-userinfo-password", "private-key-pem")
     )
 )
-_URL_USERINFO_SECRET_RE = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)")
+_URL_USERINFO_SECRET_RE = re.compile(r"(?<![A-Za-z0-9+-])([A-Za-z][A-Za-z0-9+-]*://[^/\s:@]+:)[^@\s/]+(@)")
 _INVISIBLE_UNICODE_RE = re.compile(
     r"[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f"
     r"\u2800\u3164\ufeff\uffa0\ufe00-\ufe0f\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
@@ -614,17 +614,22 @@ def _iter_json_strings(value: Any) -> Iterator[str]:
 
 
 def _extract_split_views_and_pieces(
-    value: Any, *, max_chars: int = 131_072
+    value: Any, *, max_chars: int | None = 131_072
 ) -> tuple[tuple[str, int], tuple[str, int], tuple[str, int], list[str], int]:
     val_parts: list[str] = []
     key_parts: list[str] = []
     both_parts: list[str] = []
     norm_pieces: list[str] = []
     val_count = key_count = both_count = total_norm_chars = 0
-    budget = [max_chars, max_chars, max_chars]
+    budget = [max_chars, max_chars, max_chars] if max_chars is not None else None
 
     def _append(parts: list[str], idx: int, piece: str) -> None:
-        if not piece or budget[idx] <= 0:
+        if not piece:
+            return
+        if budget is None:
+            parts.append(piece)
+            return
+        if budget[idx] <= 0:
             return
         if len(piece) > budget[idx]:
             parts.append(piece[: budget[idx]])
@@ -729,6 +734,22 @@ def _split_fragments_cover_canary(value: Any, norm_canary: str) -> bool:
     return _split_fragments_from_normalized(norm_pieces, norm_canary)
 
 
+_SPLIT_VIEW_WINDOW_CHARS = 131_072
+
+
+def _view_has_canary(view: str, canary: str, *, overlap_chars: int) -> bool:
+    if len(view) <= _SPLIT_VIEW_WINDOW_CHARS:
+        return canary_present(view, canary)
+    step = max(1, _SPLIT_VIEW_WINDOW_CHARS - overlap_chars)
+    for start in range(0, len(view), step):
+        window = view[start : start + _SPLIT_VIEW_WINDOW_CHARS]
+        if canary_present(window, canary):
+            return True
+        if start + _SPLIT_VIEW_WINDOW_CHARS >= len(view):
+            break
+    return False
+
+
 def _canary_present_in_json_extracted(
     canary: str,
     *,
@@ -746,7 +767,8 @@ def _canary_present_in_json_extracted(
     candidate_views = dict.fromkeys(
         view for view, count in (val_view_info, key_view_info, both_view_info) if view and count >= min_count
     )
-    if any(canary_present(view, canary) for view in candidate_views):
+    overlap_chars = max(2_048, 8 * len(norm_canary))
+    if any(_view_has_canary(view, canary, overlap_chars=overlap_chars) for view in candidate_views):
         return True
     return (
         len(norm_canary) >= SPLIT_COVERAGE_MIN_CANARY_CHARS
@@ -767,7 +789,9 @@ def canary_present_in_json(value: Any, canary: str) -> bool:
     norm_canary = _normalized_canary(canary)
     if len(norm_canary) < 8:
         return False
-    val_info, key_info, both_info, norm_pieces, total_norm_chars = _extract_split_views_and_pieces(value)
+    val_info, key_info, both_info, norm_pieces, total_norm_chars = _extract_split_views_and_pieces(
+        value, max_chars=None
+    )
     return _canary_present_in_json_extracted(
         canary,
         val_view_info=val_info,
@@ -794,9 +818,17 @@ def _ox_hex_token_texts(tok: str) -> Iterator[str]:
 
 
 def _decimal_token_texts(tok: str) -> Iterator[str]:
-    values = [int(n) for n in re.findall(r"\d+", tok)]
-    if all(v <= 255 for v in values):
-        yield bytes(values).decode("utf-8", errors="ignore")
+    run: list[int] = []
+    for raw_n in re.findall(r"\d+", tok):
+        val = int(raw_n)
+        if val <= 255:
+            run.append(val)
+        else:
+            if len(run) >= 12:
+                yield bytes(run).decode("utf-8", errors="ignore")
+            run.clear()
+    if len(run) >= 12:
+        yield bytes(run).decode("utf-8", errors="ignore")
 
 
 def _b64_token_texts(tok: str) -> Iterator[str]:
@@ -922,9 +954,11 @@ def _scan_secrets_all_layers(
         ignore_placeholder=False,
     )
     secret_hit = raw_hit
+    decoded_layers: list[str] = []
 
     raw_norm = normalize_str(sanitized)
     if raw_norm != sanitized:
+        decoded_layers.append(raw_norm)
         norm_redacted, norm_hit = _redact_secret_matches_in_text(
             raw_norm,
             field_path=field_path,
@@ -940,9 +974,12 @@ def _scan_secrets_all_layers(
     else:
         pct_base = sanitized
 
+    u1_for_esc: str | None = None
     if "%" in sanitized or "%" in pct_base:
         pct_source = pct_base if "%" in pct_base else sanitized
         u1 = normalize_str(unquote(pct_source))
+        u1_for_esc = u1
+        decoded_layers.append(u1)
         u1_redacted, u1_hit = _redact_secret_matches_in_text(
             u1,
             field_path=field_path,
@@ -955,6 +992,7 @@ def _scan_secrets_all_layers(
         u2_source = u1_redacted if u1_hit else u1
         if "%" in u2_source:
             u2 = normalize_str(unquote(u2_source))
+            decoded_layers.append(u2)
             u2_redacted, u2_hit = _redact_secret_matches_in_text(
                 u2,
                 field_path=field_path,
@@ -965,11 +1003,17 @@ def _scan_secrets_all_layers(
                 secret_hit = True
                 sanitized = u2_redacted
 
-    if "\\" in sanitized:
-        unescaped = unescape_text(sanitized)
+    esc_source = next(
+        (cand for cand in (sanitized, pct_base, u1_for_esc) if cand is not None and "\\" in cand),
+        None,
+    )
+    if esc_source is not None:
+        unescaped = unescape_text(esc_source)
         if unescaped is not None:
+            norm_unesc = normalize_str(unescaped)
+            decoded_layers.append(norm_unesc)
             esc_redacted, esc_hit = _redact_secret_matches_in_text(
-                normalize_str(unescaped),
+                norm_unesc,
                 field_path=field_path,
                 findings=findings,
                 ignore_placeholder=True,
@@ -988,6 +1032,13 @@ def _scan_secrets_all_layers(
 
     sanitized, encoded_hit = redact_encoded_secret_tokens(sanitized, _decoded_is_secret)
     secret_hit = secret_hit or encoded_hit
+    for layer in dict.fromkeys(decoded_layers):
+        if layer == sanitized:
+            continue
+        layer_redacted, layer_enc_hit = redact_encoded_secret_tokens(layer, _decoded_is_secret)
+        if layer_enc_hit:
+            secret_hit = True
+            sanitized = layer_redacted
     return sanitized, secret_hit
 
 
@@ -1276,7 +1327,9 @@ def scan_payload_core(
 
     if isinstance(payload, list | tuple | dict) and clean_canaries and leaf_count > 1:
         split_target = redacted if redact else payload
-        val_info, key_info, both_info, norm_pieces, total_norm_chars = _extract_split_views_and_pieces(split_target)
+        val_info, key_info, both_info, norm_pieces, total_norm_chars = _extract_split_views_and_pieces(
+            split_target, max_chars=None
+        )
         if any(info[1] >= 2 for info in (val_info, key_info, both_info)):
             split_hit = False
             for idx, canary in enumerate(clean_canaries):

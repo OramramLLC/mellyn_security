@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -271,7 +272,12 @@ def _parse_oauth_section(raw: Any, *, server_idx: int, server_name: str, base_di
     cache_path: Path | None = None
     if raw_cache is not None:
         raw_p = Path(raw_cache)
-        cache_path = raw_p.resolve() if raw_p.is_absolute() else (base_dir / raw_p).resolve()
+        joined = raw_p if raw_p.is_absolute() else (base_dir / raw_p)
+        # Do not resolve symlinks here so OAuthTokenProvider's own symlink/junction refusal remains intact.
+        for candidate in (joined, joined.parent):
+            if candidate.is_symlink() or bool(getattr(candidate, "is_junction", lambda: False)()):
+                raise PolicyLoadError(f"{label}.token_cache_path must not be or sit under a symlink or junction.")
+        cache_path = Path(os.path.abspath(str(joined)))
 
     try:
         return OAuthClientConfig(

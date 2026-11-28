@@ -44,6 +44,7 @@ from typing import IO, Any, BinaryIO, Literal, Protocol, TextIO
 from mellyn.approvals import ApprovalHTTPServer, PendingApprovals
 from mellyn.audit import AuditChainError, AuditLogger
 from mellyn.authorizer import RESOURCE_READ_TOOL, Authorizer
+from mellyn.core.strict_input import StrictJsonError, strict_json_loads
 from mellyn.credentials import CredentialConfig, CredentialConfigError, Role
 from mellyn.egress import WorkspaceConfigError, check_workspace_root
 from mellyn.egress.guards import OwnedFile
@@ -513,8 +514,8 @@ class StdioDownstream:
                 if oversized or frame is None:
                     continue
                 try:
-                    parsed = json.loads(frame.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    parsed = strict_json_loads(frame)
+                except (UnicodeDecodeError, json.JSONDecodeError, StrictJsonError):
                     continue
                 self._inbox.put(parsed, len(frame))
         except (OSError, ValueError):
@@ -553,7 +554,7 @@ class StdioDownstream:
         """Return `(wrote_ok, timed_out)`. Counts writing and flushing against `deadline`."""
         if self._closed:
             return False, False
-        payload = (json.dumps(message) + "\n").encode("utf-8")
+        payload = (json.dumps(message, allow_nan=False) + "\n").encode("utf-8")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             self._abort_unresponsive()
@@ -1273,6 +1274,9 @@ def _relay(req_id: Any, response: dict[str, Any]) -> dict[str, Any]:
     return _jsonrpc_error(req_id, code, message[:1000])
 
 
+AAD_EXIT_CODE = 78
+
+
 def run_stdio_proxy(
     *,
     gateway: MCPGateway,
@@ -1286,8 +1290,8 @@ def run_stdio_proxy(
             reply: dict[str, Any] | None = _jsonrpc_error(None, JSONRPC_INVALID_REQUEST, "Message too large.")
         else:
             try:
-                message = json.loads(frame.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+                message = strict_json_loads(frame)
+            except (UnicodeDecodeError, json.JSONDecodeError, StrictJsonError):
                 reply = _jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Malformed JSON-RPC message.")
             else:
                 try:
@@ -1297,8 +1301,10 @@ def run_stdio_proxy(
                     err_id = raw_id if _valid_request_id(raw_id) else None
                     reply = _jsonrpc_error(err_id, JSONRPC_INTERNAL_ERROR, "Internal gateway error (fail-closed).")
         if reply is not None:
-            client_out.write(json.dumps(reply) + "\n")
+            client_out.write(json.dumps(reply, allow_nan=False) + "\n")
             client_out.flush()
+        if gateway._aad_tripped:
+            return AAD_EXIT_CODE
     return 0
 
 
@@ -1451,7 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
     gateway: MCPGateway | None = None
 
     def notify_client(message: dict[str, Any]) -> None:
-        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.write(json.dumps(message, allow_nan=False) + "\n")
         sys.stdout.flush()
 
     def on_notification(server: str, message: dict[str, Any]) -> None:

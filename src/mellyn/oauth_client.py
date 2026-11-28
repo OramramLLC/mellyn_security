@@ -12,10 +12,12 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -29,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal
 
+from mellyn.core.strict_input import StrictJsonError, strict_json_loads
 from mellyn.egress import EgressValidator
 from mellyn.egress_proxy import validate_egress_domain
 from mellyn.legacy_env import LEGACY_ENV_PREFIX
@@ -160,14 +163,38 @@ def _well_known_urls(base_url: str, suffix_name: str) -> tuple[str, ...]:
     )
 
 
-def read_bounded_bytes(stream: Any, *, max_bytes: int) -> bytes:
-    """Read an HTTP response stream in bounded chunks, raising ValueError if it exceeds `max_bytes`."""
+def _apply_stream_deadline(stream: Any, deadline: float | None) -> None:
+    """Enforce an absolute monotonic `deadline` across chunked reads by tightening any underlying socket timeout."""
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("HTTP response read exceeded total deadline.")
+    for candidate in (
+        stream,
+        getattr(stream, "fp", None),
+        getattr(getattr(stream, "fp", None), "raw", None),
+        getattr(stream, "raw", None),
+    ):
+        sock = getattr(candidate, "_sock", None)
+        settimeout = getattr(sock, "settimeout", None)
+        if callable(settimeout):
+            settimeout(remaining)
+            return
+
+
+def read_bounded_bytes(stream: Any, *, max_bytes: int, deadline: float | None = None) -> bytes:
+    """Read an HTTP response stream in bounded chunks within optional `deadline` and `max_bytes`."""
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive.")
     buf = bytearray()
-    chunk_size = min(16_384, max_bytes + 1)
+    chunk_size = min(4_096, max_bytes + 1)
+    read_fn = getattr(stream, "read1", None)
+    if not callable(read_fn):
+        read_fn = stream.read
     while True:
-        chunk = stream.read(chunk_size)
+        _apply_stream_deadline(stream, deadline)
+        chunk = read_fn(chunk_size)
         if not chunk:
             break
         if len(buf) + len(chunk) > max_bytes:
@@ -346,9 +373,10 @@ def _http_get_json(
     max_bytes: int = MAX_OAUTH_RESPONSE_BYTES,
 ) -> dict[str, Any]:
     req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})  # noqa: S310 - validated URL
+    deadline = time.monotonic() + timeout
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 - scheme/host validated by validate_outbound_url
-            raw = read_bounded_bytes(resp, max_bytes=max_bytes)
+            raw = read_bounded_bytes(resp, max_bytes=max_bytes, deadline=deadline)
     except OAuthError:
         raise
     except urllib.error.HTTPError as exc:
@@ -357,8 +385,8 @@ def _http_get_json(
         raise OAuthError(f"Metadata GET '{url}' failed: {exc}") from exc
 
     try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        parsed = strict_json_loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, StrictJsonError) as exc:
         raise OAuthError(f"Malformed JSON metadata from '{url}': {exc}") from exc
     if not isinstance(parsed, dict):
         raise OAuthError(f"Metadata from '{url}' must be a JSON object.")
@@ -549,9 +577,10 @@ def _post_token_form(
             "Accept": "application/json",
         },
     )
+    deadline = time.monotonic() + timeout
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 - scheme/host validated
-            raw = read_bounded_bytes(resp, max_bytes=MAX_OAUTH_RESPONSE_BYTES)
+            raw = read_bounded_bytes(resp, max_bytes=MAX_OAUTH_RESPONSE_BYTES, deadline=deadline)
     except OAuthError:
         raise
     except urllib.error.HTTPError as exc:
@@ -560,8 +589,8 @@ def _post_token_form(
         raise OAuthError(f"Token request failed: {exc}") from exc
 
     try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        parsed = strict_json_loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, StrictJsonError) as exc:
         raise OAuthError(f"Malformed JSON from token endpoint: {exc}") from exc
     if not isinstance(parsed, dict):
         raise OAuthError("Token endpoint response must be a JSON object.")
@@ -580,7 +609,12 @@ def _post_token_form(
     expires_at: float | None = None
     expires_in = parsed.get("expires_in")
     if expires_in is not None:
-        if isinstance(expires_in, bool) or not isinstance(expires_in, int | float) or expires_in <= 0:
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, int | float)
+            or not math.isfinite(float(expires_in))
+            or expires_in <= 0
+        ):
             raise OAuthError("Token endpoint returned invalid 'expires_in'.")
         expires_at = time.time() + float(expires_in)
 
@@ -857,28 +891,66 @@ class OAuthTokenProvider:
         self._cache_write_warned = False
         self._token: OAuthToken | None = self._load_cached_token()
 
+    @staticmethod
+    def _is_link_or_junction(path: Path) -> bool:
+        return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
     def _load_cached_token(self) -> OAuthToken | None:
         path = self.config.token_cache_path
         if path is None or not path.exists():
             return None
-        if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+        if self._is_link_or_junction(path) or self._is_link_or_junction(path.parent) or not path.is_file():
             raise OAuthError(f"Refusing unsafe OAuth token cache path '{path}'.")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise OAuthError(f"Refusing unsafe OAuth token cache path '{path}': {exc}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OAuthError(f"Refusing non-regular OAuth token cache '{path}'.")
+            if os.name == "posix" and (st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0):
+                raise OAuthError(f"Refusing insecure permissions or ownership on OAuth token cache '{path}'.")
+            if st.st_size > 65_536:
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                raw = handle.read(65_537)
+                fd = -1
+            if len(raw) > 65_536:
+                return None
+            data = strict_json_loads(raw)
+        except OAuthError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, StrictJsonError):
             return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
         if not isinstance(data, dict):
             return None
         if data.get("binding") != self._cache_binding():
-            # Issued for another server, authorization server, client or flow (or written before tokens were bound):
-            # sending it here would hand one server's credential to another.
+            # Issued for another server, authorization server, client, flow, or scopes:
+            # sending it here would hand one server's credential to another or widen scopes.
             return None
         access = data.get("access_token")
-        if not isinstance(access, str) or not access:
+        if not isinstance(access, str) or not access or _CONTROL_CHARS_RE.search(access):
             return None
         exp = data.get("expires_at")
-        expires_at = float(exp) if isinstance(exp, int | float) and not isinstance(exp, bool) else None
-        refresh = data.get("refresh_token") if isinstance(data.get("refresh_token"), str) else None
+        if isinstance(exp, bool) or not isinstance(exp, int | float):
+            expires_at = None
+        else:
+            exp_f = float(exp)
+            if not math.isfinite(exp_f):
+                return None
+            expires_at = exp_f
+        raw_refresh = data.get("refresh_token")
+        refresh = (
+            raw_refresh
+            if isinstance(raw_refresh, str) and raw_refresh and not _CONTROL_CHARS_RE.search(raw_refresh)
+            else None
+        )
         scope = data.get("scope") if isinstance(data.get("scope"), str) else None
         return OAuthToken(access_token=access, expires_at=expires_at, refresh_token=refresh, scope=scope)
 
@@ -890,14 +962,15 @@ class OAuthTokenProvider:
             "authorization_servers": sorted(self.config.allowed_authorization_servers),
             "client": client,
             "flow": self.config.flow,
+            "scopes": sorted(self.config.scopes),
         }
 
     def _save_cached_token(self, token: OAuthToken | None) -> None:
         path = self.config.token_cache_path
         if path is None:
             return
-        if path.is_symlink() or path.parent.is_symlink():
-            raise OAuthError(f"Refusing symlink OAuth token cache path '{path}'.")
+        if self._is_link_or_junction(path) or self._is_link_or_junction(path.parent):
+            raise OAuthError(f"Refusing symlink or junction OAuth token cache path '{path}'.")
         if token is None:
             if path.is_file():
                 try:
@@ -905,28 +978,38 @@ class OAuthTokenProvider:
                 except OSError:
                     pass
             return
+        tmp_path: Path | None = None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            tmp_path = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(tmp_path, flags, 0o600)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(
-                        json.dumps(
-                            {
-                                "binding": self._cache_binding(),
-                                "access_token": token.access_token,
-                                "token_type": token.token_type,
-                                "expires_at": token.expires_at,
-                                "refresh_token": token.refresh_token,
-                                "scope": token.scope,
-                            },
-                            sort_keys=True,
-                        )
-                        + "\n"
+                if os.name == "posix":
+                    os.fchmod(fd, 0o600)
+                payload = (
+                    json.dumps(
+                        {
+                            "binding": self._cache_binding(),
+                            "access_token": token.access_token,
+                            "token_type": token.token_type,
+                            "expires_at": token.expires_at,
+                            "refresh_token": token.refresh_token,
+                            "scope": token.scope,
+                        },
+                        sort_keys=True,
                     )
+                    + "\n"
+                ).encode("utf-8")
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fsync(fd)
             finally:
-                if os.name == "posix" and path.exists() and not path.is_symlink():
-                    os.chmod(path, 0o600)
+                os.close(fd)
+            os.replace(tmp_path, path)
+            tmp_path = None
         except OSError as exc:
             # A cache is an optimisation. Failing here (for example a path inside a read-only config mount) used to
             # fail every call after a fresh token had been fetched; the token is kept in memory instead.
@@ -936,6 +1019,12 @@ class OAuthTokenProvider:
                     f"mellyn: could not write OAuth token cache '{path}' ({exc}); keeping the token in memory only.",
                     file=sys.stderr,
                 )
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _resolve_client_id(self) -> str:
         if self.config.client_id is not None:

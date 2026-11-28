@@ -29,7 +29,7 @@ from mellyn.egress_proxy import validate_egress_domain
 from mellyn.gateway_config import SERVER_NAME
 from mellyn.http_downstream import StreamableHttpDownstream
 from mellyn.legacy_env import LEGACY_ENV_PREFIX
-from mellyn.oauth_client import OAuthClientConfig, OAuthError, extract_url_host, validate_outbound_url
+from mellyn.oauth_client import OAuthClientConfig, OAuthError, validate_outbound_url
 from mellyn.policy import SMB_SERVER_PRESETS, validate_argv
 from mellyn.policy_loader import MAX_POLICY_BYTES, PolicyLoadError
 from mellyn.scanner import invisible_unicode_tools
@@ -543,15 +543,6 @@ def _serialize_unified_toml(data: Mapping[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _add_public_url_domain(url: str, domains: list[str]) -> None:
-    try:
-        norm = validate_egress_domain(extract_url_host(url))
-    except ValueError:
-        return
-    if norm not in domains:
-        domains.append(norm)
-
-
 def _starter_unified_dict(result: GatewayPinResult) -> dict[str, Any]:
     domains: list[str] = []
     if result.preset is not None:
@@ -559,16 +550,6 @@ def _starter_unified_dict(result: GatewayPinResult) -> dict[str, Any]:
             norm = validate_egress_domain(dom)
             if norm not in domains:
                 domains.append(norm)
-    if result.url is not None:
-        _add_public_url_domain(result.url, domains)
-    if result.oauth is not None:
-        for oauth_url in (
-            *result.oauth.allowed_authorization_servers,
-            *([result.oauth.resource] if result.oauth.resource else ()),
-            *([result.oauth.token_endpoint] if result.oauth.token_endpoint else ()),
-            *([result.oauth.authorization_endpoint] if result.oauth.authorization_endpoint else ()),
-        ):
-            _add_public_url_domain(oauth_url, domains)
     return {
         "schema_version": 2,
         "runtime": {

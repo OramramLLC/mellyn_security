@@ -134,29 +134,45 @@ def generate_squid_config(
         r"acl raw_ip_host url_regex -i ^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?$ ^\[?[0-9a-f:]+\]?(:[0-9]+)?$",
         "http_access deny raw_ip_host",
         "",
-        "# Block private, loopback, link-local, and cloud-metadata IPs at connect time (anti-DNS-rebinding)",
     ]
 
-    for cidr in BLOCKED_DESTINATION_CIDRS:
-        lines.append(f"acl blocked_dst dst {cidr}")
-    lines.append("http_access deny blocked_dst")
-    lines.append("")
+    if domains or gw_domains:
+        # Gate DNS resolution behind dstdomain allowlists BEFORE evaluating IP-based blocked_dst ACLs so
+        # unallowlisted domains fail immediately without emitting outbound DNS queries.
+        allow_acls: list[str] = []
+        if domains:
+            lines.append("# Policy-synced domain allowlist (exact domain and subdomains)")
+            for domain in domains:
+                lines.append(f"acl allowed_domains dstdomain .{domain}")
+            allow_acls.append("!allowed_domains")
+        if gw_domains:
+            lines.append("")
+            lines.append(
+                "# Gateway-only hosts (remote MCP servers and their OAuth hosts): NOT in the tool policy, so the"
+            )
+            lines.append(
+                "# authorizer refuses tool calls to them, but processes on the gateway's network can reach them."
+            )
+            for domain in gw_domains:
+                lines.append(f"acl gateway_domains dstdomain {domain}")
+            allow_acls.append("!gateway_domains")
 
-    if domains:
-        lines.append("# Policy-synced domain allowlist (exact domain and subdomains)")
-        for domain in domains:
-            lines.append(f"acl allowed_domains dstdomain .{domain}")
-        lines.append("http_access allow CONNECT SSL_ports allowed_domains")
+        lines.append(f"http_access deny {' '.join(allow_acls)}")
+        lines.append("")
+        lines.append(
+            "# Block private, loopback, link-local, and cloud-metadata IPs at connect time (anti-DNS-rebinding)"
+        )
+        for cidr in BLOCKED_DESTINATION_CIDRS:
+            lines.append(f"acl blocked_dst dst {cidr}")
+        lines.append("http_access deny blocked_dst")
+        lines.append("")
+
+        if domains:
+            lines.append("http_access allow CONNECT SSL_ports allowed_domains")
+        if gw_domains:
+            lines.append("http_access allow CONNECT SSL_ports gateway_domains")
     else:
         lines.append("# Policy has no allowed_egress_domains; failing closed (all outbound traffic denied).")
-
-    if gw_domains:
-        lines.append("")
-        lines.append("# Gateway-only hosts (remote MCP servers and their OAuth hosts): NOT in the tool policy, so the")
-        lines.append("# authorizer refuses tool calls to them, but processes on the gateway's network can reach them.")
-        for domain in gw_domains:
-            lines.append(f"acl gateway_domains dstdomain {domain}")
-        lines.append("http_access allow CONNECT SSL_ports gateway_domains")
 
     lines.append("")
     lines.append("# Default deny everything else (fail closed)")
