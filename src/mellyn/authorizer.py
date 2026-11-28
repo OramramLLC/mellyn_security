@@ -617,8 +617,13 @@ class Authorizer:
             has_colon_port = ":" in hostport
         if has_colon_port and (port is None or port <= 0):
             return False, "Resource URI specifies an empty or invalid port."
-        if parsed.scheme.lower() != "file":
+        scheme = parsed.scheme.lower()
+        if scheme in ("http", "https"):
+            return self.egress.validate_url(uri.strip())
+        if scheme != "file":
             return True, "Non-file resource URI scheme; risk tier decides."
+        if parsed.query or parsed.fragment or "?" in uri or "#" in uri:
+            return False, "file:// resource URI must not contain query or fragment components."
         if port is not None or parsed.netloc.lower() not in ("", "localhost"):
             return False, "file:// URI on remote host or with port is denied."
         try:

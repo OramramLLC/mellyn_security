@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -677,16 +678,30 @@ def _splice_server_block(text: str, server_name: str, block: str) -> str:
     return text.rstrip("\n") + "\n\n" + "\n".join(block_lines) + "\n"
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
 def _write_atomic(path: Path, text: str) -> Path:
-    """Write `text` to `path` via a temporary file in the same folder, so a crash never leaves a half-written file."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    """Write `text` to `path` via an exclusive non-symlink temporary file in the same folder."""
+    if _is_link_or_junction(path) or _is_link_or_junction(path.parent):
+        raise GatewayPinError(f"Refusing symlink or junction target '{path}'.")
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        fd = os.open(tmp, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+        if _is_link_or_junction(path):
+            raise GatewayPinError(f"Refusing symlink or junction target '{path}'.")
         os.replace(tmp, path)
     except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
         tmp.unlink(missing_ok=True)
         raise GatewayPinError(f"Could not write '{path}': {exc}") from exc
     return path

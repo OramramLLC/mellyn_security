@@ -94,6 +94,7 @@ JSONRPC_AAD_CONTAINMENT_SEVERED = -32099
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 # How long one write to the client may take before the client is treated as gone (it stopped reading stdout).
 DEFAULT_CLIENT_WRITE_TIMEOUT_SECONDS = 5.0
+DEFAULT_DOWNSTREAM_WRITE_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLI_STDIN_READ_CHUNK_BYTES = 4096
 DEFAULT_CLI_STDIN_READAHEAD_BYTES = 65_536
 MAX_STDERR_LINE_BYTES = 4096
@@ -405,26 +406,25 @@ async def _hard_kill_subprocess(proc: asyncio.subprocess.Process, *, job: _Windo
     """Forcefully terminate `proc` (its Windows job, or its process group via `SIGKILL` on POSIX) and reap it."""
     if job is not None:
         job.terminate()
-    if proc.returncode is None:
-        killed_group = False
-        if os.name == "posix":
-            killpg_fn = getattr(os, "killpg", None)
-            sigkill = getattr(signal, "SIGKILL", None)
-            if callable(killpg_fn) and isinstance(sigkill, int):
-                try:
-                    killpg_fn(proc.pid, sigkill)
-                    killed_group = True
-                except ProcessLookupError:
-                    killed_group = True
-                except OSError:
-                    killed_group = False
-        if not killed_group and proc.returncode is None:
+    killed_group = False
+    if os.name == "posix":
+        killpg_fn = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", None)
+        if callable(killpg_fn) and isinstance(sigkill, int):
             try:
-                proc.kill()
+                killpg_fn(proc.pid, sigkill)
+                killed_group = True
             except ProcessLookupError:
-                pass
+                killed_group = True
             except OSError:
-                pass
+                killed_group = False
+    if not killed_group and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
     await proc.wait()
 
 
@@ -514,6 +514,7 @@ class AirlockProxy:
         self._client_writer = client_writer
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._client_write_timeout_seconds = float(client_write_timeout_seconds)
+        self._downstream_write_timeout = float(DEFAULT_DOWNSTREAM_WRITE_TIMEOUT_SECONDS)
         self._allowed_env_keys = None if allowed_env_keys is None else tuple(allowed_env_keys)
         self._extra_env = dict(extra_env) if extra_env is not None else None
         self._cwd = cwd
@@ -710,8 +711,11 @@ class AirlockProxy:
                 return False
             try:
                 proc.stdin.write(payload)
-                await proc.stdin.drain()
+                await asyncio.wait_for(proc.stdin.drain(), timeout=self._downstream_write_timeout)
                 return True
+            except TimeoutError:
+                self._close_downstream_stdin()
+                return False
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return False
 
@@ -908,11 +912,24 @@ class AirlockProxy:
         *,
         params: JsonObject,
         request_id: RpcId | None,
+        method: str | None = None,
     ) -> tuple[bool, bool, str, list[RedactionRecord]]:
         """Return `(ok, is_aad, reason, findings)` for non-`tools/call` outbound requests/notifications."""
         findings: list[RedactionRecord] = []
         canary_hit = False
         blocked_or_secret = False
+
+        if method is not None:
+            m_scan = scan_payload(
+                method,
+                canary_tokens=self._policy.canary_tokens,
+                blocked_patterns=self._policy.blocked_patterns,
+                entropy_threshold=self._policy.entropy_threshold,
+                min_entropy_length=self._policy.min_entropy_length,
+            )
+            findings.extend(m_scan.findings)
+            canary_hit = canary_hit or m_scan.canary_matched
+            blocked_or_secret = blocked_or_secret or (not m_scan.clean)
 
         p_scan = scan_payload(
             params,
@@ -934,7 +951,11 @@ class AirlockProxy:
 
         if canary_hit:
             return False, True, "Planted canary token detected in outbound MCP frame.", findings
-        if has_invisible_unicode(params) or (isinstance(request_id, str) and has_invisible_unicode(request_id)):
+        if (
+            has_invisible_unicode(params)
+            or (method is not None and has_invisible_unicode(method))
+            or (isinstance(request_id, str) and has_invisible_unicode(request_id))
+        ):
             return False, False, "Invisible Unicode format/tag characters detected in outbound MCP frame.", findings
         if blocked_or_secret:
             return False, False, "Egress scanner detected secret or blocked pattern in outbound MCP frame.", findings
@@ -1251,29 +1272,11 @@ class AirlockProxy:
                 artifact_sha256=wire_sha,
             )
             return
-        if msg.method not in _ALLOWED_CLIENT_NOTIFICATIONS:
-            if self._mode == "observe":
-                self._record_event(
-                    action=msg.method,
-                    verdict_allow=False,
-                    severity="BLOCK",
-                    rule_id="airlock.notification_not_allowed",
-                    reason=f"Client notification method '{msg.method}' is not allowlisted.",
-                    artifact_sha256=wire_sha,
-                    metadata=self._observe_metadata(),
-                )
-                await self._write_downstream_bytes(wire_bytes)
-                return
-            self._record_event(
-                action=msg.method,
-                verdict_allow=False,
-                severity="BLOCK",
-                rule_id="airlock.notification_not_allowed",
-                reason=f"Client notification method '{msg.method}' is not allowlisted.",
-                artifact_sha256=wire_sha,
-            )
-            return
-        ok, is_aad, reason, findings = await self._scan_outbound_envelope(params=msg.params, request_id=None)
+        ok, is_aad, reason, findings = await self._scan_outbound_envelope(
+            params=msg.params,
+            request_id=None,
+            method=msg.method,
+        )
         if is_aad:
             if self._mode == "observe":
                 self._record_event(
@@ -1294,6 +1297,28 @@ class AirlockProxy:
                 reason=reason,
                 artifact_sha256=wire_sha,
                 redactions=findings,
+            )
+            return
+        if msg.method not in _ALLOWED_CLIENT_NOTIFICATIONS:
+            if self._mode == "observe":
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.notification_not_allowed",
+                    reason=f"Client notification method '{msg.method}' is not allowlisted.",
+                    artifact_sha256=wire_sha,
+                    metadata=self._observe_metadata(),
+                )
+                await self._write_downstream_bytes(wire_bytes)
+                return
+            self._record_event(
+                action=msg.method,
+                verdict_allow=False,
+                severity="BLOCK",
+                rule_id="airlock.notification_not_allowed",
+                reason=f"Client notification method '{msg.method}' is not allowlisted.",
+                artifact_sha256=wire_sha,
             )
             return
         if not ok:
@@ -1464,12 +1489,51 @@ class AirlockProxy:
             )
             return
 
+        paginated = False
+        issued_cursor = False
+        scan_params = msg.params
+        if msg.method == "tools/list" and "cursor" in msg.params:
+            cursor = msg.params["cursor"]
+            if isinstance(cursor, str) and cursor in self._issued_cursors:
+                issued_cursor = True
+                paginated = True
+                scan_params = {key: value for key, value in msg.params.items() if key != "cursor"}
+
+        ok, is_aad, reason, findings = await self._scan_outbound_envelope(
+            params=scan_params,
+            request_id=msg.id,
+            method=msg.method,
+        )
+        observed_violation = False
+        if is_aad:
+            if self._mode != "observe":
+                await self._trigger_aad(
+                    action=msg.method,
+                    rule_id="egress.canary_exfiltration",
+                    reason=reason,
+                    artifact_sha256=wire_sha,
+                    rpc_id=msg.id,
+                    redactions=findings,
+                )
+                return
+            self._record_event(
+                action=msg.method,
+                verdict_allow=False,
+                severity="AAD_FIRE",
+                rule_id="egress.canary_exfiltration",
+                reason=reason,
+                artifact_sha256=wire_sha,
+                request_id=msg.id,
+                redactions=findings,
+                metadata=self._observe_metadata(would_terminate=True),
+            )
+            observed_violation = True
+
         allowed_methods = (
             _ALLOWED_CLIENT_REQUEST_METHODS | {"resources/list", "resources/read"}
             if self._policy.allow_resources_read
             else _ALLOWED_CLIENT_REQUEST_METHODS
         )
-        observed_violation = False
         if msg.method not in allowed_methods:
             if self._mode != "observe":
                 self._record_event(
@@ -1487,82 +1551,53 @@ class AirlockProxy:
                     message=f"Policy violation: method '{msg.method}' is not permitted.",
                 )
                 return
-            self._record_event(
-                action=msg.method,
-                verdict_allow=False,
-                severity="BLOCK",
-                rule_id="airlock.method_not_allowed",
-                reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
-                artifact_sha256=wire_sha,
-                request_id=msg.id,
-                metadata=self._observe_metadata(),
-            )
-            observed_violation = True
+            if not observed_violation:
+                self._record_event(
+                    action=msg.method,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.method_not_allowed",
+                    reason=f"JSON-RPC method '{msg.method}' is not allowlisted.",
+                    artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                    metadata=self._observe_metadata(),
+                )
+                observed_violation = True
 
-        scan_params = msg.params
-        paginated = False
-        if msg.method == "tools/list" and "cursor" in msg.params:
+        if msg.method == "tools/list" and "cursor" in msg.params and not issued_cursor:
             # A cursor is opaque server data; the client may only echo back one the server issued on a verified
             # page. Anything else would be a free-form channel out of the airlock.
-            cursor = msg.params["cursor"]
-            if not isinstance(cursor, str) or cursor not in self._issued_cursors:
-                if self._mode != "observe":
-                    self._record_event(
-                        action=msg.method,
-                        verdict_allow=False,
-                        severity="BLOCK",
-                        rule_id="airlock.unknown_cursor",
-                        reason="tools/list cursor was not issued by the server on a verified page.",
-                        artifact_sha256=wire_sha,
-                        request_id=msg.id,
-                    )
-                    await self._emit_client_error(
-                        rpc_id=msg.id,
-                        code=JSONRPC_POLICY_VIOLATION,
-                        message="Policy violation: unknown tools/list cursor.",
-                    )
-                    return
-                if not observed_violation:
-                    self._record_event(
-                        action=msg.method,
-                        verdict_allow=False,
-                        severity="BLOCK",
-                        rule_id="airlock.unknown_cursor",
-                        reason="tools/list cursor was not issued by the server on a verified page.",
-                        artifact_sha256=wire_sha,
-                        request_id=msg.id,
-                        metadata=self._observe_metadata(),
-                    )
-                    observed_violation = True
-            scan_params = {key: value for key, value in msg.params.items() if key != "cursor"}
-            paginated = True
-
-        ok, is_aad, reason, findings = await self._scan_outbound_envelope(params=scan_params, request_id=msg.id)
-        if is_aad:
             if self._mode != "observe":
-                await self._trigger_aad(
+                self._record_event(
                     action=msg.method,
-                    rule_id="egress.canary_exfiltration",
-                    reason=reason,
+                    verdict_allow=False,
+                    severity="BLOCK",
+                    rule_id="airlock.unknown_cursor",
+                    reason="tools/list cursor was not issued by the server on a verified page.",
                     artifact_sha256=wire_sha,
+                    request_id=msg.id,
+                )
+                await self._emit_client_error(
                     rpc_id=msg.id,
-                    redactions=findings,
+                    code=JSONRPC_POLICY_VIOLATION,
+                    message="Policy violation: unknown tools/list cursor.",
                 )
                 return
             if not observed_violation:
                 self._record_event(
                     action=msg.method,
                     verdict_allow=False,
-                    severity="AAD_FIRE",
-                    rule_id="egress.canary_exfiltration",
-                    reason=reason,
+                    severity="BLOCK",
+                    rule_id="airlock.unknown_cursor",
+                    reason="tools/list cursor was not issued by the server on a verified page.",
                     artifact_sha256=wire_sha,
                     request_id=msg.id,
-                    redactions=findings,
-                    metadata=self._observe_metadata(would_terminate=True),
+                    metadata=self._observe_metadata(),
                 )
                 observed_violation = True
-        elif not ok:
+            paginated = True
+
+        if not is_aad and not ok:
             if self._mode != "observe":
                 self._record_event(
                     action=msg.method,

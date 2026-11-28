@@ -278,6 +278,9 @@ def check_privilege_separation(
         raise RuntimeError("--gateway-user and --downstream-user need the gateway to start as root to switch users.")
     if (gateway_user is None) != (downstream_user is None):
         raise RuntimeError("--gateway-user and --downstream-user must be given together.")
+    for flag, user_val in (("--gateway-user", gateway_user), ("--downstream-user", downstream_user)):
+        if user_val is not None and user_val.strip().lower() in ("0", "root"):
+            raise RuntimeError(f"{flag} must identify a non-root account (UID != 0).")
     if downstream_user is not None and not is_pid1:
         raise RuntimeError(
             "--downstream-user needs the gateway to be PID 1 (the container's main process, without `init`): once "
@@ -956,7 +959,10 @@ class MCPGateway:
             result = response.get("result")
             if not isinstance(result, dict):
                 break
-            items.extend(item for item in result.get(key, []) if isinstance(item, dict))
+            raw_items = result.get(key)
+            if not isinstance(raw_items, list):
+                break
+            items.extend(item for item in raw_items if isinstance(item, dict))
             next_cursor = result.get("nextCursor") if isinstance(result.get("nextCursor"), str) else None
             if not next_cursor or next_cursor in seen_cursors:
                 break
@@ -1425,10 +1431,14 @@ def main(argv: list[str] | None = None) -> int:
             if os.name != "posix":
                 raise RuntimeError("--downstream-user requires a POSIX platform.")
             ds_uid, ds_gid, ds_name, ds_home = _resolve_posix_account(args.downstream_user)
+            if ds_uid == 0:
+                raise RuntimeError("--downstream-user must resolve to a non-root UID (UID != 0).")
         if args.gateway_user is not None:
             if os.name != "posix":
                 raise RuntimeError("--gateway-user requires a POSIX platform.")
             gw_uid, _, _, _ = _resolve_posix_account(args.gateway_user)
+            if gw_uid == 0:
+                raise RuntimeError("--gateway-user must resolve to a non-root UID (UID != 0).")
             if ds_uid is not None and ds_uid == gw_uid:
                 raise RuntimeError("--downstream-user and --gateway-user must resolve to distinct UIDs.")
     except (KeyError, ValueError, RuntimeError) as exc:

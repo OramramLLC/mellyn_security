@@ -142,13 +142,17 @@ def render_env_file(
         "MELLYN_STRICT_MODE=true",
     ]
     if workspace_root is not None:
-        lines.append(f"MELLYN_WORKSPACE={workspace_root.resolve()}")
+        ws_val = _sanitize_env_value(str(workspace_root.resolve()), "MELLYN_WORKSPACE")
+        lines.append(f"MELLYN_WORKSPACE={ws_val}")
     if config_dir is not None:
+        cfg_val = _sanitize_env_value(str(config_dir.resolve()), CONFIG_DIR_ENV)
+        pol_val = _sanitize_env_value(policy_filename, POLICY_FILE_ENV)
+        gw_val = _sanitize_env_value(gateway_filename, GATEWAY_FILE_ENV)
         lines.extend(
             [
-                f"{CONFIG_DIR_ENV}={config_dir.resolve()}",
-                f"{POLICY_FILE_ENV}={policy_filename}",
-                f"{GATEWAY_FILE_ENV}={gateway_filename}",
+                f"{CONFIG_DIR_ENV}={cfg_val}",
+                f"{POLICY_FILE_ENV}={pol_val}",
+                f"{GATEWAY_FILE_ENV}={gw_val}",
             ]
         )
     lines.append("")
@@ -259,22 +263,50 @@ def render_starter_gateway(
     return "\n".join(lines)
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _sanitize_env_value(raw: str, label: str) -> str:
+    if any(ch in raw for ch in ("\r", "\n", "\x00")):
+        raise InitError(f"{label} must not contain newline or NUL characters.")
+    return raw
+
+
 def _reject_symlink(path: Path) -> None:
     try:
-        if path.is_symlink() or path.parent.is_symlink():
+        if _is_link_or_junction(path) or _is_link_or_junction(path.parent):
             raise InitError(f"Refusing symlink target '{path}'.")
     except OSError as exc:
         raise InitError(f"Unable to inspect path '{path}': {exc}") from exc
 
 
-def _write_private_text(path: Path, content: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _write_atomic_text(path: Path, content: str, *, private: bool = False) -> None:
+    _reject_symlink(path)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    mode = 0o600 if private else 0o644
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
     try:
+        fd = os.open(tmp, flags, mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
             handle.write(content)
-    finally:
-        if os.name == "posix" and path.exists() and not path.is_symlink():
-            os.chmod(path, 0o600)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix" and private:
+            os.chmod(tmp, 0o600)
+        _reject_symlink(path)
+        os.replace(tmp, path)
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise InitError(f"Could not write '{path}': {exc}") from exc
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    _write_atomic_text(path, content, private=True)
 
 
 def init_workspace(
@@ -296,8 +328,8 @@ def init_workspace(
     profiles = _resolve_presets(presets)
     config_dir = target_dir / CONFIG_SUBDIR
     for directory in (target_dir, config_dir):
-        if directory.is_symlink():
-            raise InitError(f"Directory '{directory}' must not be a symlink.")
+        if _is_link_or_junction(directory):
+            raise InitError(f"Directory '{directory}' must not be a symlink or junction.")
     config_dir.mkdir(parents=True, exist_ok=True)
 
     env_path = target_dir / ".env"
@@ -330,7 +362,7 @@ def init_workspace(
 
     if unified:
         unified_text = render_unified_config(presets, extra_domains=extra_domains, canary_tokens=canary_tokens)
-        mellyn_cfg_path.write_text(unified_text, encoding="utf-8", newline="\n")
+        _write_atomic_text(mellyn_cfg_path, unified_text)
         # Round-trip load generated config so fail-closed errors surface immediately.
         loaded_unified = load_unified_config(mellyn_cfg_path)
         loaded_policy = loaded_unified.policy
@@ -341,8 +373,8 @@ def init_workspace(
     else:
         policy_text = render_starter_policy(presets, extra_domains=extra_domains)
         gateway_text = render_starter_gateway(presets, policy_filename=policy_path.name)
-        policy_path.write_text(policy_text, encoding="utf-8", newline="\n")
-        gateway_path.write_text(gateway_text, encoding="utf-8", newline="\n")
+        _write_atomic_text(policy_path, policy_text)
+        _write_atomic_text(gateway_path, gateway_text)
         # Round-trip load generated files so fail-closed errors surface immediately.
         loaded_policy = load_policy_file(policy_path)
         gateway_domains = frozenset()
@@ -353,8 +385,9 @@ def init_workspace(
 
     if effective_squid_path is not None:
         effective_squid_path.parent.mkdir(parents=True, exist_ok=True)
-        effective_squid_path.write_text(
-            generate_squid_config(loaded_policy, gateway_domains=gateway_domains), encoding="utf-8", newline="\n"
+        _write_atomic_text(
+            effective_squid_path,
+            generate_squid_config(loaded_policy, gateway_domains=gateway_domains),
         )
 
     return InitResult(
@@ -370,8 +403,7 @@ def init_workspace(
 
 def parse_dotenv(path: Path) -> dict[str, str]:
     """Parse key=value pairs from `.env`, refusing missing files and symlinks (fail closed)."""
-    if path.is_symlink() or path.parent.is_symlink():
-        raise InitError(f"Refusing symlink env file '{path}'.")
+    _reject_symlink(path)
     if not path.is_file():
         raise InitError(f"Environment file does not exist: '{path}' (run `mellyn init` first).")
 
@@ -413,7 +445,11 @@ def resolve_stack_config(compose_file: Path, env: dict[str, str]) -> tuple[Path,
         config_dir = compose_dir / config_dir
     policy_name = _bare_filename(env.get(POLICY_FILE_ENV, "") or DEFAULT_POLICY_FILE, POLICY_FILE_ENV)
     gateway_name = _bare_filename(env.get(GATEWAY_FILE_ENV, "") or DEFAULT_GATEWAY_FILE, GATEWAY_FILE_ENV)
-    return config_dir.resolve(), (config_dir / policy_name).resolve(), (config_dir / gateway_name).resolve()
+    unresolved_policy = config_dir / policy_name
+    unresolved_gateway = config_dir / gateway_name
+    for unresolved in (config_dir, unresolved_policy, unresolved_gateway):
+        _reject_symlink(unresolved)
+    return config_dir.resolve(), unresolved_policy.resolve(), unresolved_gateway.resolve()
 
 
 def run_up(
@@ -433,7 +469,7 @@ def run_up(
     one policy while the authorizer enforces another. With `dry_run`, nothing is written or started.
     """
     check_no_legacy_env()
-    if compose_file.is_symlink() or not compose_file.is_file():
+    if _is_link_or_junction(compose_file) or not compose_file.is_file():
         raise InitError(f"Docker Compose file does not exist or is a symlink: '{compose_file}'.")
     _reject_symlink(squid_output)
 
@@ -450,13 +486,13 @@ def run_up(
         merged_env = mellyn_env
 
     config_dir, stack_policy, stack_gateway = resolve_stack_config(compose_file, merged_env)
-    if env_file is not None and env_file.resolve().parent == config_dir:
+    if env_file is not None and env_file.resolve().is_relative_to(config_dir):
         raise InitError(
             f"'{env_file}' is inside the config folder '{config_dir}', which is mounted into the containers. "
             "Keep .env outside it."
         )
     for required in (stack_policy, stack_gateway):
-        if required.is_symlink() or not required.is_file():
+        if _is_link_or_junction(required) or not required.is_file():
             raise InitError(f"Config file the containers would load does not exist or is a symlink: '{required}'.")
     if policy_path is not None and policy_path.resolve() != stack_policy:
         raise InitError(
@@ -488,7 +524,7 @@ def run_up(
         raise InitError("Docker CLI ('docker') was not found on PATH.")
 
     squid_output.parent.mkdir(parents=True, exist_ok=True)
-    squid_output.write_text(squid_text, encoding="utf-8", newline="\n")
+    _write_atomic_text(squid_output, squid_text)
     compose_env = dict(os.environ)
     if env_file is not None:
         # The containers load the same file compose interpolated, not whatever sits at the default ../.env.

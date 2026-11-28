@@ -109,6 +109,9 @@ _CREDENTIAL_ASSIGN_RE = re.compile(
     r"""\s*[:=]\s*["']?([A-Za-z0-9._~+/=-]{16,})["']?"""
 )
 _OPAQUE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_+/=.-])([A-Za-z0-9_+/=-]{20,})(?![A-Za-z0-9_+/=.-])")
+_JWT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_+/=-])(eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{10,})(?![A-Za-z0-9_+/=-])"
+)
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _HEX_ONLY_RE = re.compile(r"^[0-9a-fA-F]+$")
 _REDACTION_PLACEHOLDERS: frozenset[str] = frozenset(
@@ -1190,6 +1193,30 @@ def _scan_single_string(
         sanitized = _CREDENTIAL_ASSIGN_RE.sub(_redact_contextual, sanitized)
 
         if len(sanitized) >= min_entropy_length:
+
+            def _redact_jwt(m: re.Match[str]) -> str:
+                nonlocal entropy_hit
+                token = m.group(1)
+                sig = token.rsplit(".", 1)[1]
+                if _is_high_entropy_candidate(
+                    sig,
+                    threshold=entropy_threshold,
+                    min_length=min(min_entropy_length, 16),
+                    contextual=False,
+                ):
+                    entropy_hit = True
+                    findings.append(
+                        ScanFinding(
+                            kind="high_entropy",
+                            rule_id="high-entropy-token",
+                            field_path=field_path,
+                            match_sha256=_hash_match(token),
+                        )
+                    )
+                    return "[REDACTED_HIGH_ENTROPY]"
+                return token
+
+            sanitized = _JWT_TOKEN_RE.sub(_redact_jwt, sanitized)
 
             def _redact_standalone(m: re.Match[str]) -> str:
                 nonlocal entropy_hit

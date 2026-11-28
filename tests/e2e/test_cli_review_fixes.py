@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import io
 import json
 import math
@@ -356,17 +357,28 @@ class TestIncidentReportIntegrity(unittest.TestCase):
         for idx in range(3):
             ledger.record(_event(idx, request_id=idx))
         self.assertEqual(verify_ledger_bytes(self.path.read_bytes()), verify_ledger(self.path))
+        verify_chain_mod = importlib.import_module("mellyn.ir_lab.verify_chain")
         real_read_bytes = Path.read_bytes
-        calls: list[Path] = []
+        real_nofollow = verify_chain_mod.read_regular_file_nofollow
+        raw_read_calls: list[Path] = []
+        nofollow_calls: list[Path] = []
 
         def counting_read_bytes(path: Path) -> bytes:
-            calls.append(path)
+            raw_read_calls.append(path)
             return real_read_bytes(path)
 
-        with mock.patch.object(Path, "read_bytes", counting_read_bytes):
+        def counting_nofollow(path: Path) -> bytes:
+            nofollow_calls.append(path)
+            return real_nofollow(path)
+
+        with (
+            mock.patch.object(Path, "read_bytes", counting_read_bytes),
+            mock.patch.object(verify_chain_mod, "read_regular_file_nofollow", counting_nofollow),
+        ):
             report = reconstruct_incident(self.path)
         self.assertEqual(report.total_events, 3)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(nofollow_calls), 1)
+        self.assertEqual(len(raw_read_calls), 0)
 
     def test_unconfirmed_aad_trigger_reports_aad_triggered_unconfirmed(self) -> None:
         AuditLedger(self.path).record(_event(0, request_id=42))

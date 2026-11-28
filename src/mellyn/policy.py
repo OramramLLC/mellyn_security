@@ -309,9 +309,9 @@ def tool_key(tool_name: str, mcp_server: str | None) -> str:
 
 
 def program_name(argv0: str) -> str:
-    """Basename of argv[0], lower-cased, without a Windows executable suffix ('/bin/RM.exe' -> 'rm')."""
-    name = re.split(r"[\\/]", argv0)[-1].lower()
-    return re.sub(r"\.(exe|cmd|bat|com)$", "", name)
+    """Basename of argv[0], lower-cased, without trailing Win32 dots/spaces or executable suffix."""
+    name = re.split(r"[\\/]", argv0)[-1].lower().rstrip(". ")
+    return re.sub(r"\.(exe|cmd|bat|com)$", "", name).rstrip(". ")
 
 
 def _short_option_clusters(rest: tuple[str, ...], value_letters: str, long_with_value: frozenset[str]):
