@@ -1,6 +1,6 @@
 # Mellyn Security — External Evaluation Suite (`evals/`)
 
-This directory contains isolated external security harnesses designed for **Google Colab A100** using open-weight **`Qwen/Qwen3-32B-AWQ`** (fits both 40GB and 80GB A100s; optional 80GB preset: **`Qwen/Qwen3-30B-A3B-Instruct-2507`**) served locally via **vLLM** (`--enable-auto-tool-choice --tool-call-parser hermes`). Running against local open-weights avoids third-party API moderation blocks when testing prompt injections, canary exfiltration, guardrail tampering, and SSRF probes.
+This directory contains isolated external security harnesses designed for **Google Colab** (with automatic GPU VRAM model selection across **A100 80GB**, **A100 40GB**, **L4 24GB**, and **T4 16GB**) using open-weight **Qwen3** models served locally via **vLLM** (`--enable-auto-tool-choice --tool-call-parser hermes`). Running against local open-weights avoids third-party API moderation blocks when testing prompt injections, canary exfiltration, guardrail tampering, and SSRF probes.
 
 ## Harnesses Included
 
@@ -23,16 +23,17 @@ This directory contains isolated external security harnesses designed for **Goog
 # 1. Install Mellyn + eval dependencies (intentionally kept outside root lockfiles)
 pip install -e . vllm mcp-fuzzer agentdojo==0.1.35
 
-# 2. Start vLLM with Qwen/Qwen3-32B-AWQ and Hermes tool calling (disable thinking for fast tool loops)
+# 2. Start vLLM matching your GPU VRAM:
+#    - A100 80GB: Qwen/Qwen3-30B-A3B-Instruct-2507 (BF16 MoE, drop the --reasoning-parser flags)
+#    - A100 40GB: Qwen/Qwen3-32B-AWQ (--max-model-len 16384)
+#    - L4 24GB:   Qwen/Qwen3-14B-AWQ (--max-model-len 16384 --max-num-seqs 4)
+#    - T4 16GB:   Qwen/Qwen3-8B-AWQ  (--max-model-len 8192 --max-num-seqs 4 --dtype half)
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen3-32B-AWQ \
   --host 127.0.0.1 --port 8000 \
   --enable-auto-tool-choice --tool-call-parser hermes \
   --reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-model-len 16384 --gpu-memory-utilization 0.90
-
-# Optional 80GB A100 preset (pure non-thinking BF16 MoE, drop the --reasoning-parser flags):
-#   --model Qwen/Qwen3-30B-A3B-Instruct-2507
 
 export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=EMPTY
@@ -41,6 +42,7 @@ export MELLYN_EVAL_MODEL=Qwen/Qwen3-32B-AWQ
 # 3. Run the harnesses
 python -m evals.fuzzer.run_fuzzer --mode smoke --output-dir outputs/fuzzer_smoke
 python -m evals.fuzzer.run_fuzzer --mode mcp-fuzzer --runs 25 --output-dir outputs/fuzzer_live
-npx -y promptfoo@latest eval -c evals/promptfoo/promptfooconfig.yaml -o outputs/promptfoo/results.json
+PROMPTFOO_PYTHON="$(which python)" npx -y promptfoo@latest eval \
+  -c evals/promptfoo/promptfooconfig.yaml -o outputs/promptfoo/results.json --no-cache -j 1
 python -m evals.agentdojo.run_agentdojo --suites workspace banking slack travel --output-dir outputs/agentdojo
 ```
