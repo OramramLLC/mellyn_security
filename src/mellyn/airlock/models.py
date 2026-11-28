@@ -242,12 +242,55 @@ def _reject_optional_control_chars(value: str | None, what: str) -> str | None:
     return None
 
 
+# MCP 2025-11-25 `Icon.src`: "May be an HTTP/HTTPS URL or a `data:` URI with Base64-encoded image data." No size limit
+# is set here; a large `data:` URI is still bounded by the policy's `max_payload_bytes` frame cap.
+_ICON_SRC_SCHEMES: tuple[str, ...] = ("https:", "http:", "data:")
+
+
+class ClientIcon(_StrictAirlockModel):
+    """Strict MCP 2025-11-25 `Icon` inside `clientInfo.icons`."""
+
+    src: str = Field(min_length=1)
+    mimeType: str | None = Field(default=None, min_length=1, max_length=128)
+    sizes: list[str] | None = Field(default=None, max_length=32)
+    theme: Literal["light", "dark"] | None = None
+
+    @field_validator("src")
+    @classmethod
+    def _validate_src(cls, v: str) -> str:
+        _reject_control_chars(v, "clientInfo.icons[].src")
+        if not v.lower().startswith(_ICON_SRC_SCHEMES):
+            raise ValueError("clientInfo.icons[].src must be an http(s) URL or a data: URI.")
+        return v
+
+    @field_validator("mimeType")
+    @classmethod
+    def _validate_mime_type(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.icons[].mimeType")
+
+    @field_validator("sizes")
+    @classmethod
+    def _validate_sizes(cls, v: list[str] | None) -> list[str] | None:
+        for size in v or ():
+            if not 1 <= len(size) <= 32:
+                raise ValueError("clientInfo.icons[].sizes entries must be 1-32 characters.")
+            _reject_control_chars(size, "clientInfo.icons[].sizes")
+        return v
+
+
 class ClientImplementationInfo(_StrictAirlockModel):
-    """Strict MCP client implementation metadata inside `initialize.params.clientInfo`."""
+    """Strict MCP client implementation metadata inside `initialize.params.clientInfo`.
+
+    Covers the `Implementation` fields of MCP 2025-06-18 (`name`, `version`, `title`) and those added in 2025-11-25
+    (`icons`, `websiteUrl`, `description`). Anything else is still rejected.
+    """
 
     name: str = Field(min_length=1, max_length=256)
     version: str = Field(min_length=1, max_length=128)
     title: str | None = Field(default=None, max_length=256)
+    icons: list[ClientIcon] | None = Field(default=None, max_length=32)
+    websiteUrl: str | None = Field(default=None, min_length=1, max_length=2048)
+    description: str | None = Field(default=None, max_length=4096)
 
     @field_validator("name")
     @classmethod
@@ -263,6 +306,16 @@ class ClientImplementationInfo(_StrictAirlockModel):
     @classmethod
     def _validate_title(cls, v: str | None) -> str | None:
         return _reject_optional_control_chars(v, "clientInfo.title")
+
+    @field_validator("websiteUrl")
+    @classmethod
+    def _validate_website_url(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.websiteUrl")
+
+    @field_validator("description")
+    @classmethod
+    def _validate_description(cls, v: str | None) -> str | None:
+        return _reject_optional_control_chars(v, "clientInfo.description")
 
 
 class InitializeParams(_StrictAirlockModel):
@@ -343,15 +396,26 @@ class InitializedNotificationParams(_StrictAirlockModel):
 
 
 class CancelledNotificationParams(_StrictAirlockModel):
-    """Strict MCP `notifications/cancelled` parameters."""
+    """Strict MCP `notifications/cancelled` parameters.
 
-    requestId: int | str
+    `requestId` is required in MCP 2025-06-18 but optional in 2025-11-25 (omitted when a task is cancelled), so it may
+    be left out; an explicit `null` is still rejected because it is not a valid request id.
+    """
+
+    requestId: int | str | None = None
     reason: str | None = Field(default=None, max_length=1024)
     meta: JsonObject | None = Field(default=None, alias="_meta")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_request_id(cls, data: object) -> object:
+        if isinstance(data, dict) and "requestId" in data and data["requestId"] is None:
+            raise ValueError("notifications/cancelled requestId cannot be null when provided.")
+        return data
+
     @field_validator("requestId")
     @classmethod
-    def _validate_request_id(cls, v: int | str) -> int | str:
+    def _validate_request_id(cls, v: int | str | None) -> int | str | None:
         if isinstance(v, bool):
             raise ValueError("notifications/cancelled requestId cannot be a boolean.")
         if isinstance(v, str):
