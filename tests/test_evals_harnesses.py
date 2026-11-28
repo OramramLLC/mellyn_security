@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -151,13 +152,18 @@ class EvalsStructureAndServersTests(unittest.TestCase):
             "Qwen/Qwen3-8B-AWQ",
             "enable_thinking",
             "vllm_proc.poll()",
-            'TARGET_REF="main"',
             "mcp-fuzzer",
             "promptfoo",
             "agentdojo",
             "mellyn-ir",
         ):
             self.assertIn(expected, joined_src)
+
+        # TARGET_REF may be a branch or a commit, but `git fetch origin <sha>` only accepts a full 40-character SHA.
+        refs = re.findall(r'^TARGET_REF="([^"]+)"$', joined_src, flags=re.MULTILINE)
+        self.assertEqual(len(refs), 1, refs)
+        if re.fullmatch(r"[0-9a-f]{7,39}", refs[0]):
+            self.fail(f"TARGET_REF {refs[0]!r} is an abbreviated SHA; git fetch needs all 40 characters.")
 
 
 @unittest.skipUnless(HAS_PYDANTIC, "Requires pydantic installed in active venv.")
